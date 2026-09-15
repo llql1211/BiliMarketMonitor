@@ -1,4 +1,4 @@
-# BiliMarket | B站市集商品价格监视器
+# BiliMarketMonitor | B站市集商品价格监视器
 
 一个监视 Bilibili 会员购市集商品价格的桌面小工具（PyQt5）。从文件导入商品 clusterId，依次查询每个商品的现价、近期均价和最近成交记录，以表格展示。
 
