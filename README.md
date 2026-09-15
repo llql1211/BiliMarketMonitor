@@ -6,8 +6,8 @@
 
 ## 功能
 
-- **导入商品链接**：先将 `watchlist.example.txt` 复制一份到 `watchlist.txt`，输入商品链接或商品 clusterId。分享链接中的 `share_medium`、`bbid` 等无关参数不影响解析。
-- **本地缓存**：第一次抓取后，商品的 clusterID、名称、缩略图会保存到本地 SQLite（`cache.db`）。之后启动时先整体扫描 watchlist 与缓存库，立即显示所有已知信息，再对清单内商品逐个抓取最新价格——命中缓存的商品无需等待即可看到名称和缩略图。
+- **导入商品链接**：先将 `data/watchlist.example.txt` 复制一份到 `data/watchlist.txt`，输入商品链接或商品 clusterId。分享链接中的 `share_medium`、`bbid` 等无关参数不影响解析。
+- **本地缓存**：第一次抓取后，商品的 clusterID、名称、缩略图会保存到本地 SQLite（`data/cache.db`）。之后启动时先整体扫描 watchlist 与缓存库，立即显示所有已知信息，再对清单内商品逐个抓取最新价格——命中缓存的商品无需等待即可看到名称和缩略图。
 - **依次轮询**：程序启动时、以及点击"刷新"按钮后，依次（非并发）查询每个商品，间隔 ≥ 2 秒；单个商品查询失败不影响其他商品（自动重试 1 次），查询过程中显示进度（如 `查询中 3/12`）。
 - **表格展示**：
 
@@ -30,7 +30,7 @@ pixi run start
 
 ### 配置监视清单
 
-编辑项目根目录的 `watchlist.txt`，每行一条商品链接（或纯数字 `clusterId`）：
+编辑 `data/watchlist.txt`，每行一条商品链接（或纯数字 `clusterId`）：
 
 ```
 # 以 # 开头的行、空行会被忽略；重复的 clusterId 只保留第一次出现
@@ -50,17 +50,19 @@ https://mall.bilibili.com/neul-next/index.html?page=magic-market_detail&noTitleB
 ```
 BiliMarket/
 ├── pyproject.toml      # 依赖 + pixi 配置 + 启动任务
-├── watchlist.txt       # 监视清单（用户维护，仅作为输入）
-├── cache.db            # 本地缓存（首次运行后自动生成）
+├── data/               # 数据文件
+│   ├── watchlist.example.txt  # 监视清单示例（模板）
+│   ├── watchlist.txt          # 监视清单（用户维护，仅作为输入，不入库）
+│   └── cache.db               # 本地缓存（首次运行后自动生成，不入库）
 └── src/
-    ├── App.py          # 入口：PyQt5 主窗口 + QThread 轮询调度
+    ├── app.py          # 入口：PyQt5 主窗口 + QThread 轮询调度
     ├── client.py       # API 封装：fetch_cluster(cluster_id)
     ├── parser.py       # 响应解析：提取名称/价格/均价/成交/图片，全路径判空
     ├── links.py        # 链接解析：watchlist.txt -> clusterId 列表
     └── store.py        # SQLite 缓存：clusterID / 名称 / 缩略图
 ```
 
-数据流：`watchlist.txt` → `links.py`（解析/去重）→ 与 `store.py` 缓存合并显示 → `client.py`（请求接口）→ `parser.py`（判空提取字段）→ `App.py`（刷新价格并回写缓存）。
+数据流：`data/watchlist.txt` → `links.py`（解析/去重）→ 与 `store.py` 缓存合并显示 → `client.py`（请求接口）→ `parser.py`（判空提取字段）→ `app.py`（刷新价格并回写缓存）。
 
 轮询放在子线程（`QThread` + 信号槽），每条结果回传主线程刷新表格，界面不会假死。
 

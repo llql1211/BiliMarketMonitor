@@ -65,6 +65,11 @@ def get_detail_url(entry: LinkEntry) -> str:
 
 
 def default_watchlist_path() -> str:
-    """默认的 watchlist.txt 路径（项目根目录，即 src/ 的上一级）。"""
+    """默认的 watchlist.txt 路径（data/ 目录，即 src/ 的上一级下的 data/）。"""
+    return os.path.join(_data_dir(), "watchlist.txt")
+
+
+def _data_dir() -> str:
+    """数据文件目录（项目根目录下的 data/）。"""
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(root, "watchlist.txt")
+    return os.path.join(root, "data")

@@ -1,7 +1,7 @@
 """市集商品价格监视器 · PyQt5 主窗口 + 轮询调度。
 
 启动流程：
-1. 整体扫描 watchlist.txt 与本地缓存库（SQLite）中的商品 clusterID，
+1. 整体扫描 data/watchlist.txt 与本地缓存库（SQLite）中的商品 clusterID，
    先把所有能显示的数据（名称、缩略图、clusterID）摆上表格；
 2. 再对 watchlist 中的商品一行行抓取价格信息并刷新。
 
@@ -16,7 +16,7 @@ import time
 import webbrowser
 
 import requests
-from PyQt5.QtCore import QObject, Qt, QThread, pyqtSignal
+from PyQt5.QtCore import QObject, QSize, Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QIcon, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
@@ -40,7 +40,7 @@ import store
 
 POLL_INTERVAL_SEC = 2.0        # 依次轮询的间隔，风控经验：>= 2 秒
 RETRY_ONCE_INTERVAL_SEC = 1.0  # 单条失败重试前的等待
-IMAGE_SIZE = 64                # 缩略图边长（配合 CDN 裁剪后缀减小流量）
+IMAGE_SIZE = 96                # 缩略图边长（配合 CDN 裁剪后缀减小流量）
 IMAGE_SUFFIX = f"@{IMAGE_SIZE}w_{IMAGE_SIZE}h_85q.webp"
 
 COL_IMG, COL_NAME, COL_CID, COL_PRICE, COL_AVG = 0, 1, 2, 3, 4
@@ -163,12 +163,16 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
-        header.resizeSection(COL_IMG, 80)
-        header.resizeSection(COL_NAME, 240)
+        self.table.setIconSize(QSize(IMAGE_SIZE, IMAGE_SIZE))
+        header.resizeSection(COL_IMG, IMAGE_SIZE + 8)
+        for col in (COL_PRICE, COL_AVG):
+            header.resizeSection(col, 100)
+        for col in (COL_DEAL_BASE, COL_DEAL_BASE + 1, COL_DEAL_BASE + 2):
+            header.resizeSection(col, 120)
         header.resizeSection(COL_CID, 100)
-        for col in (COL_PRICE, COL_AVG, COL_DEAL_BASE, COL_DEAL_BASE + 1, COL_DEAL_BASE + 2):
-            header.resizeSection(col, 110)
-        header.setSectionResizeMode(COL_LINK, QHeaderView.Stretch)
+        header.resizeSection(COL_LINK, 60)
+        # 商品名占剩余全部横向空间
+        header.setSectionResizeMode(COL_NAME, QHeaderView.Stretch)
         self.table.cellClicked.connect(self.OnCellClick)
         layout.addWidget(self.table)
 
@@ -318,6 +322,10 @@ class MainWindow(QMainWindow):
             return
         item = self.table.item(row, COL_IMG)
         if item is not None:
+            # CDN 已按 1:1 裁剪，这里兜底缩放保证不超出单元格
+            pixmap = pixmap.scaled(
+                IMAGE_SIZE, IMAGE_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
             item.setIcon(QIcon(pixmap))
 
     def OnPollFinished(self):

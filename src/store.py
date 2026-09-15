@@ -58,6 +58,8 @@ class Store:
 
 
 def default_db_path() -> str:
-    """缓存数据库路径（项目根目录，即 src/ 的上一级）。"""
+    """缓存数据库路径（项目根目录下的 data/ 目录，不存在则创建）。"""
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(root, DB_FILENAME)
+    data_dir = os.path.join(root, "data")
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.join(data_dir, DB_FILENAME)

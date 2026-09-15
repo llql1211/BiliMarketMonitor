@@ -4,5 +4,5 @@
 
 *.pyc
 
-watchlist.txt
-cache.db
+data/watchlist.txt
+data/cache.db

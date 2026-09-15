@@ -13,4 +13,4 @@ channels = ["conda-forge"]
 platforms = ["win-64"]
 
 [tool.pixi.tasks]
-start = { cmd = "python src/App.py", cwd = "." }
+start = { cmd = "python src/app.py", cwd = "." }
