@@ -3,4 +3,7 @@
 # 链接中携带的 share_medium、bbid 等无关参数不影响解析
 
 # 请将此示例文件复制一份为 watchlist.txt，放在同目录下，其不会被跟踪
-# 下面开始记录需要监视的商品 clusterId 或链接：
+
+# 下面开始记录需要监视的商品 clusterId 或链接，例如：
+# 10000008780
+# https://mall.bilibili.com/neul-next/resell/detail.html?clusterId=10000007650&noTitleBar=1&share_medium=android&share_source=weixin&bbid=XU8FF57870E1B13BBF6891E69F6F952B320E5&ts=1789136704090
