@@ -1,9 +1,10 @@
-# 监视清单：每行一条市集商品链接，或直接粘贴纯数字 clusterId
-# 以 # 开头的行、空行会被忽略；重复的 clusterId 只保留第一次出现
-# 链接中携带的 share_medium、bbid 等无关参数不影响解析
+# 监视清单示例：复制本文件为同目录下的 watchlist.txt 使用（watchlist.txt 不会被 git 跟踪）
+# 每行格式 <clusterId> | <商品名>，名称未知时只写 clusterId
+# 下面两种写法程序都能识别，但程序写回时会统一成上面那种格式：
+#   10000004212 | Vsinger 洛天依拍立得相框 规格：D款
+#   10000008780
+# 也可以直接粘贴分享链接（share_medium、bbid 等参数会被忽略）：
+#   https://mall.bilibili.com/neul-next/resell/detail.html?clusterId=10000004212&noTitleBar=1&share_medium=android&bbid=XU8FF57870E1B13BBF6891E69F6F952B320E5
 
-# 请将此示例文件复制一份为 watchlist.txt，放在同目录下，其不会被跟踪
-
-# 下面开始记录需要监视的商品 clusterId 或链接，例如：
-# 10000008780
-# https://mall.bilibili.com/neul-next/resell/detail.html?clusterId=10000007650&noTitleBar=1&share_medium=android&share_source=weixin&bbid=XU8FF57870E1B13BBF6891E69F6F952B320E5&ts=1789136704090
+10000004212 | Vsinger 洛天依拍立得相框 规格：D款
+10000008780 | 淬羽赫默 角色亚克力立牌 进阶大礼包 规格：大礼包

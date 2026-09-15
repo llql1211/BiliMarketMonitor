@@ -1,0 +1,14 @@
+# 本文件为程序默认配置文件，默认无需修改。若想进行个性化配置，请把本文件
+# 复制为 config.toml 后按需修改。config.toml 不会被 git 跟踪。
+
+# 商品详情页链接模板，必须包含 {clusterId} 占位符
+detail_url_template = "https://mall.bilibili.com/neul-next/resell/detail.html?clusterId={clusterId}"
+
+# 依次抓取每个商品之间的间隔（秒），建议不小于 2
+poll_interval_seconds = 2
+
+# 单个商品抓取失败后、重试前的等待（秒）
+retry_interval_seconds = 1
+
+# 单次请求超时（秒）
+request_timeout_seconds = 10

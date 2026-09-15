@@ -24,7 +24,7 @@ class ApiError(Exception):
     """统一的接口错误出口。"""
 
 
-def fetch_cluster(cluster_id: str, timeout: float = 10) -> dict:
+def fetch_cluster(cluster_id: str, timeout: float = 10.0) -> dict:
     """查询一个商品的 cluster_info，成功返回原始 JSON dict，失败抛 ApiError。"""
     try:
         resp = requests.post(

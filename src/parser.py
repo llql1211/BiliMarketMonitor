@@ -79,6 +79,12 @@ def parse_cluster(resp: dict) -> dict:
                 url = "https://" + url
             result["image_url"] = url
 
+    # 不存在的 clusterId 也会返回 success=true，只是 data 里除了 clusterId 什么都没有；
+    # 这种情况明确标成失败，避免界面上一直停留在"待抓取"。
+    if not any((result["name"], result["price"], result["image_url"])):
+        result["ok"] = False
+        result["error"] = "接口没有返回该商品的数据（clusterId 可能已失效）"
+
     return result
 
 

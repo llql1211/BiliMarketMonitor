@@ -4,5 +4,8 @@
 
 *.pyc
 
-data/watchlist.txt
+# 本地数据
 data/cache.db
+data/config.toml
+data/watchlist.txt
+data/watchlist.txt.bak
