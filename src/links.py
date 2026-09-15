@@ -46,6 +46,14 @@ def load_links(path: str):
     return entries
 
 
+def build_detail_url(cluster_id: str) -> str:
+    """由 clusterID 拼接可在浏览器打开的详情页地址。"""
+    return (
+        "https://mall.bilibili.com/neul-next/index.html"
+        f"?page=magic-market_detail&noTitleBar=1&clusterId={cluster_id}&from=market_index"
+    )
+
+
 def get_detail_url(entry: LinkEntry) -> str:
     """得到可在浏览器打开的详情页链接。
 
@@ -53,10 +61,7 @@ def get_detail_url(entry: LinkEntry) -> str:
     """
     if entry.raw.startswith("http"):
         return entry.raw
-    return (
-        "https://mall.bilibili.com/neul-next/index.html"
-        f"?page=magic-market_detail&noTitleBar=1&clusterId={entry.cluster_id}&from=market_index"
-    )
+    return build_detail_url(entry.cluster_id)
 
 
 def default_watchlist_path() -> str:

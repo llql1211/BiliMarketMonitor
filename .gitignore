@@ -5,3 +5,4 @@
 *.pyc
 
 watchlist.txt
+cache.db
