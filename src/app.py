@@ -291,11 +291,15 @@ class MainWindow(QMainWindow):
         header.resizeSection(COL_LINK, 60)
         # 商品名占剩余全部横向空间
         header.setSectionResizeMode(COL_NAME, QHeaderView.Stretch)
+        # 模板说明挂在「链接」列头上。以前是挂在主窗口上的，但 Qt 找 tooltip 会沿
+        # 父链上溯，于是每个没设自己 tooltip 的单元格都会弹它。
+        self.table.horizontalHeaderItem(COL_LINK).setToolTip(
+            f"点击「打开」用浏览器访问商品详情页\n链接由配置里的模板拼出：\n{template}"
+        )
         self.table.cellClicked.connect(self.OnCellClick)
         layout.addWidget(self.table)
 
         self.setCentralWidget(central)
-        self.setToolTip(f"详情页链接模板：{template}")
         self.SetBusy(False)  # 空闲态：暂停/停止置灰
 
     # ---------------- 数据载入 ----------------
@@ -353,6 +357,20 @@ class MainWindow(QMainWindow):
         for row, item in enumerate(self.rows):
             self.FillRow(row, item)
 
+    def MakeCell(self, text, tooltip=None, align=None):
+        """建单元格。tooltip 默认为该格的完整文本——列宽不够被截断时也能看全。
+
+        文本为空或只是占位符（—/…）时不挂，免得弹出来一句没信息量的提示。
+        """
+        item = QTableWidgetItem(text)
+        if tooltip is None and text not in ("", NO_DATA_TEXT, PENDING_TEXT):
+            tooltip = text
+        if tooltip:
+            item.setToolTip(tooltip)
+        if align is not None:
+            item.setTextAlignment(align)
+        return item
+
     def FillRow(self, row, item):
         """填充一行：优先显示本次抓到的值，其次缓存，最后留待抓取。"""
         values = item["values"] or {}
@@ -367,37 +385,33 @@ class MainWindow(QMainWindow):
             or item["entry"].name
             or (FAILED_TEXT if values and not values.get("ok") else PENDING_TEXT)
         )
-        name_item = QTableWidgetItem(name_text)
-        if values and not values.get("ok"):
-            name_item.setToolTip(values.get("error") or "未知错误")
-        self.table.setItem(row, COL_NAME, name_item)
+        # 抓失败时，名称格的提示换成失败原因（比重复一遍名称有用）
+        name_tip = (values.get("error") or "未知错误") if values and not values.get("ok") else None
+        self.table.setItem(row, COL_NAME, self.MakeCell(name_text, tooltip=name_tip))
 
-        self.table.setItem(row, COL_CID, QTableWidgetItem(cluster_id))
+        self.table.setItem(row, COL_CID, self.MakeCell(cluster_id))
 
         def text(value):
             return str(value) if value else NO_DATA_TEXT
 
-        self.table.setItem(row, COL_PRICE, QTableWidgetItem(text(values.get("price"))))
-        self.table.setItem(row, COL_AVG, QTableWidgetItem(text(values.get("avg_price"))))
+        self.table.setItem(row, COL_PRICE, self.MakeCell(text(values.get("price"))))
+        self.table.setItem(row, COL_AVG, self.MakeCell(text(values.get("avg_price"))))
         deals = values.get("deals") or []
         for i in range(3):
             deal_text = (
                 f"{deals[i]['price']} · {deals[i]['time']}"
                 if i < len(deals) else NO_DATA_TEXT
             )
-            self.table.setItem(row, COL_DEAL_BASE + i, QTableWidgetItem(deal_text))
+            self.table.setItem(row, COL_DEAL_BASE + i, self.MakeCell(deal_text))
 
-        img_item = QTableWidgetItem()
-        img_item.setTextAlignment(Qt.AlignCenter)
-        self.table.setItem(row, COL_IMG, img_item)
+        self.table.setItem(row, COL_IMG, self.MakeCell("", align=Qt.AlignCenter))
         if record.get("image_url"):
             self.image_fetcher.fetch(row, record["image_url"] + IMAGE_SUFFIX)
 
         url = links.build_detail_url(cluster_id, self.config["detail_url_template"])
         self.row_urls[row] = url
-        link_item = QTableWidgetItem("打开")
+        link_item = self.MakeCell("打开", tooltip=url, align=Qt.AlignCenter)
         link_item.setData(Qt.UserRole, url)
-        link_item.setTextAlignment(Qt.AlignCenter)
         self.table.setItem(row, COL_LINK, link_item)
 
     def IsPolling(self) -> bool:
@@ -562,20 +576,21 @@ class MainWindow(QMainWindow):
         def text(value):
             return str(value) if value else NO_DATA_TEXT
 
-        self.table.setItem(row, COL_PRICE, QTableWidgetItem(text(result["price"])))
-        self.table.setItem(row, COL_AVG, QTableWidgetItem(text(result["avg_price"])))
+        self.table.setItem(row, COL_PRICE, self.MakeCell(text(result["price"])))
+        self.table.setItem(row, COL_AVG, self.MakeCell(text(result["avg_price"])))
         deals = result["deals"]
         for i in range(3):
             deal_text = (
                 f"{deals[i]['price']} · {deals[i]['time']}"
                 if i < len(deals) else NO_DATA_TEXT
             )
-            self.table.setItem(row, COL_DEAL_BASE + i, QTableWidgetItem(deal_text))
+            self.table.setItem(row, COL_DEAL_BASE + i, self.MakeCell(deal_text))
 
         # 名称：接口返回的才是最新的；失败时如果原本没有名字，标出来而不是留个"…"
         name_item = self.table.item(row, COL_NAME)
         if result["ok"] and result["name"]:
             name_item.setText(result["name"])
+            name_item.setToolTip(result["name"])  # 跟着新名字走
             item["entry"].name = result["name"]
         elif not result["ok"]:
             name_item.setToolTip(result["error"] or "未知错误")
