@@ -1,0 +1,16 @@
+[project]
+name = "bili-market-price-watcher"
+version = "0.1.0"
+description = "Bilibili 市集商品价格监视器"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.28",
+    "PyQt5>=5.15",
+]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["win-64"]
+
+[tool.pixi.tasks]
+start = { cmd = "python src/App.py", cwd = "." }
