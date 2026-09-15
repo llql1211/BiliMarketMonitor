@@ -3,7 +3,8 @@
 启动流程：
 1. 读取 watchlist.txt，并让缓存库严格跟随清单（缺的补、多的删）；
 2. 把能显示的数据（名称、缩略图、clusterID）摆上表格；
-3. 点「抓取价格」时逐个抓取价格，新商品连名称、缩略图一起抓。
+3. 点「开始抓取」时逐个抓取价格，新商品连名称、缩略图一起抓；
+   抓取过程中可以「暂停抓取」（两条商品之间生效）或「停止抓取」（已抓到的保留）。
 
 与旧版 src/App.py 的关键区别：轮询放在 QThread 子线程里做，
 通过信号槽把每条结果回传主线程刷新表格，避免界面假死。
@@ -21,12 +22,14 @@ from PyQt5.QtGui import QIcon, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
-    QFileDialog,
+    QDialog,
+    QDialogButtonBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -54,11 +57,28 @@ PENDING_TEXT = "…"      # 等待抓取
 NO_DATA_TEXT = "—"      # 无数据
 FAILED_TEXT = "（查询失败）"
 
+PAUSE_TEXT = "暂停抓取"
+RESUME_TEXT = "继续抓取"
+ADD_PLACEHOLDER = "粘贴商品 ID 或分享链接，一行一个…"
+
+
+def _skipped_note(duplicated: int, invalid: int) -> str:
+    """「添加」结果里的补充说明：有几条已存在、几行没认出来。"""
+    notes = []
+    if duplicated:
+        notes.append(f"{duplicated} 条已存在")
+    if invalid:
+        notes.append(f"{invalid} 行无法识别")
+    return "（已忽略：" + "、".join(notes) + "）" if notes else ""
+
 
 class PollerThread(QThread):
     """依次（非并发）查询每个商品，单条失败重试 1 次后放弃。
 
     tasks 为 [(行号, LinkEntry)]，只轮询 watchlist 里的商品。
+
+    pause()/resume() 在两条商品之间生效，不会打断正在进行的请求；
+    stop() 直接中止本次抓取（已经 emit 出去的结果由主线程保留）。
     """
 
     result_ready = pyqtSignal(int, dict)     # 行号, 解析结果
@@ -72,13 +92,27 @@ class PollerThread(QThread):
         self.retry_interval = retry_interval
         self.request_timeout = request_timeout
         self._stop = False
+        self._paused = False
 
     def stop(self):
         self._stop = True
+        self._paused = False  # 顺手解除暂停，否则线程会卡在暂停里退不出去
+
+    def pause(self):
+        self._paused = True
+
+    def resume(self):
+        self._paused = False
+
+    def is_paused(self) -> bool:
+        return self._paused
 
     def run(self):
         total = len(self.tasks)
         for i, (row, entry) in enumerate(self.tasks):
+            if self._stop:
+                break
+            self._wait_if_paused()  # 暂停时不发下一个请求
             if self._stop:
                 break
             self.progress_changed.emit(i + 1, total)
@@ -102,11 +136,21 @@ class PollerThread(QThread):
                 self._sleep(self.poll_interval)
         self.finished_all.emit()
 
+    def _wait_if_paused(self):
+        """暂停期间原地等着，直到 resume() 或 stop()。"""
+        while self._paused and not self._stop:
+            time.sleep(0.1)
+
     def _sleep(self, seconds):
-        """分片 sleep，保证 stop() 能及时生效。"""
-        end = time.time() + seconds
-        while not self._stop and time.time() < end:
-            time.sleep(min(0.1, end - time.time()))
+        """分片 sleep，保证 pause()/stop() 能及时生效；暂停期间不计时。"""
+        remaining = seconds
+        while remaining > 0 and not self._stop:
+            if self._paused:
+                time.sleep(0.1)  # 暂停时不扣 remaining，恢复后接着睡完
+                continue
+            step = min(0.1, remaining)
+            time.sleep(step)
+            remaining -= step
 
 
 class ImageFetcher(QObject):
@@ -128,6 +172,35 @@ class ImageFetcher(QObject):
             self.fetched.emit(row, pixmap)
 
 
+class AddDialog(QDialog):
+    """添加商品：多行输入 ID/链接（一行一个），比单行输入框多留了批量粘贴的余地。"""
+
+    def __init__(self, dark: bool, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("添加商品")
+        self.resize(480, 260)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("商品 ID 或分享链接，一行一个："))
+
+        self.editor = QPlainTextEdit()
+        self.editor.setPlaceholderText(ADD_PLACEHOLDER)
+        theme.style_placeholder(self.editor, dark)  # 灰字，深浅主题下都要看得清
+        layout.addWidget(self.editor)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("确定")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.editor.setFocus()
+
+    def text(self) -> str:
+        return self.editor.toPlainText()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -139,6 +212,7 @@ class MainWindow(QMainWindow):
         self.row_urls = {}       # 行号 -> 详情页链接
         self.poller = None
         self.names_learned = False  # 本次抓取是否学到了新名称（决定要不要回写清单）
+        self.poller_stopped = False  # 本次抓取是否被「停止抓取」中止
         self.image_fetcher = ImageFetcher()
         self.image_fetcher.fetched.connect(self.OnImageFetched)
         self.InitUI()
@@ -156,14 +230,16 @@ class MainWindow(QMainWindow):
 
         # 顶部按钮行
         btn_bar = QHBoxLayout()
-        self.btn_import = QPushButton("导入…")
+        self.btn_add = QPushButton("添加…")
         self.btn_delete = QPushButton("删除选中")
         self.btn_normalize = QPushButton("整理清单")
         self.btn_refresh_list = QPushButton("刷新商品列表")
-        self.btn_fetch = QPushButton("抓取价格")
+        self.btn_fetch = QPushButton("开始抓取")
+        self.btn_pause = QPushButton(PAUSE_TEXT)
+        self.btn_stop = QPushButton("停止抓取")
         for btn, slot, tip in (
-            (self.btn_import, self.OnImport,
-             "从 txt 文件导入链接，追加写入 watchlist.txt 末尾"),
+            (self.btn_add, self.OnAdd,
+             "输入商品 ID 或分享链接（一行一个），追加写入 watchlist.txt 末尾"),
             (self.btn_delete, self.OnDeleteSelected,
              "把选中的商品从 watchlist.txt 和缓存中删除"),
             (self.btn_normalize, self.OnNormalize,
@@ -172,14 +248,20 @@ class MainWindow(QMainWindow):
              "重新读取 watchlist.txt（手工改动后点这里同步）"),
             (self.btn_fetch, self.OnFetchPrices,
              f"逐个抓取价格，间隔 {self.config['poll_interval_seconds']:g} 秒"),
+            (self.btn_pause, self.OnTogglePause,
+             "暂停 / 继续本次抓取（在两条商品之间生效，不打断正在进行的请求）"),
+            (self.btn_stop, self.OnStopFetch,
+             "中止本次抓取，已经抓到的结果会保留在表格和缓存里"),
         ):
             btn.setToolTip(tip)
             btn_bar.addWidget(btn)
-        self.btn_import.clicked.connect(self.OnImport)
+        self.btn_add.clicked.connect(self.OnAdd)
         self.btn_delete.clicked.connect(self.OnDeleteSelected)
         self.btn_normalize.clicked.connect(self.OnNormalize)
         self.btn_refresh_list.clicked.connect(self.OnRefreshList)
         self.btn_fetch.clicked.connect(self.OnFetchPrices)
+        self.btn_pause.clicked.connect(self.OnTogglePause)
+        self.btn_stop.clicked.connect(self.OnStopFetch)
 
         btn_bar.addStretch()
         self.progress_label = QLabel("就绪")
@@ -214,6 +296,7 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
         self.setToolTip(f"详情页链接模板：{template}")
+        self.SetBusy(False)  # 空闲态：暂停/停止置灰
 
     # ---------------- 数据载入 ----------------
 
@@ -233,7 +316,7 @@ class MainWindow(QMainWindow):
         self.RebuildRows(keep_values=False)
         self.progress_label.setText(
             f"共 {len(self.rows)} 件商品（缓存新增 {added}，删除 {removed}）"
-            f"，点「抓取价格」开始查询"
+            f"，点「开始抓取」开始查询"
         )
         return True
 
@@ -320,10 +403,14 @@ class MainWindow(QMainWindow):
     def IsPolling(self) -> bool:
         return self.poller is not None and self.poller.isRunning()
 
-    def SetButtonsEnabled(self, enabled: bool):
-        for btn in (self.btn_import, self.btn_delete, self.btn_normalize,
+    def SetBusy(self, busy: bool):
+        """抓取中：清单管理类按钮置灰、暂停/停止放开；空闲时反过来。"""
+        for btn in (self.btn_add, self.btn_delete, self.btn_normalize,
                     self.btn_refresh_list, self.btn_fetch):
-            btn.setEnabled(enabled)
+            btn.setEnabled(not busy)
+        self.btn_pause.setEnabled(busy)
+        self.btn_stop.setEnabled(busy)
+        self.btn_pause.setText(PAUSE_TEXT)  # 每次进出都复位成「暂停抓取」
 
     # ---------------- 清单写入 ----------------
 
@@ -347,26 +434,41 @@ class MainWindow(QMainWindow):
         if self.SaveWatchlist():
             self.progress_label.setText("清单已按规范格式整理")
 
-    def OnImport(self):
-        """导入链接：追加到 watchlist.txt 末尾，并立即显示为新行。"""
+    def OnAdd(self):
+        """添加商品：弹窗输入 ID/链接（一行一个），追加到 watchlist.txt 末尾并立即显示为新行。"""
         if self.IsPolling():
             return
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择要导入的链接文件",
-            os.path.dirname(self.watchlist_path), "Text (*.txt);;All Files (*)",
-        )
-        if not path:
+        dialog = AddDialog(self.dark, self)
+        if dialog.exec_() != QDialog.Accepted:
             return
-        try:
-            imported = links.load_links(path)
-        except OSError as err:
-            QMessageBox.warning(self, "导入失败", f"读取文件出错：\n{err}")
+
+        entries, seen, invalid = [], set(), 0
+        for line in dialog.text().splitlines():
+            if not line.strip() or line.strip().startswith("#"):
+                continue  # 空行 / 注释行
+            cluster_id, name = links.parse_line(line)
+            if cluster_id is None:
+                invalid += 1
+                continue
+            if cluster_id in seen:  # 同一批里重复的只留第一条
+                continue
+            seen.add(cluster_id)
+            entries.append(links.LinkEntry(cluster_id, name, line.strip()))
+
+        if not entries:
+            QMessageBox.warning(
+                self, "没有可添加的商品",
+                "没识别到商品 ID 或链接。\n"
+                "支持纯数字 ID，以及含 clusterId=… 的分享链接。",
+            )
             return
 
         existing = {item["entry"].cluster_id for item in self.rows}
-        new_entries = [e for e in imported if e.cluster_id not in existing]
+        new_entries = [e for e in entries if e.cluster_id not in existing]
         if not new_entries:
-            self.progress_label.setText(f"没有新商品（文件里 {len(imported)} 条已全部在清单中）")
+            self.progress_label.setText(
+                f"没有新商品（输入的 {len(entries)} 条已全部在清单中）"
+            )
             return
 
         self.watch_entries.extend(new_entries)
@@ -376,7 +478,8 @@ class MainWindow(QMainWindow):
         self.RenderTable()
         self.SaveWatchlist()
         self.progress_label.setText(
-            f"已导入 {len(new_entries)} 条并追加到 watchlist 末尾，待抓取价格"
+            f"已添加 {len(new_entries)} 件商品到 watchlist，待抓取价格"
+            + _skipped_note(len(entries) - len(new_entries), invalid)
         )
 
     def OnDeleteSelected(self):
@@ -426,7 +529,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示", "watchlist 中没有商品链接。")
             return
         self.names_learned = False
-        self.SetButtonsEnabled(False)
+        self.poller_stopped = False
+        self.SetBusy(True)
         self.poller = PollerThread(
             tasks,
             self.config["poll_interval_seconds"],
@@ -493,8 +597,34 @@ class MainWindow(QMainWindow):
             )
             item.setIcon(QIcon(pixmap))
 
+    def OnTogglePause(self):
+        """暂停 / 继续本次抓取。"""
+        if not self.IsPolling():
+            return
+        if self.poller.is_paused():
+            self.poller.resume()
+            self.progress_label.setText("继续抓取…")
+        else:
+            self.poller.pause()
+            self.progress_label.setText("已暂停（当前这条请求返回后生效）")
+        # 文案跟着状态走，用户一眼能看出现在点它是「暂停」还是「继续」
+        self.btn_pause.setText(RESUME_TEXT if self.poller.is_paused() else PAUSE_TEXT)
+
+    def OnStopFetch(self):
+        """中止本次抓取：已经抓到的结果留在表格和缓存里，不写回清单。"""
+        if not self.IsPolling():
+            return
+        self.poller_stopped = True
+        self.poller.stop()
+        self.btn_pause.setEnabled(False)  # 已停止，暂停没意义了
+        self.btn_stop.setEnabled(False)
+        self.progress_label.setText("正在停止…")
+
     def OnPollFinished(self):
-        self.SetButtonsEnabled(True)
+        self.SetBusy(False)
+        if self.poller_stopped:
+            self.progress_label.setText("已停止抓取，已抓到的结果保留")
+            return
         if self.names_learned:
             # 抓到了新名称，顺手把清单刷新一次，方便用户直接在文件里管理
             if self.SaveWatchlist():
@@ -538,7 +668,7 @@ def main():
     window = MainWindow()
     window.show()
 
-    # 程序启动时：读取清单、同步缓存、显示已有数据；抓取由「抓取价格」按钮触发
+    # 程序启动时：读取清单、同步缓存、显示已有数据；抓取由「开始抓取」按钮触发
     default_path = links.default_watchlist_path()
     if os.path.exists(default_path):
         window.LoadWatchlist(default_path)

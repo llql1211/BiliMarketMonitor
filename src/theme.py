@@ -1,5 +1,7 @@
 """界面主题：暗色/浅色样式表，以及系统深浅色判断。"""
 
+from PyQt5.QtGui import QColor, QPalette
+
 LIGHT_QSS = ""  # 浅色用 Qt 默认样式，不做额外装饰
 
 DARK_QSS = """
@@ -48,6 +50,13 @@ QPushButton:disabled {
 }
 QLabel {
     background: transparent;
+}
+QPlainTextEdit {
+    background-color: #26272b;
+    color: #e3e3e3;
+    border: 1px solid #4a4d55;
+    border-radius: 4px;
+    padding: 4px;
 }
 QToolTip {
     background-color: #2f3136;
@@ -107,6 +116,18 @@ def system_uses_dark() -> bool:
 
 def qss_for(dark: bool) -> str:
     return DARK_QSS if dark else LIGHT_QSS
+
+
+def style_placeholder(widget, dark: bool):
+    """给输入框的占位文字（灰字）上色。
+
+    占位文字走的是 QPalette.PlaceholderText，样式表管不到；
+    不显式设的话暗色主题下会跟着正文色走，几乎看不出是提示。
+    """
+    color = "#7a7d85" if dark else "#9aa0a6"  # 暗色这档与禁用按钮文字同色
+    palette = widget.palette()
+    palette.setColor(QPalette.PlaceholderText, QColor(color))
+    widget.setPalette(palette)
 
 
 def apply_theme(app, dark: bool):
