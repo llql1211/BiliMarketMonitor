@@ -20,7 +20,6 @@ from PyQt5.QtCore import QObject, QSize, Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QIcon, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
-    QFileDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -127,6 +126,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.store = store.Store(store.default_db_path())
+        self.watchlist_path = links.default_watchlist_path()
         self.watch_entries = []  # List[links.LinkEntry]，来自 watchlist.txt
         self.rows = []           # 表格行模型：[{"entry": LinkEntry|None, "record": dict|None}]
         self.row_urls = {}       # 行号 -> 详情页链接
@@ -144,13 +144,13 @@ class MainWindow(QMainWindow):
 
         # 顶部按钮行
         btn_bar = QHBoxLayout()
-        self.btn_import = QPushButton("导入链接…")
-        self.btn_refresh = QPushButton("刷新")
-        self.btn_import.clicked.connect(self.OnImport)
-        self.btn_refresh.clicked.connect(self.OnRefresh)
+        self.btn_refresh_list = QPushButton("刷新商品列表")
+        self.btn_fetch = QPushButton("抓取价格")
+        self.btn_refresh_list.clicked.connect(self.OnRefreshList)
+        self.btn_fetch.clicked.connect(self.OnFetchPrices)
         self.progress_label = QLabel("就绪")
-        btn_bar.addWidget(self.btn_import)
-        btn_bar.addWidget(self.btn_refresh)
+        btn_bar.addWidget(self.btn_refresh_list)
+        btn_bar.addWidget(self.btn_fetch)
         btn_bar.addStretch()
         btn_bar.addWidget(self.progress_label)
         layout.addLayout(btn_bar)
@@ -179,17 +179,18 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
     def LoadWatchlist(self, path):
-        """读取 watchlist，与缓存库合并成表格行，先显示缓存里已有的数据。"""
+        """启动时读取 watchlist，与缓存库合并成表格行，先显示缓存里已有的数据。"""
         try:
             entries = links.load_links(path)
         except OSError as err:
             QMessageBox.warning(self, "导入失败", f"读取文件出错：\n{err}")
             return
+        self.watchlist_path = path
         self.watch_entries = entries
         self.RebuildRows()
 
     def RebuildRows(self):
-        """watchlist 与缓存库求并集：watchlist 条目在前，仅存在于缓存中的条目在后。"""
+        """整体重建表格行：watchlist 与缓存库求并集，watchlist 条目在前。"""
         rows = []
         seen = set()
         for entry in self.watch_entries:
@@ -199,74 +200,135 @@ class MainWindow(QMainWindow):
             if record["cluster_id"] not in seen:
                 rows.append({"entry": None, "record": record})
         self.rows = rows
-        self.BuildTable()
-
-    def BuildTable(self):
-        self.table.setRowCount(len(self.rows))
+        self.table.setRowCount(len(rows))
         self.row_urls.clear()
-        for row, item in enumerate(self.rows):
-            self.table.setRowHeight(row, IMAGE_SIZE + 8)
-            entry, record = item["entry"], item["record"]
-            cluster_id = entry.cluster_id if entry else record["cluster_id"]
+        for row, item in enumerate(rows):
+            self.FillRow(row, item)
+        self.UpdateSummary()
 
-            # 商品名：有缓存用缓存；清单里的新商品先占位等抓取
-            if record and record["name"]:
-                name_text = record["name"]
-            elif entry:
-                name_text = PENDING_TEXT
-            else:
-                name_text = "（无缓存记录）"
-            name_item = QTableWidgetItem(name_text)
-            if entry is None:
-                name_item.setToolTip("不在 watchlist 中，仅显示缓存信息")
-            self.table.setItem(row, COL_NAME, name_item)
+    def AppendRow(self, item):
+        """在表格末尾追加一行（不影响已抓取到的数据）。"""
+        self.rows.append(item)
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.FillRow(row, item)
 
-            self.table.setItem(row, COL_CID, QTableWidgetItem(cluster_id))
+    def FillRow(self, row, item):
+        """填充一行：有缓存就显示名称/缩略图，价格列留待抓取。"""
+        self.table.setRowHeight(row, IMAGE_SIZE + 8)
+        entry, record = item["entry"], item["record"]
+        cluster_id = entry.cluster_id if entry else record["cluster_id"]
 
-            # 价格信息：清单内商品等待抓取，仅缓存条目没有价格
-            pending = PENDING_TEXT if entry else NO_DATA_TEXT
-            self.table.setItem(row, COL_PRICE, QTableWidgetItem(pending))
-            self.table.setItem(row, COL_AVG, QTableWidgetItem(pending))
-            for i in range(3):
-                self.table.setItem(row, COL_DEAL_BASE + i, QTableWidgetItem(pending))
+        # 商品名：有缓存用缓存；清单里的新商品先占位等抓取
+        if record and record["name"]:
+            name_text = record["name"]
+        elif entry:
+            name_text = PENDING_TEXT
+        else:
+            name_text = "（无缓存记录）"
+        name_item = QTableWidgetItem(name_text)
+        if entry is None:
+            name_item.setToolTip("不在 watchlist 中，仅显示缓存信息")
+        self.table.setItem(row, COL_NAME, name_item)
 
-            img_item = QTableWidgetItem()
-            img_item.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(row, COL_IMG, img_item)
+        self.table.setItem(row, COL_CID, QTableWidgetItem(cluster_id))
 
-            # 缩略图：有缓存直接加载，不用等抓取
-            if record and record["image_url"]:
-                self.image_fetcher.fetch(row, record["image_url"] + IMAGE_SUFFIX)
+        # 价格信息：清单内商品等待抓取，仅缓存条目没有价格
+        pending = PENDING_TEXT if entry else NO_DATA_TEXT
+        self.table.setItem(row, COL_PRICE, QTableWidgetItem(pending))
+        self.table.setItem(row, COL_AVG, QTableWidgetItem(pending))
+        for i in range(3):
+            self.table.setItem(row, COL_DEAL_BASE + i, QTableWidgetItem(pending))
 
-            url = links.get_detail_url(entry) if entry else links.build_detail_url(cluster_id)
-            self.row_urls[row] = url
-            link_item = QTableWidgetItem("打开")
-            link_item.setData(Qt.UserRole, url)
-            link_item.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(row, COL_LINK, link_item)
+        img_item = QTableWidgetItem()
+        img_item.setTextAlignment(Qt.AlignCenter)
+        self.table.setItem(row, COL_IMG, img_item)
 
+        # 缩略图：有缓存直接加载，不用等抓取
+        if record and record["image_url"]:
+            self.image_fetcher.fetch(row, record["image_url"] + IMAGE_SUFFIX)
+
+        url = links.get_detail_url(entry) if entry else links.build_detail_url(cluster_id)
+        self.row_urls[row] = url
+        link_item = QTableWidgetItem("打开")
+        link_item.setData(Qt.UserRole, url)
+        link_item.setTextAlignment(Qt.AlignCenter)
+        self.table.setItem(row, COL_LINK, link_item)
+
+    def UpdateSummary(self):
         cached = sum(1 for item in self.rows if item["record"])
         self.progress_label.setText(
             f"共 {len(self.rows)} 件商品（{cached} 件有本地缓存），待抓取 "
             f"{sum(1 for item in self.rows if item['entry'])} 件"
         )
 
-    def OnImport(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择链接文件", links.default_watchlist_path(),
-            "Text (*.txt);;All Files (*)",
-        )
-        if path:
-            self.LoadWatchlist(path)
+    @staticmethod
+    def RowClusterId(item):
+        return item["entry"].cluster_id if item["entry"] else item["record"]["cluster_id"]
 
-    def OnRefresh(self):
+    def OnRefreshList(self):
+        """重新读取 watchlist.txt：清单里新增的商品补成新行（只填 clusterID）。
+
+        分两种情况：
+        - 表格中完全没有该 clusterID -> 新建一行，只填 clusterID，等抓取；
+        - 该商品原先只是"仅缓存"行（不在清单中）-> 并入监视范围，之后会抓价格。
+        """
+        try:
+            entries = links.load_links(self.watchlist_path)
+        except OSError as err:
+            QMessageBox.warning(self, "刷新失败", f"读取 watchlist 出错：\n{err}")
+            return
+        self.watch_entries = entries
+
+        row_by_cid = {self.RowClusterId(item): item for item in self.rows}
+        new_items = []
+        promoted = 0
+        for entry in entries:
+            item = row_by_cid.get(entry.cluster_id)
+            if item is None:
+                item = {"entry": entry, "record": self.store.get_item(entry.cluster_id)}
+                row_by_cid[entry.cluster_id] = item
+                new_items.append(item)
+            elif item["entry"] is None:
+                self.PromoteRow(item, entry)
+                promoted += 1
+
+        for item in new_items:
+            self.AppendRow(item)
+
+        self.UpdateSummary()
+        parts = []
+        if new_items:
+            parts.append(f"新增 {len(new_items)} 行")
+        if promoted:
+            parts.append(f"{promoted} 行并入监视")
+        if parts:
+            self.progress_label.setText("商品列表已更新：" + "，".join(parts))
+        else:
+            self.progress_label.setText("商品列表已是最新")
+
+    def PromoteRow(self, item, entry):
+        """把"仅缓存"行并入监视范围：补上清单条目，价格列改为待抓取。"""
+        item["entry"] = entry
+        row = self.rows.index(item)
+        name_item = self.table.item(row, COL_NAME)
+        if name_item is not None:
+            name_item.setToolTip("")
+        for col in (COL_PRICE, COL_AVG,
+                    COL_DEAL_BASE, COL_DEAL_BASE + 1, COL_DEAL_BASE + 2):
+            self.table.setItem(row, col, QTableWidgetItem(PENDING_TEXT))
+        self.row_urls[row] = links.get_detail_url(entry)
+
+    def OnFetchPrices(self):
+        """抓取已有商品的价格；新增商品连名称、缩略图一起抓。"""
         if self.poller is not None and self.poller.isRunning():
             return  # 轮询中不允许重复启动
         tasks = [(i, item["entry"]) for i, item in enumerate(self.rows) if item["entry"]]
         if not tasks:
             QMessageBox.information(self, "提示", "watchlist 中没有商品链接。")
             return
-        self.btn_refresh.setEnabled(False)
+        self.btn_fetch.setEnabled(False)
+        self.btn_refresh_list.setEnabled(False)
         self.poller = PollerThread(tasks)
         self.poller.result_ready.connect(self.OnResultReady)
         self.poller.progress_changed.connect(self.OnProgress)
@@ -329,7 +391,8 @@ class MainWindow(QMainWindow):
             item.setIcon(QIcon(pixmap))
 
     def OnPollFinished(self):
-        self.btn_refresh.setEnabled(True)
+        self.btn_fetch.setEnabled(True)
+        self.btn_refresh_list.setEnabled(True)
         self.progress_label.setText("完成")
 
     def OnCellClick(self, row, col):
@@ -344,12 +407,11 @@ def main():
     window = MainWindow()
     window.show()
 
-    # 程序启动时：扫描 watchlist + 缓存库，先显示缓存，
-    # 再对 watchlist 中的商品轮询一遍价格
+    # 程序启动时：扫描 watchlist + 缓存库，先显示缓存里已有的名称/缩略图，
+    # 再由"抓取价格"按钮逐个抓取价格
     default_path = links.default_watchlist_path()
     if os.path.exists(default_path):
         window.LoadWatchlist(default_path)
-        window.OnRefresh()
 
     sys.exit(app.exec_())
 
