@@ -23,11 +23,32 @@
 
 ### 安装与启动
 
-使用 [pixi](https://pixi.sh) 管理环境，首次运行会自动创建环境并安装依赖（`requests`、`PyQt5`）：
+需要 Python 3.11 或更高（读配置用到 `tomllib`），依赖（`requests`、`PyQt5`）写在 `pyproject.toml` 里，用 pip 装即可。装好依赖后从仓库根目录运行 `python src/app.py`，两种方式等价，用哪个都行。
+
+**方式一：普通 Python**——已有 Python 环境时最省事：
+
+安装：
+
+```bash
+python -m venv .venv
+source .venv/Scripts/activate      # Windows(Git Bash)；cmd/PowerShell 用 .venv\Scripts\activate
+# Linux/macOS 改用 source .venv/bin/activate
+pip install -e .                   # 读 pyproject.toml 装依赖；不加 -e 也行，区别只是会把源码复制进环境
+```
+
+运行：
+
+```bash
+python src/app.py
+```
+
+**方式二：[pixi](https://pixi.sh)**——不用自己管 Python 版本：
 
 ```bash
 pixi run start
 ```
+
+`pixi run` 会在环境没装或已过期时自动装好再运行，无需先手动 install。pixi 只是本仓库图省事选用的环境管理工具，程序本身不依赖它，`pyproject.toml` 里的 `[tool.pixi.*]` 两节删掉也不影响运行。
 
 ### 配置
 
@@ -52,7 +73,7 @@ cp data/config.example.toml data/config.toml   # 想改配置时
 
 编辑 `data/watchlist.txt`，每行一件商品：
 
-```
+```text
 # 以 # 开头的行、空行会被忽略；重复的 clusterId 只保留第一次出现
 10000008780 | 淬羽赫默 角色亚克力立牌 进阶大礼包 规格：大礼包
 10000004212
@@ -78,9 +99,9 @@ https://mall.bilibili.com/neul-next/resell/detail.html?clusterId=10000004245
 
 ## 架构
 
-```
+```text
 BiliMarket/
-├── pyproject.toml      # 依赖 + pixi 配置 + 启动任务
+├── pyproject.toml      # 依赖声明 + pixi 配置 + 启动任务（后两者可选）
 ├── data/               # 数据文件
 │   ├── config.example.toml    # 配置默认值（随仓库分发，可复制为 config.toml 后修改）
 │   ├── config.toml            # 个人配置（可选，不入库）
@@ -121,4 +142,3 @@ Copyright (C) 2026 llql1211
 或改用 LGPL 的 PySide6。
 
 这意味着：你可以自由使用、修改、再分发本程序，但**再分发修改版时必须同样开源**。
-
