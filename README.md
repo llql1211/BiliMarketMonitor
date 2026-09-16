@@ -97,17 +97,38 @@ https://mall.bilibili.com/neul-next/resell/detail.html?clusterId=10000004245
 - 查询失败的商品，把鼠标悬停在商品名上可查看错误原因
 - 支持按住 Ctrl / Shift 多选，配合"删除选中"批量清理
 
+## 测试
+
+界面测试跑在 Qt 的 offscreen 平台上，不需要显示器，也不会联网：
+
+```bash
+pixi run test
+```
+
+普通 Python 环境则先 `pip install -e ".[test]"`，再 `python -m pytest`。
+
+测试有三条规矩（都写在 `tests/conftest.py` 里）：**不碰真实 `data/`**（数据路径整体指向临时目录，另有会话级看门狗比对 `data/` 指纹，被改动过就 fail）、**不联网**（`requests` 一律被换成抛错）、**不弹窗**（`QMessageBox` 与 `webbrowser.open` 一律被拦下并记录）。
+
 ## 架构
 
 ```text
 BiliMarket/
-├── pyproject.toml      # 依赖声明 + pixi 配置 + 启动任务（后两者可选）
+├── pyproject.toml      # 依赖声明 + pixi 配置 + 启动/测试任务（后两者可选）
 ├── data/               # 数据文件
 │   ├── config.example.toml    # 配置默认值（随仓库分发，可复制为 config.toml 后修改）
 │   ├── config.toml            # 个人配置（可选，不入库）
 │   ├── watchlist.example.txt  # 监视清单示例（模板）
 │   ├── watchlist.txt          # 监视清单（用户维护，程序会规范化写回，不入库）
 │   └── cache.db               # 本地缓存（首次运行后自动生成，不入库）
+├── tests/              # pytest 测试（界面走 offscreen，见「测试」一节）
+│   ├── conftest.py     # 临时数据目录 / 无头 Qt / 看门狗 / 拦网络与弹窗
+│   ├── test_app.py     # 主窗口渲染与按钮流程、PollerThread、缩略图线程
+│   ├── test_client.py  # 请求形态与各类失败的统一出口
+│   ├── test_config.py  # 配置优先级与逐项校验
+│   ├── test_links.py   # 清单解析、去重、规范化回写
+│   ├── test_parser.py  # 响应解析与全路径判空
+│   ├── test_store.py   # SQLite 缓存随清单增删、设置项
+│   └── test_theme.py   # 样式表、占位文字配色、系统深浅色判断
 └── src/
     ├── app.py          # 入口：PyQt5 主窗口 + QThread 轮询调度
     ├── client.py       # API 封装：fetch_cluster(cluster_id)

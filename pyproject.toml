@@ -11,9 +11,27 @@ dependencies = [
     "PyQt5>=5.15",
 ]
 
+# 测试依赖：pip 用户 `pip install -e ".[test]"`
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
 [tool.pixi.workspace]
 channels = ["conda-forge"]
 platforms = ["win-64"]
 
 [tool.pixi.tasks]
 start = { cmd = "python src/app.py", cwd = "." }
+
+# pixi 不认 [project.optional-dependencies]，同一份依赖得在这里再写一次；
+# 把 test feature 并进默认环境，`pixi run test` 和 `pixi run start` 共用一个环境。
+[tool.pixi.feature.test.pypi-dependencies]
+pytest = ">=8"
+
+[tool.pixi.environments]
+default = { features = ["test"], solve-group = "default" }
+
+[tool.pixi.feature.test.tasks]
+test = { cmd = "python -m pytest", cwd = "." }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
