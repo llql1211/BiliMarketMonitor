@@ -8,9 +8,21 @@ import time
 
 import pytest
 import requests
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QPixmap
-from PyQt5.QtWidgets import QDialog, QMessageBox
+from PyQt5.QtCore import QMimeData, QModelIndex, QPoint, QRect, Qt
+from PyQt5.QtGui import (
+    QDrag,
+    QDragEnterEvent,
+    QDragLeaveEvent,
+    QDragMoveEvent,
+    QDropEvent,
+    QPixmap,
+)
+from PyQt5.QtWidgets import (
+    QAbstractItemView,
+    QDialog,
+    QMessageBox,
+    QTableWidgetSelectionRange,
+)
 
 import app as app_module
 import client
@@ -600,6 +612,302 @@ def test_click_on_link_column_opens_browser(window, opened_urls):
 
     w.OnCellClick(0, app_module.COL_NAME)
     assert len(opened_urls) == 1
+
+
+# ---------------- 拖拽排序 ----------------
+
+
+def _ids(w):
+    """行模型里各行的 clusterId，按表格顺序。"""
+    return [item["entry"].cluster_id for item in w.rows]
+
+
+def _loaded(window, *items):
+    """建窗口并把清单载入表格（拖拽相关的用例都要先有行）。"""
+    w = window("".join(f"{cid} | {name}\n" for cid, name in items))
+    w.LoadWatchlist(w.watchlist_path)
+    return w
+
+
+@pytest.mark.parametrize(
+    "sources, target, expected",
+    [
+        ([0], 2, "B A C D"),      # 往下挪：插到原 2 号前面
+        ([3], 0, "D A B C"),      # 往上挪
+        ([1, 2], 4, "A D B C"),   # 多选整块挪到末尾
+        ([0, 1], 0, "A B C D"),   # 原地放下
+        ([0, 1], 2, "A B C D"),   # 挪到紧挨着的下一行：等于没动
+    ],
+)
+def test_move_rows(sources, target, expected):
+    """行号按挪动前的下标算，被挪的行之间保持原有相对顺序。"""
+    assert app_module.move_rows(list("ABCD"), sources, target) == expected.split()
+
+
+@pytest.mark.parametrize(
+    "sources, target",
+    [
+        ([], 0),         # 没拖任何行
+        ([9], 0),        # 行号越界
+        ([-1], 0),
+        (["0"], 0),      # 行号不是整数
+        ([0], "1"),      # 落点不是整数
+        (None, 0),       # 形状不对
+    ],
+)
+def test_move_rows_degrades(sources, target):
+    """入参不合法就原样返回：排序是给人看的，宁可不动也不能把清单弄乱。"""
+    assert app_module.move_rows(list("ABCD"), sources, target) == list("ABCD")
+
+
+def test_reorder_enabled_only_when_idle(window):
+    """空闲时可以拖行；抓取中关掉（轮询任务记的是行号，中途插队会填错行）。"""
+    w = window()
+    assert w.table.dragDropMode() == QAbstractItemView.InternalMove
+    w.SetBusy(True)
+    assert w.table.dragDropMode() == QAbstractItemView.NoDragDrop
+    w.SetBusy(False)
+    assert w.table.dragDropMode() == QAbstractItemView.InternalMove
+
+
+def test_table_rejects_foreign_drops(window):
+    """只有自己拖自己才受理：从文件管理器拖进来的内容一律不理。
+
+    （拖拽事件只存 QMimeData 的指针、不接管所有权，所以得留个引用给垃圾回收。）
+    """
+    w = window()
+    mime = QMimeData()
+    event = QDragEnterEvent(QPoint(10, 10), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
+
+    w.table.dragEnterEvent(event)
+    assert not event.isAccepted()
+
+
+def test_drop_reorders_rows_table_and_watchlist(window, data_files):
+    """拖拽排序：行模型、表格、清单三处顺序一致，并按新顺序写回文件。"""
+    w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"), ("10000000003", "丙"))
+
+    w.OnRowsDropped([2], 0)  # 把「丙」拖到最前面
+
+    assert _ids(w) == ["10000000003", "10000008780", "10000000002"]
+    assert w.table.item(0, app_module.COL_CID).text() == "10000000003"
+    assert w.row_urls[0].endswith("clusterId=10000000003")
+    body = [
+        line
+        for line in (data_files / "watchlist.txt").read_text(encoding="utf-8").split("\n")
+        if line and not line.startswith("#")
+    ]
+    assert body == ["10000000003 | 丙", "10000008780 | 甲", "10000000002 | 乙"]
+    assert "已调整顺序" in w.progress_label.text()
+
+
+def test_reorder_keeps_fetched_values_with_their_row(window):
+    """已抓到的数据跟着商品走，不会留在原来的行号上。"""
+    w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"))
+    w.rows[1]["values"] = result_ok(name="乙最新")
+
+    w.OnRowsDropped([1], 0)
+
+    assert _ids(w) == ["10000000002", "10000008780"]
+    assert w.rows[0]["values"]["name"] == "乙最新"
+    assert w.table.item(0, app_module.COL_NAME).text() == "乙最新"
+    assert w.table.item(0, app_module.COL_PRICE).text() == "¥44"
+    assert w.table.item(1, app_module.COL_PRICE).text() == app_module.NO_DATA_TEXT
+
+
+def test_reorder_to_same_place_changes_nothing(window, data_files):
+    """原地放下（或又拖回原位）不重画也不写文件。"""
+    w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"))
+    before = (data_files / "watchlist.txt").read_text(encoding="utf-8")
+    w.progress_label.setText("哨兵")
+
+    w.OnRowsDropped([0], 0)
+
+    assert (data_files / "watchlist.txt").read_text(encoding="utf-8") == before
+    assert w.progress_label.text() == "哨兵"
+
+
+def test_reorder_ignored_while_polling(window, data_files):
+    """抓取中忽略重排：轮询任务记的是行号，中途插队会把结果填错行。"""
+    w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"))
+    before = (data_files / "watchlist.txt").read_text(encoding="utf-8")
+    w.poller = FakePoller()
+
+    w.OnRowsDropped([1], 0)
+
+    assert _ids(w) == ["10000008780", "10000000002"]
+    assert (data_files / "watchlist.txt").read_text(encoding="utf-8") == before
+
+
+ROW1_RECT = QRect(0, 100, 300, 100)  # 假装第 1 行占了 y=100..199 这么一块
+
+
+def test_drop_target_splits_the_row_at_its_middle(window, monkeypatch):
+    """落点按行的中线分上/下半格——和画出来的那条横线是同一套算法。
+
+    几何直接给死，免得依赖 offscreen 平台下真实的行高与滚动位置。
+    """
+    w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"), ("10000000003", "丙"))
+    monkeypatch.setattr(w.table, "indexAt", lambda pos: w.table.model().index(1, 0))
+    monkeypatch.setattr(w.table, "visualRect", lambda index: ROW1_RECT)
+    middle = ROW1_RECT.center().y()
+
+    assert w.table._drop_target(QPoint(10, ROW1_RECT.top())) == 1
+    assert w.table._drop_target(QPoint(10, middle)) == 1  # 正中间算上半格
+    assert w.table._drop_target(QPoint(10, middle + 1)) == 2
+    assert w.table._drop_target(QPoint(10, ROW1_RECT.bottom())) == 2
+
+
+def test_drop_target_below_last_row_appends(window, monkeypatch):
+    """拖到表格下方的空白区 = 挪到最后。"""
+    w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"))
+    monkeypatch.setattr(w.table, "indexAt", lambda pos: QModelIndex())
+
+    assert w.table._drop_target(QPoint(0, 0)) == 2
+
+
+def test_drop_hint_tracks_the_drag(window, monkeypatch):
+    """拖动时记下落点（好画出那条横线），离开表格或松手就清掉。"""
+    w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"), ("10000000003", "丙"))
+    w.table.selectRow(0)
+    monkeypatch.setattr(w.table, "indexAt", lambda pos: w.table.model().index(1, 0))
+    monkeypatch.setattr(w.table, "visualRect", lambda index: ROW1_RECT)
+    mime = w.table.model().mimeData([w.table.model().index(0, 0)])
+    move = QDragMoveEvent(
+        QPoint(10, ROW1_RECT.bottom()), Qt.MoveAction, mime, Qt.LeftButton, Qt.NoModifier
+    )
+
+    w.table.dragMoveEvent(move)
+    assert move.isAccepted()
+    assert w.table._drop_at == 2
+
+    w.table.dragLeaveEvent(QDragLeaveEvent())
+    assert w.table._drop_at is None
+
+
+def test_drop_hint_is_painted(window, qapp):
+    """那条横线是真画出来了：有落点和没落点的截图得不一样。"""
+    w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"))
+    w.show()  # 没显示过就没有可视区，画不出东西
+    qapp.processEvents()
+    plain = w.table.viewport().grab().toImage()
+
+    w.table._set_drop_hint(1)
+    hinted = w.table.viewport().grab().toImage()
+
+    assert hinted != plain
+
+
+def test_drop_event_reports_target_and_leaves_cells_alone(window, monkeypatch):
+    """dropEvent 只算落点、发信号，自己一行都不搬。
+
+    "Qt 会不会顺手把源行删掉"只能在真实拖拽里才会发生（本类靠 startDrag 里
+    自己起 QDrag 绕开它），这里退一步，守住"表格行数不变"这条底线。
+    """
+    w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"), ("10000000003", "丙"))
+    w.table.selectRow(0)
+    monkeypatch.setattr(w.table, "indexAt", lambda pos: w.table.model().index(1, 0))
+    monkeypatch.setattr(w.table, "visualRect", lambda index: ROW1_RECT)  # 落在下半格
+    mime = QMimeData()  # 得留个引用：QDropEvent 只存指针，不接管所有权
+    event = QDropEvent(
+        QPoint(10, ROW1_RECT.bottom()), Qt.MoveAction, mime, Qt.LeftButton, Qt.NoModifier
+    )
+
+    w.table.dropEvent(event)
+
+    assert event.isAccepted()
+    assert w.table._drop_at is None  # 松手后提示要收掉
+    assert w.table.rowCount() == 3
+    assert _ids(w) == ["10000000002", "10000008780", "10000000003"]
+
+
+def test_drop_event_requires_a_selection(window, monkeypatch):
+    """没选中任何行就没什么可挪的，事件退回给 Qt。"""
+    w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"))
+    w.table.clearSelection()
+    mime = QMimeData()
+    event = QDropEvent(QPoint(10, 10), Qt.MoveAction, mime, Qt.LeftButton, Qt.NoModifier)
+
+    w.table.dropEvent(event)
+
+    assert not event.isAccepted()
+    assert _ids(w) == ["10000008780", "10000000002"]
+
+
+def test_start_drag_carries_model_mime_and_keeps_rows(window, qapp, monkeypatch):
+    """自己起的那个拖拽带着模型认得的 mime，且一行都不动。
+
+    真拖一遍要点住鼠标、走进 Qt 的拖拽循环，测试里跑不了；这里把 exec_ 换掉，
+    只验"起出来的是个什么样的拖拽"，不跑那圈循环。
+    """
+    w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"), ("10000000003", "丙"))
+    w.show()  # 取拖拽小图要用到真实几何
+    qapp.processEvents()
+    w.table.selectRow(1)
+    made = []
+
+    def fake_exec(drag, *args, **kwargs):
+        made.append((drag.mimeData(), drag.pixmap()))
+        return Qt.IgnoreAction
+
+    monkeypatch.setattr(QDrag, "exec_", fake_exec)
+    w.table.startDrag(Qt.MoveAction)
+
+    assert len(made) == 1
+    mime, pixmap = made[0]
+    assert mime is not None
+    assert mime.hasFormat(w.table.model().mimeTypes()[0])  # 有它 Qt 那边才 canDrop
+    assert not pixmap.isNull()
+    assert w.table.rowCount() == 3
+    assert _ids(w) == ["10000008780", "10000000002", "10000000003"]
+
+
+def test_start_drag_without_selection_does_nothing(window, monkeypatch):
+    """没选中行时不起拖拽。"""
+    w = _loaded(window, ("10000008780", "甲"))
+    w.table.clearSelection()
+    made = []
+    monkeypatch.setattr(QDrag, "exec_", lambda drag, *a, **k: made.append(drag))
+
+    w.table.startDrag(Qt.MoveAction)
+
+    assert made == []
+
+
+def test_reorder_uses_whole_selection(window, monkeypatch):
+    """多选时整块一起挪，块内保持原顺序。"""
+    w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"), ("10000000003", "丙"))
+    # selectRow 会顶掉上一次的选择，多选得用 setRangeSelected
+    w.table.setRangeSelected(QTableWidgetSelectionRange(0, 0, 1, 8), True)
+    monkeypatch.setattr(w.table, "indexAt", lambda pos: QModelIndex())  # 落在空白区
+    mime = QMimeData()
+    event = QDropEvent(QPoint(10, 10), Qt.MoveAction, mime, Qt.LeftButton, Qt.NoModifier)
+
+    w.table.dropEvent(event)
+
+    assert _ids(w) == ["10000000003", "10000008780", "10000000002"]
+
+
+def test_thumbnails_are_reused_across_redraws(window, monkeypatch):
+    """下过的缩略图存起来复用：重画表格（拖拽排序、增删）不再重下一遍。"""
+    w = window("10000008780 | 甲\n10000000002 | 乙\n")
+    w.store.upsert_item("10000008780", "甲", "https://example.test/a.png")
+    w.store.upsert_item("10000000002", "乙", "https://example.test/b.png")
+    fetched = []
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: fetched.append(url))
+
+    w.LoadWatchlist(w.watchlist_path)
+    assert len(fetched) == 2  # 缓存里没有，两张都得下
+
+    for row in (0, 1):  # 假装两张图都下载回来了
+        pixmap = QPixmap(8, 8)
+        pixmap.fill(Qt.red)
+        w.OnImageFetched(row, pixmap)
+
+    fetched.clear()
+    w.RenderTable()
+    assert fetched == []
+    assert not w.table.item(0, app_module.COL_IMG).icon().isNull()
 
 
 # ---------------- 主题 ----------------

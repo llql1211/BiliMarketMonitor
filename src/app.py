@@ -17,8 +17,8 @@ import time
 import webbrowser
 
 import requests
-from PyQt5.QtCore import QObject, QSize, Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QIcon, QPixmap
+from PyQt5.QtCore import QObject, QPoint, QRect, QSize, Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QCursor, QDrag, QIcon, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -77,6 +77,35 @@ def _deal_text(deal) -> str:
     if not isinstance(deal, dict):  # 渲染路径上多一层保险，别让脏数据把表格卡住
         return ""
     return " · ".join(part for part in (deal.get("price"), deal.get("time")) if part)
+
+
+def move_rows(items, sources, target):
+    """把 items 里 sources 这几行整体挪到 target 处（插在该位置之前），返回新列表。
+
+    纯函数，不碰界面：表格、清单两边的重排都走它，规则只有这一份。
+
+    行号按"挪动之前"的下标算，越界或不是整数的忽略；被挪的行之间保持原有的
+    相对顺序。target 超出末尾按挪到末尾算，入参形状不对就原样返回——
+    排序是给人看的，宁可不动也不要把清单弄乱。
+    """
+    items = list(items)
+    if not isinstance(sources, (list, tuple, set, frozenset)):
+        return items
+    picked = sorted({
+        i for i in sources
+        if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < len(items)
+    })
+    if not picked or not isinstance(target, int) or isinstance(target, bool):
+        return items
+
+    target = max(0, min(target, len(items)))
+    moving = [items[i] for i in picked]
+    picked_set = set(picked)
+    rest = [item for i, item in enumerate(items) if i not in picked_set]
+    # 落在目标之前的行被抽走后，后面的行会整体前移，插回时要减掉它们的数量。
+    # 例：[A,B,C,D] 把 A 挪到 C 前面 -> rest=[B,C,D]，insert = 2-1 = 1 -> [B,A,C,D]
+    insert = max(0, min(target - sum(1 for i in picked if i < target), len(rest)))
+    return rest[:insert] + moving + rest[insert:]
 
 
 class PollerThread(QThread):
@@ -208,6 +237,150 @@ class AddDialog(QDialog):
         return self.editor.toPlainText()
 
 
+class ReorderableTable(QTableWidget):
+    """行可以拖拽排序的表格：把行拖到别处松手，顺序就变了。
+
+    表格只是"顺序"的视图——真正的顺序在 MainWindow.rows 和 watchlist.txt 里，
+    所以这里算出落点后只发信号，一行都不自己搬。
+
+    拖拽由本类整个接管（`startDrag` 里自己起一个 QDrag），不能退回用 Qt 现成的
+    InternalMove：那条路上 Qt 搬完格子还会把源行从模型里删掉，表格就和窗口那边的
+    行模型对不上了（QAbstractItemViewPrivate::clearOrRemove，拖拽的最终动作是
+    Move 时触发）。想靠在 dropEvent 里把动作改成 Copy 拦住它也不行——Qt 只在
+    候选集里挑动作，挑不中会静默退回默认动作（实测 Move→Copy 的降级无效）。
+    自己起 QDrag 就没有这一步，`drag.exec_()` 的返回值没人接，源行自然没人动。
+    """
+
+    rows_dropped = pyqtSignal(list, int)  # 被拖的行号（升序）, 目标插入位置
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # 关掉"覆盖"模式（默认是开的）：这模式是为"拖一格盖一格"设计的，
+        # 和这里的"插到某两行之间"不是一回事
+        self.setDragDropOverwriteMode(False)
+        # 落点提示自己画（见 paintEvent）：Qt 自带的只在行上沿/下沿各 2px 内
+        # 显示，一行的中间那 90% 压根没提示（实测那里给的是 OnViewport），
+        # 拖动时等于看不见落点在哪儿
+        self.setDropIndicatorShown(False)
+        self._drop_at = None  # 正在拖时：落点（插入位置）；None 表示没在拖
+
+    def startDrag(self, actions):
+        """自己起拖拽，绕开 QAbstractItemView.startDrag 的"搬格子 + 删源行"。
+
+        拖拽内容用模型自己的 mime（application/x-qabstractitemmodeldatalist），
+        免得 Qt 那边 canDrop 认不出来，拖动过程中什么都不响应。
+        """
+        rows = self._selected_rows()
+        if not rows:
+            return
+        mime = self.model().mimeData([
+            self.model().index(row, col)
+            for row in rows
+            for col in range(self.columnCount())
+        ])
+        if mime is None:  # 模型给不出拖拽内容就干脆不拖，别起一个空拖拽
+            return
+
+        drag = QDrag(self)
+        drag.setMimeData(mime)  # 所有权随之转移给 drag，不用自己释放
+        pixmap, hotspot = self._drag_pixmap(rows)
+        if not pixmap.isNull():
+            drag.setPixmap(pixmap)
+            drag.setHotSpot(hotspot)
+        drag.exec_(Qt.MoveAction)
+        drag.deleteLater()
+
+    def dragEnterEvent(self, event):
+        """只接自己拖自己；从文件管理器之类拖进来的内容一概不理。
+
+        这一关就拦在这里：Qt 的规矩是 dragEnter 不接，后面的 dragMove / drop
+        压根不会送过来，所以底下几处不用再各查一遍。
+        （另外"从资源管理器拖文件进来"这类来源，source() 本来就是空的。）
+        """
+        if event.source() is self:
+            super().dragEnterEvent(event)  # 交给 Qt：它还要置拖拽状态、启动自动滚动
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        super().dragMoveEvent(event)  # 自动滚动、拖拽状态这些还得 Qt 管
+        self._set_drop_hint(self._drop_target(event.pos()))
+        event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):
+        self._set_drop_hint(None)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        """接住落点，交给窗口去重排——本类自己一行都不动。"""
+        rows = self._selected_rows()
+        target = self._drop_target(event.pos())
+        self._set_drop_hint(None)
+        if not rows:
+            event.ignore()
+            return
+        event.accept()
+        self.rows_dropped.emit(rows, target)
+
+    def paintEvent(self, event):
+        """正常画表格，顺带把落点那条横线画上。"""
+        super().paintEvent(event)
+        if self._drop_at is None:
+            return
+        y = self._drop_hint_y(self._drop_at)
+        painter = QPainter(self.viewport())
+        painter.setPen(QPen(self.palette().highlight().color(), 2))
+        painter.drawLine(0, y, self.viewport().width(), y)
+
+    # ---------------- 落点提示 ----------------
+
+    def _set_drop_hint(self, target):
+        """记住落点并重画那条横线；target 为 None 表示没有落点。"""
+        if target != self._drop_at:
+            self._drop_at = target
+            self.viewport().update()
+
+    def _drop_hint_y(self, target) -> int:
+        """插入位置换算成横线的 y 坐标（行号会被滚动裁掉，所以得夹在可视区内）。"""
+        viewport = self.viewport().rect()
+        if target >= self.rowCount():
+            rect = self.visualRect(self.model().index(self.rowCount() - 1, 0))
+            y = rect.bottom() + 1 if rect.isValid() else viewport.bottom()
+        else:
+            rect = self.visualRect(self.model().index(target, 0))
+            y = rect.top() if rect.isValid() else viewport.top()
+        return max(viewport.top(), min(y, viewport.bottom()))
+
+    # ---------------- 内部 ----------------
+
+    def _selected_rows(self):
+        """当前选中的行号（升序）。
+
+        拖拽开始和放下时都以选区为准——拖拽期间 Qt 不会动选区，
+        两边拿到的是同一批行。
+        """
+        return sorted({index.row() for index in self.selectedIndexes()})
+
+    def _drop_target(self, pos) -> int:
+        """落点换算成插入位置：落在某行上半格就插它前面，下半格插它后面。"""
+        index = self.indexAt(pos)
+        if not index.isValid():
+            return self.rowCount()  # 表格下方的空白区：挪到最后
+        rect = self.visualRect(index)
+        return index.row() + (1 if pos.y() > rect.center().y() else 0)
+
+    def _drag_pixmap(self, rows):
+        """被拖的那几行的截图，拖拽时跟着光标走，返回 (图, 光标在图上的位置)。"""
+        rect = QRect()
+        for row in rows:
+            rect = rect.united(self.visualRect(self.model().index(row, 0)))
+        rect = rect.intersected(self.viewport().rect())
+        if rect.isEmpty():
+            return QPixmap(), QPoint()
+        cursor = self.viewport().mapFromGlobal(QCursor.pos())
+        return self.viewport().grab(rect), cursor - rect.topLeft()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -221,6 +394,8 @@ class MainWindow(QMainWindow):
         self.watch_entries = []  # List[links.LinkEntry]，来自 watchlist.txt
         self.rows = []           # 表格行模型：见 MakeRow() 的字段说明
         self.row_urls = {}       # 行号 -> 详情页链接
+        self.row_images = {}     # 行号 -> 缩略图原始地址（下载回来时用来认领）
+        self.icons = {}          # 缩略图原始地址 -> QPixmap，重画表格时复用
         self.poller = None
         self.names_learned = False  # 本次抓取是否学到了新名称（决定要不要回写清单）
         self.poller_stopped = False  # 本次抓取是否被「停止抓取」中止
@@ -283,11 +458,13 @@ class MainWindow(QMainWindow):
         layout.addLayout(btn_bar)
 
         # 表格
-        self.table = QTableWidget(0, len(HEADERS))
+        self.table = ReorderableTable(0, len(HEADERS))
         self.table.setHorizontalHeaderLabels(HEADERS)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        # 行可拖拽排序（抓取中会被 SetBusy 关掉）
+        self.table.setDragDropMode(QAbstractItemView.InternalMove)
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
@@ -308,6 +485,7 @@ class MainWindow(QMainWindow):
             f"点击「打开」用浏览器访问商品详情页\n链接由配置里的模板拼出：\n{template}"
         )
         self.table.cellClicked.connect(self.OnCellClick)
+        self.table.rows_dropped.connect(self.OnRowsDropped)
         layout.addWidget(self.table)
 
         self.setCentralWidget(central)
@@ -382,8 +560,29 @@ class MainWindow(QMainWindow):
         """按行模型重画整张表（已抓到的数据通过 values 保留）。"""
         self.table.setRowCount(len(self.rows))
         self.row_urls.clear()
+        self.row_images.clear()  # 行号会整体挪位，缩略图的归属得跟着重算
         for row, item in enumerate(self.rows):
             self.FillRow(row, item)
+
+    def SetThumbnail(self, row, image_url):
+        """给某行配缩略图：缓存里有就直接贴，没有才后台下载。
+
+        拖拽排序、增删、刷新清单都会整表重画，走到这里；没有这层缓存的话，
+        每重画一次就要把所有缩略图重下一遍——图标闪一下，还白发一堆请求。
+        """
+        if not image_url:
+            return
+        self.row_images[row] = image_url
+        pixmap = self.icons.get(image_url)
+        if pixmap is None:
+            self.image_fetcher.fetch(row, image_url + IMAGE_SUFFIX)
+        else:
+            self.PutThumbnail(row, pixmap)
+
+    def PutThumbnail(self, row, pixmap):
+        item = self.table.item(row, COL_IMG)
+        if item is not None:
+            item.setIcon(QIcon(pixmap))
 
     def MakeCell(self, text, tooltip=None, align=None):
         """建单元格。tooltip 默认为该格的完整文本——列宽不够被截断时也能看全。
@@ -430,8 +629,7 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, COL_DEAL_BASE + i, self.MakeCell(deal_text))
 
         self.table.setItem(row, COL_IMG, self.MakeCell("", align=Qt.AlignCenter))
-        if record.get("image_url"):
-            self.image_fetcher.fetch(row, record["image_url"] + IMAGE_SUFFIX)
+        self.SetThumbnail(row, record.get("image_url"))
 
         url = links.build_detail_url(cluster_id, self.config["detail_url_template"])
         self.row_urls[row] = url
@@ -450,6 +648,11 @@ class MainWindow(QMainWindow):
         self.btn_pause.setEnabled(busy)
         self.btn_stop.setEnabled(busy)
         self.btn_pause.setText(PAUSE_TEXT)  # 每次进出都复位成「暂停抓取」
+        # 抓取中也不许拖拽排序：轮询任务记的是"第几行"，
+        # 中途插队会让已经发出的结果填到别的商品上
+        self.table.setDragDropMode(
+            QAbstractItemView.NoDragDrop if busy else QAbstractItemView.InternalMove
+        )
 
     # ---------------- 清单写入 ----------------
 
@@ -564,6 +767,29 @@ class MainWindow(QMainWindow):
             f"清单已同步，共 {len(self.rows)} 件商品" + self.last_note
         )
 
+    def OnRowsDropped(self, rows, target):
+        """拖拽排序：按拖拽结果重排行模型，顺序即清单顺序，直接写回文件。
+
+        清单本身就是顺序的载体（watchlist.txt 的行序 = 表格的行序），
+        所以这里同步重排两张表：行模型和清单条目。
+        """
+        if self.IsPolling():
+            return  # 抓取中不许重排，理由见 SetBusy
+        before = [item["entry"].cluster_id for item in self.rows]
+
+        self.rows = move_rows(self.rows, rows, target)
+        if [item["entry"].cluster_id for item in self.rows] == before:
+            return  # 原地放下（或又拖回了原位）：不重画也不写文件
+
+        # 清单条目与行模型一一对应，直接从行模型里取，省得再对齐一次行号
+        self.watch_entries = [item["entry"] for item in self.rows]
+        self.RenderTable()
+        if self.SaveWatchlist():
+            self.progress_label.setText(
+                f"已调整顺序，共 {len(self.rows)} 件商品，已写回 watchlist.txt"
+                + self.last_note
+            )
+
     # ---------------- 抓取 ----------------
 
     def OnFetchPrices(self):
@@ -629,18 +855,19 @@ class MainWindow(QMainWindow):
         if result["ok"] and result["image_url"]:
             img_item = self.table.item(row, COL_IMG)
             if img_item is not None and img_item.icon().isNull():
-                self.image_fetcher.fetch(row, result["image_url"] + IMAGE_SUFFIX)
+                self.SetThumbnail(row, result["image_url"])
 
     def OnImageFetched(self, row, pixmap):
         if row >= self.table.rowCount():
             return
-        item = self.table.item(row, COL_IMG)
-        if item is not None:
-            # CDN 已按 1:1 裁剪，这里兜底缩放保证不超出单元格
-            pixmap = pixmap.scaled(
-                IMAGE_SIZE, IMAGE_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-            item.setIcon(QIcon(pixmap))
+        # CDN 已按 1:1 裁剪，这里兜底缩放保证不超出单元格
+        pixmap = pixmap.scaled(
+            IMAGE_SIZE, IMAGE_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        image_url = self.row_images.get(row)
+        if image_url:
+            self.icons[image_url] = pixmap  # 存下来，下次重画表格就不必再下这一张
+        self.PutThumbnail(row, pixmap)
 
     def OnTogglePause(self):
         """暂停 / 继续本次抓取。"""
