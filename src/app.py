@@ -317,7 +317,10 @@ class MainWindow(QMainWindow):
         added, removed = self.store.sync(
             [(e.cluster_id, e.name) for e in entries]
         )
-        self.RebuildRows(keep_values=False)
+        # 保留本次运行已抓到的值：手动改完清单点「刷新商品列表」时，
+        # 已查到的价格不该退回「—」（值按 clusterId 对齐，重排/增删都安全）。
+        # 启动时 self.rows 还是空的，这条保留对首次载入没有任何影响。
+        self.RebuildRows()
         self.progress_label.setText(
             f"共 {len(self.rows)} 件商品（缓存新增 {added}，删除 {removed}）"
             f"，点「开始抓取」开始查询"

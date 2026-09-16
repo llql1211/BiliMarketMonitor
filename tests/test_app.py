@@ -529,12 +529,7 @@ def test_delete_cancelled_keeps_everything(window, data_files):
 
 
 def test_refresh_list_picks_up_external_edits(window, data_files):
-    """手工改过清单后点「刷新商品列表」：新增补行，缓存里的名字/缩略图照旧显示。
-
-    注意：LoadWatchlist 走的是 RebuildRows(keep_values=False)，所以本次运行
-    抓到的价格会被清回「—」，要重新抓。README 里写的是「已抓到的数据保留」，
-    两者不一致（已反馈，见交付说明）。
-    """
+    """手工改过清单后点「刷新商品列表」：新增补行，已抓到的数据原地保留。"""
     w = window("10000008780 | 甲\n")
     w.LoadWatchlist(w.watchlist_path)
     w.OnResultReady(0, result_ok(price="¥99", name="甲"))
@@ -544,10 +539,23 @@ def test_refresh_list_picks_up_external_edits(window, data_files):
 
     w.OnRefreshList()
     assert [item["entry"].cluster_id for item in w.rows] == ["10000008780", "10000000002"]
-    assert w.table.item(0, app_module.COL_PRICE).text() == app_module.NO_DATA_TEXT
-    assert w.table.item(0, app_module.COL_NAME).text() == "甲"  # 缓存里的名字还在
-    assert w.rows[0]["values"] is None  # 本次运行抓到的值被丢掉
+    assert w.table.item(0, app_module.COL_PRICE).text() == "¥99"  # 已抓到的价格不丢
+    assert w.table.item(0, app_module.COL_NAME).text() == "甲"
+    assert w.table.item(0, app_module.COL_DEAL_BASE).text() == "¥205 · 8天前"
+    assert w.table.item(1, app_module.COL_PRICE).text() == app_module.NO_DATA_TEXT  # 新行待抓
     assert "清单已同步" in w.progress_label.text()
+
+
+def test_refresh_list_keeps_failed_rows_marked(window, data_files):
+    """刷新时连「查询失败」的结果一起保留：错误原因不会因为刷新被抹掉。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, result_fail("HTTP 500"))
+
+    w.OnRefreshList()
+    cell = w.table.item(0, app_module.COL_NAME)
+    assert cell.text() == app_module.FAILED_TEXT
+    assert cell.toolTip() == "HTTP 500"
 
 
 def test_normalize_rewrites_watchlist(window, data_files):
