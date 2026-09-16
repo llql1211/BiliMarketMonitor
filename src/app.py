@@ -72,6 +72,13 @@ def _skipped_note(duplicated: int, invalid: int) -> str:
     return "（已忽略：" + "、".join(notes) + "）" if notes else ""
 
 
+def _deal_text(deal) -> str:
+    """一条成交记录的展示文本：「¥48 · 3天前」；没有时间就只显示价格，不留个空尾巴。"""
+    if not isinstance(deal, dict):  # 渲染路径上多一层保险，别让脏数据把表格卡住
+        return ""
+    return " · ".join(part for part in (deal.get("price"), deal.get("time")) if part)
+
+
 class PollerThread(QThread):
     """依次（非并发）查询每个商品，单条失败重试 1 次后放弃。
 
@@ -206,6 +213,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config, self.config_warnings = config.load_config()
         self.store = store.Store(store.default_db_path())
+        # 构造阶段的提示（例如缓存库损坏已备份重建）要先留下来：
+        # 后面任何一次正式操作都会清空 store.notes
+        self.store_warnings = list(self.store.notes)
+        self.last_note = ""      # 最近一次子模块降级提示的文案，供状态栏拼接
         self.watchlist_path = links.default_watchlist_path()
         self.watch_entries = []  # List[links.LinkEntry]，来自 watchlist.txt
         self.rows = []           # 表格行模型：见 MakeRow() 的字段说明
@@ -304,10 +315,22 @@ class MainWindow(QMainWindow):
 
     # ---------------- 数据载入 ----------------
 
+    def Note(self, *groups) -> str:
+        """汇总子模块的降级提示：打印留档，返回可拼到状态栏的短句（没有则空串）。
+
+        子模块（links/store）不抛异常，只把"这次哪里降级了"写进 notes 列表，
+        统一在这里收集——留痕，但不打断用户正在做的事。
+        """
+        messages = [m for group in groups for m in (group or [])]
+        for message in messages:
+            print(f"[降级] {message}")
+        return ("；" + "；".join(messages)) if messages else ""
+
     def LoadWatchlist(self, path, show_errors=True):
         """读取清单 -> 同步缓存 -> 重建表格。"""
+        notes = []
         try:
-            entries = links.load_links(path)
+            entries = links.load_links(path, notes)
         except OSError as err:
             if show_errors:
                 QMessageBox.warning(self, "读取失败", f"读取 watchlist 出错：\n{err}")
@@ -317,13 +340,15 @@ class MainWindow(QMainWindow):
         added, removed = self.store.sync(
             [(e.cluster_id, e.name) for e in entries]
         )
+        # store.notes 每次操作都会重置，必须紧接着读；下面 RebuildRows 会查缓存
+        self.last_note = self.Note(notes, self.store.notes)
         # 保留本次运行已抓到的值：手动改完清单点「刷新商品列表」时，
         # 已查到的价格不该退回「—」（值按 clusterId 对齐，重排/增删都安全）。
         # 启动时 self.rows 还是空的，这条保留对首次载入没有任何影响。
         self.RebuildRows()
         self.progress_label.setText(
             f"共 {len(self.rows)} 件商品（缓存新增 {added}，删除 {removed}）"
-            f"，点「开始抓取」开始查询"
+            f"，点「开始抓取」开始查询" + self.last_note
         )
         return True
 
@@ -401,10 +426,7 @@ class MainWindow(QMainWindow):
         self.table.setItem(row, COL_AVG, self.MakeCell(text(values.get("avg_price"))))
         deals = values.get("deals") or []
         for i in range(3):
-            deal_text = (
-                f"{deals[i]['price']} · {deals[i]['time']}"
-                if i < len(deals) else NO_DATA_TEXT
-            )
+            deal_text = _deal_text(deals[i]) if i < len(deals) else NO_DATA_TEXT
             self.table.setItem(row, COL_DEAL_BASE + i, self.MakeCell(deal_text))
 
         self.table.setItem(row, COL_IMG, self.MakeCell("", align=Qt.AlignCenter))
@@ -439,17 +461,19 @@ class MainWindow(QMainWindow):
             record = item["record"] or {}
             name = (values.get("name") or record.get("name") or item["entry"].name or "")
             items.append((item["entry"].cluster_id, name))
+        notes = []
         try:
-            links.save_watchlist(self.watchlist_path, items)
+            links.save_watchlist(self.watchlist_path, items, notes)
         except OSError as err:
             QMessageBox.warning(self, "写入失败", f"写入 watchlist 出错：\n{err}")
             return False
+        self.last_note = self.Note(notes)
         return True
 
     def OnNormalize(self):
         """手动整理清单：把链接、乱序格式统一成「clusterId | 商品名」。"""
         if self.SaveWatchlist():
-            self.progress_label.setText("清单已按规范格式整理")
+            self.progress_label.setText("清单已按规范格式整理" + self.last_note)
 
     def OnAdd(self):
         """添加商品：弹窗输入 ID/链接（一行一个），追加到 watchlist.txt 末尾并立即显示为新行。"""
@@ -497,6 +521,7 @@ class MainWindow(QMainWindow):
         self.progress_label.setText(
             f"已添加 {len(new_entries)} 件商品到 watchlist，待抓取价格"
             + _skipped_note(len(entries) - len(new_entries), invalid)
+            + self.last_note
         )
 
     def OnDeleteSelected(self):
@@ -525,7 +550,9 @@ class MainWindow(QMainWindow):
             self.store.delete_item(cluster_id)
         self.RenderTable()
         if self.SaveWatchlist():
-            self.progress_label.setText(f"已删除 {len(cluster_ids)} 件商品")
+            self.progress_label.setText(
+                f"已删除 {len(cluster_ids)} 件商品" + self.last_note
+            )
 
     def OnRefreshList(self):
         """重新读取 watchlist.txt：新增的补成新行，删掉的移除，已抓数据保留。"""
@@ -533,7 +560,9 @@ class MainWindow(QMainWindow):
             return
         if not self.LoadWatchlist(self.watchlist_path):
             return
-        self.progress_label.setText(f"清单已同步，共 {len(self.rows)} 件商品")
+        self.progress_label.setText(
+            f"清单已同步，共 {len(self.rows)} 件商品" + self.last_note
+        )
 
     # ---------------- 抓取 ----------------
 
@@ -545,6 +574,7 @@ class MainWindow(QMainWindow):
         if not tasks:
             QMessageBox.information(self, "提示", "watchlist 中没有商品链接。")
             return
+        self.last_note = ""  # 开始新的一轮抓取，不带着之前的降级提示
         self.names_learned = False
         self.poller_stopped = False
         self.SetBusy(True)
@@ -583,10 +613,7 @@ class MainWindow(QMainWindow):
         self.table.setItem(row, COL_AVG, self.MakeCell(text(result["avg_price"])))
         deals = result["deals"]
         for i in range(3):
-            deal_text = (
-                f"{deals[i]['price']} · {deals[i]['time']}"
-                if i < len(deals) else NO_DATA_TEXT
-            )
+            deal_text = _deal_text(deals[i]) if i < len(deals) else NO_DATA_TEXT
             self.table.setItem(row, COL_DEAL_BASE + i, self.MakeCell(deal_text))
 
         # 名称：接口返回的才是最新的；失败时如果原本没有名字，标出来而不是留个"…"
@@ -646,9 +673,11 @@ class MainWindow(QMainWindow):
         if self.names_learned:
             # 抓到了新名称，顺手把清单刷新一次，方便用户直接在文件里管理
             if self.SaveWatchlist():
-                self.progress_label.setText("完成，已把商品名写回 watchlist.txt")
+                self.progress_label.setText(
+                    "完成，已把商品名写回 watchlist.txt" + self.last_note
+                )
             return
-        self.progress_label.setText("完成")
+        self.progress_label.setText("完成" + self.last_note)
 
     def OnCellClick(self, row, col):
         if col == COL_LINK:
@@ -669,7 +698,11 @@ class MainWindow(QMainWindow):
 
     def ApplyTheme(self, dark: bool):
         self.dark = dark
-        theme.apply_theme(QApplication.instance(), dark)
+        app = QApplication.instance()
+        theme.apply_theme(app, dark)
+        # 悬停提示的延时是全局样式提示（样式表管不到），跟主题一起装。
+        # 表格里格子密，默认 0.7 秒太容易顺着光标一路弹出来。
+        theme.install_tooltip_delay(app)
         self.btn_theme.setText("浅色模式" if dark else "暗色模式")
         self.btn_theme.setToolTip(
             "当前是暗色主题，点击切换为浅色" if dark else "当前是浅色主题，点击切换为暗色"
@@ -679,6 +712,24 @@ class MainWindow(QMainWindow):
         dark = not self.dark
         self.store.set_setting("theme", "dark" if dark else "light")
         self.ApplyTheme(dark)
+
+    # ---------------- 收尾 ----------------
+
+    def ReportStartupNotes(self):
+        """把启动阶段的问题（缓存重建、配置被忽略）挂到状态栏上，并打印留档。"""
+        for warning in self.config_warnings:
+            print(f"[config] {warning}")
+        for warning in self.store_warnings:
+            print(f"[cache] {warning}")
+        if self.store_warnings:
+            self.progress_label.setText(
+                self.progress_label.text() + "；" + "；".join(self.store_warnings)
+            )
+
+    def closeEvent(self, event):
+        """退出前把缓存连接关掉：SQLite 的写入要落盘，文件句柄也别留着。"""
+        self.store.close()
+        super().closeEvent(event)
 
 
 def main():
@@ -693,8 +744,8 @@ def main():
     else:
         window.progress_label.setText("未找到 data/watchlist.txt")
 
-    for warning in window.config_warnings:
-        print(f"[config] {warning}")
+    # 启动阶段的降级提示也得让人看见：缓存坏了重建、清单被跳过几行之类
+    window.ReportStartupNotes()
 
     sys.exit(app.exec_())
 

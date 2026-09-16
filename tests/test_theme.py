@@ -9,7 +9,7 @@ import types
 
 import pytest
 from PyQt5.QtGui import QPalette
-from PyQt5.QtWidgets import QPlainTextEdit
+from PyQt5.QtWidgets import QPlainTextEdit, QStyle
 
 import theme
 
@@ -99,3 +99,113 @@ def test_system_uses_dark_falls_back_on_registry_error(monkeypatch):
     """注册表项读不到（老系统/被裁剪）时不报错，按浅色处理。"""
     _install_fake_winreg(monkeypatch, error=FileNotFoundError("没有这个键"))
     assert theme.system_uses_dark() is False
+
+
+@pytest.mark.parametrize(
+    "error", [PermissionError("没权限"), OSError("注册表被锁"), TypeError("读法不对")]
+)
+def test_system_uses_dark_survives_any_registry_failure(monkeypatch, error):
+    """注册表读取失败不止 OSError 一种（还被其他程序写坏过），都不能崩启动路径。"""
+    _install_fake_winreg(monkeypatch, error=error)
+    assert theme.system_uses_dark() is False
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (0, True),        # 0 = 系统在用暗色
+        (1, False),       # 1 = 浅色
+        (False, True),    # 布尔值按同样的语义走（False 就是 0）
+        (True, False),
+        ("dark", False),  # 认不出来的值一律浅色：别猜，样式是纯装饰
+        (None, False),
+        ([], False),
+        (2, False),
+        (-1, False),
+        (0.0, False),     # float 不是预期的类型，不按 0 处理
+    ],
+)
+def test_system_uses_dark_only_trusts_known_values(monkeypatch, value, expected):
+    """注册表里只有 0/1 有意义；其他类型（被别的程序写坏）按浅色处理。"""
+    _install_fake_winreg(monkeypatch, value=value)
+    assert theme.system_uses_dark() is expected
+
+
+# ---------------- 空对象也不能崩 ----------------
+
+
+@pytest.mark.parametrize("app", [None, object(), "not-an-app"])
+def test_apply_theme_without_app_does_nothing(app):
+    """拿不到 QApplication 时（None/假对象）安静跳过，不抛异常。"""
+    theme.apply_theme(app, True)
+
+
+def test_apply_theme_tolerates_deleted_app(qapp):
+    """setStyleSheet 抛异常时只打印一句，不让主题把程序带崩。"""
+
+    class _Broken:
+        def setStyleSheet(self, qss):
+            raise RuntimeError("wrapped C/C++ object has been deleted")
+
+    theme.apply_theme(_Broken(), True)
+
+
+@pytest.mark.parametrize("widget", [None, object()])
+def test_style_placeholder_with_bad_widget(widget):
+    """占位色设置遇到 None/假对象时安静跳过。"""
+    theme.style_placeholder(widget, True)
+
+
+# ---------------- 悬停提示延时 ----------------
+#
+# 延时是 QStyle 的样式提示（SH_ToolTip_WakeUpDelay），样式表管不到，
+# 只能套一层代理样式。装上是全局生效的，下面的用例都不还原样式
+# ——代理除了这一处延时之外和原样式完全一致，留在会话里无害。
+
+
+def test_install_tooltip_delay_lengthens_hover(qapp):
+    """装上之后，悬停唤醒延时变成 TOOLTIP_DELAY_MS（Qt 默认约 0.7 秒）。"""
+    theme.install_tooltip_delay(qapp)
+
+    # 从 app.style() 问，而不是直接问代理：设过样式表之后 Qt 会在外层再套一个
+    # 内部的 QStyleSheetStyle，真正被读到的就是这个值（它会把提示转给代理）。
+    hint = qapp.style().styleHint(QStyle.SH_ToolTip_WakeUpDelay, None, None)
+    assert hint == theme.TOOLTIP_DELAY_MS
+    assert theme.TOOLTIP_DELAY_MS > 700  # 不比 Qt 默认值长的话，这功能没意义
+
+
+def test_install_tooltip_delay_leaves_other_hints_alone(qapp):
+    """除延时外的样式提示照旧交回原样式，界面其余部分不受影响。"""
+    theme.install_tooltip_delay(qapp)
+
+    style = theme._installed_style
+    base = style.baseStyle()
+    for hint in (QStyle.SH_UnderlineShortcut, QStyle.SH_ItemView_ShowDecorationSelected):
+        assert style.styleHint(hint) == base.styleHint(hint)
+
+
+def test_install_tooltip_delay_installs_only_once(qapp):
+    """重复调用不再套一层：代理链越套越长会白白多绕几层。"""
+    theme.install_tooltip_delay(qapp)
+    first = theme._installed_style
+
+    theme.install_tooltip_delay(qapp)
+    assert theme._installed_style is first
+    assert not isinstance(first.baseStyle(), theme._ToolTipDelayStyle)
+
+
+@pytest.mark.parametrize("app", [None, object(), "not-an-app"])
+def test_install_tooltip_delay_without_app(app):
+    """拿不到 QApplication 时安静跳过，不抛异常。"""
+    theme.install_tooltip_delay(app)
+
+
+def test_install_tooltip_delay_tolerates_deleted_app(qapp, monkeypatch):
+    """取样式就抛异常时只打印一句，不让延时把程序带崩。"""
+    monkeypatch.setattr(theme, "_installed_style", None)  # 假装还没装过
+
+    class _Broken:
+        def style(self):
+            raise RuntimeError("wrapped C/C++ object has been deleted")
+
+    theme.install_tooltip_delay(_Broken())

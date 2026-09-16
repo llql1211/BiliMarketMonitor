@@ -151,6 +151,55 @@ def test_network_errors_are_wrapped(posted, error):
     assert str(error) in str(excinfo.value)
 
 
+@pytest.mark.parametrize("payload", [[], 42, "not-an-object", ["a", "b"]])
+def test_non_dict_json_raises_api_error(posted, payload):
+    """JSON 本身不是对象（列表/数字/字符串）时也要是 ApiError，不能是 AttributeError。"""
+    _, state = posted
+    state["response"] = FakeResponse(payload)
+
+    with pytest.raises(client.ApiError):
+        client.fetch_cluster("10000008780")
+
+
+def test_unexpected_request_error_is_wrapped(posted):
+    """requests 之外的异常（代理层、编码问题）同样归口成 ApiError。"""
+    _, state = posted
+    state["error"] = RuntimeError("代理层炸了")
+
+    with pytest.raises(client.ApiError) as excinfo:
+        client.fetch_cluster("10000008780")
+    assert "代理层炸了" in str(excinfo.value)
+
+
+# ---------------- 入参自带检测 ----------------
+
+
+@pytest.mark.parametrize("cluster_id", ["", "   ", "abc", None, True, "12a34"])
+def test_invalid_cluster_id_never_reaches_the_network(posted, cluster_id):
+    """clusterId 不合法时直接报错，不发无效请求（接口没有频率承诺，省着点用）。"""
+    calls, _ = posted
+
+    with pytest.raises(client.ApiError) as excinfo:
+        client.fetch_cluster(cluster_id)
+    assert calls == []
+    assert "clusterId" in str(excinfo.value)
+
+
+def test_cluster_id_is_stripped(posted):
+    """前后带空白的 ID 会被 strip，不会把空格发给接口。"""
+    calls, _ = posted
+    client.fetch_cluster("  10000008780  ")
+    assert calls[0]["kwargs"]["json"] == {"clusterId": "10000008780"}
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), "5", None, True])
+def test_invalid_timeout_falls_back_to_default(posted, timeout):
+    """非法超时退回默认值：宁可慢一点，也不能让 requests 抛 ValueError 混进错误路径。"""
+    calls, _ = posted
+    client.fetch_cluster("10000008780", timeout=timeout)
+    assert calls[0]["kwargs"]["timeout"] == client.DEFAULT_TIMEOUT
+
+
 def test_api_error_is_exception():
     """ApiError 必须是普通异常，调用方 except 得住。"""
     assert issubclass(client.ApiError, Exception)

@@ -3,8 +3,13 @@ data/config.example.toml 兜底。
 
 两份文件都在 data/ 目录；config.example.toml 随仓库分发，既是默认值也是格式参考。
 注释用 TOML 原生的 #，解析时自动忽略，不需要额外的约定。
+
+配置是用户手写的文件，什么值都可能出现：TOML 里能直接写 inf / nan，
+间隔写成 inf 会让抓取线程卡死，写成 nan 会让间隔判断全部失效（高频打接口）。
+所以每个值都单独校验，不合格的退回默认值并记一条 warning，不影响其他项。
 """
 
+import math
 import os
 import tomllib
 
@@ -66,12 +71,17 @@ def _read_toml(path):
             data = tomllib.load(f)
     except FileNotFoundError:
         return None, None
-    except (OSError, tomllib.TOMLDecodeError) as err:
+    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError) as err:
+        # UnicodeDecodeError 不是 OSError：配置文件被存成 GBK 时它才出现，
+        # 漏掉就是启动即崩，所以单独列出来
         return None, str(err)
     return data, None
 
 
 def _merge(config, data, label, warnings):
+    if not isinstance(data, dict):  # 解析结果不是表（正常 TOML 不会出现）
+        warnings.append(f"{label}配置的内容不是一个 TOML 表，已忽略")
+        return
     for key, value in data.items():
         if key not in DEFAULTS:
             warnings.append(f"{label}配置里的未知项 {key} 已忽略")
@@ -87,13 +97,22 @@ def _validate(key, value, label, warnings):
         if not isinstance(value, str) or not value.strip():
             warnings.append(f"{label}配置的 {key} 不是有效字符串，已忽略")
             return None
+        value = value.strip()
         if "{clusterId}" not in value:
             warnings.append(f"{label}配置的 {key} 缺少 {{clusterId}} 占位符，已忽略")
             return None
-        return value.strip()
+        if not value.startswith(("http://", "https://")):
+            # 模板不是链接的话，点「打开」会跳到乱七八糟的地方
+            warnings.append(f"{label}配置的 {key} 不是 http(s) 链接，已忽略")
+            return None
+        return value
 
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         warnings.append(f"{label}配置的 {key} 不是数字，已忽略")
+        return None
+    if not math.isfinite(value):
+        # TOML 允许写 inf / nan，直接放过会让间隔失效（卡死或高频请求）
+        warnings.append(f"{label}配置的 {key} 必须是有限数字，已忽略")
         return None
     if value <= 0:
         warnings.append(f"{label}配置的 {key} 必须大于 0，已忽略")

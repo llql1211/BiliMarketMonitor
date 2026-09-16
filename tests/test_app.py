@@ -632,6 +632,18 @@ def test_apply_theme_updates_button_label(window):
     assert "浅色主题" in w.btn_theme.toolTip()
 
 
+def test_apply_theme_installs_tooltip_delay(window, qapp, monkeypatch):
+    """应用主题时顺带拉长悬停提示的延时（样式表管不到，得走样式提示）。"""
+    installed = []
+    monkeypatch.setattr(theme, "install_tooltip_delay", installed.append)
+
+    w = window()
+    assert installed[-1] is qapp  # 建窗口时就装上了
+
+    w.OnToggleTheme()
+    assert installed[-1] is qapp  # 切主题时再装一次也无妨（装过就跳过）
+
+
 # ---------------- 缩略图 ----------------
 
 
@@ -915,3 +927,126 @@ def test_start_fetch_ignored_while_polling(window):
 def test_skipped_note(duplicated, invalid, expected):
     """「添加」结果里的忽略说明按两种计数拼接。"""
     assert app_module._skipped_note(duplicated, invalid) == expected
+
+
+@pytest.mark.parametrize(
+    "deal, expected",
+    [
+        ({"price": "¥205", "time": "8天前"}, "¥205 · 8天前"),
+        ({"price": "¥205", "time": ""}, "¥205"),  # 没有时间就不留个空尾巴
+        ({"price": "", "time": "8天前"}, "8天前"),
+        ({"price": "", "time": ""}, ""),
+    ],
+)
+def test_deal_text(deal, expected):
+    """成交格的文本：有价格有时间才拼「·」，缺一半时不留分隔符。"""
+    assert app_module._deal_text(deal) == expected
+
+
+# ---------------- 子模块降级提示的接线 ----------------
+
+
+def test_note_helper_prints_and_formats(window, capsys):
+    """Note() 既是留档（打印）也是状态栏文案（拼接）。"""
+    w = window()
+
+    assert w.Note(["一条提示"], None, []) == "；一条提示"
+    assert w.Note() == ""
+    assert w.Note(None, []) == ""
+    assert "[降级] 一条提示" in capsys.readouterr().out
+
+
+def test_startup_reports_corrupt_cache(window, data_files, capsys):
+    """缓存库损坏时：程序照样起来，坏文件改名留档，状态栏和控制台都有提示。"""
+    (data_files / "cache.db").write_text("这不是 SQLite 文件", encoding="utf-8")
+
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.ReportStartupNotes()
+
+    assert w.store_warnings and "损坏" in w.store_warnings[0]
+    assert "损坏" in w.progress_label.text()
+    assert "cache.db.bad-" in w.progress_label.text()
+    assert len(list(data_files.glob("cache.db.bad-*"))) == 1
+    assert "[cache]" in capsys.readouterr().out
+    # 缓存坏了也不影响使用：清单照常载入，写回清单也能成功
+    assert w.table.rowCount() == 1
+    assert w.SaveWatchlist() is True
+
+
+def test_load_watchlist_surfaces_notes(window, data_files):
+    """清单里有认不出来的行时，状态栏要说出来（而不是默默少几件商品）。"""
+    w = window("# 注释\n1001 | 甲\n这行是什么鬼\n")
+
+    assert w.LoadWatchlist(w.watchlist_path) is True
+
+    assert "1 行认不出" in w.progress_label.text()
+    assert w.table.rowCount() == 1
+
+
+def test_refresh_list_keeps_the_note(window, data_files):
+    """「刷新商品列表」会覆盖状态栏文案，降级提示必须跟着一起显示。"""
+    w = window("1001 | 甲\n乱码行\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnRefreshList()
+
+    assert "清单已同步" in w.progress_label.text()
+    assert "认不出" in w.progress_label.text()
+
+
+def test_save_watchlist_reports_skipped_rows(window):
+    """行模型里混进非法 ID 时：能写的照写，跳过的条数报给用户。"""
+    w = window("1001 | 甲\n1002 | 乙\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.rows[1]["entry"].cluster_id = "不是数字"
+
+    assert w.SaveWatchlist() is True
+    w.OnNormalize()
+
+    assert "跳过" in w.last_note
+    assert "跳过" in w.progress_label.text()
+    body = [
+        line
+        for line in open(w.watchlist_path, encoding="utf-8").read().split("\n")
+        if line and not line.startswith("#")
+    ]
+    assert body == ["1001 | 甲"]  # 非法条目没被写进清单
+
+
+def test_dangerous_name_is_cleaned_on_load_and_save(window):
+    """清单里手写的名字带 "|" 时不进表格也不写回文件，两头都不会被撑坏。"""
+    w = window("1001 | 甲|乙\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    assert w.table.item(0, app_module.COL_NAME).text() == "甲 乙"
+
+    w.OnNormalize()
+    body = [
+        line
+        for line in open(w.watchlist_path, encoding="utf-8").read().split("\n")
+        if line and not line.startswith("#")
+    ]
+    assert body == ["1001 | 甲 乙"]
+
+
+def test_deal_cell_without_time_has_no_separator(window):
+    """接口没给成交时间时，单元格只显示价格，不是「¥205 · 」。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    result = result_ok(deals=1)
+    result["deals"][0]["time"] = ""
+    w.OnResultReady(0, result)
+
+    assert w.table.item(0, app_module.COL_DEAL_BASE).text() == "¥205"
+    assert w.table.item(0, app_module.COL_DEAL_BASE + 1).text() == app_module.NO_DATA_TEXT
+
+
+def test_close_event_closes_store(window):
+    """关窗口时把缓存连接关掉（SQLite 写入落盘、别占着文件句柄）。"""
+    w = window("1001 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.close()
+
+    assert w.store.conn is None

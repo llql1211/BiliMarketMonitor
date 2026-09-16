@@ -99,7 +99,11 @@ def test_parse_cluster_filters_non_dict_deals():
         (" 205 ", "¥205"),  # 先 str().strip() 再拼前缀
         (None, None),
         ("", None),
-        ("   ", "¥"),  # 现状如此：纯空白串会产出孤零零的 "¥"
+        ("   ", None),  # 纯空白串按「没抓到」处理，不再产出孤零零的 "¥"
+        (True, None),   # bool 是 int 的子类，不能被当成价格
+        (float("inf"), None),  # inf/nan 会让 "¥{value:g}" 变成 ¥inf / ¥nan
+        (float("nan"), None),
+        ({"a": 1}, None),  # 类型完全不对时也不再 str() 一下塞进表格
     ],
 )
 def test_price_formats(raw, expected):
@@ -185,3 +189,127 @@ def test_thumbnail_url_normalization(img_list, expected):
     resp = _base_response()
     resp["data"]["clusterHeaderFloorVO"]["clusterImgList"] = img_list
     assert parser.parse_cluster(resp)["image_url"] == expected
+
+
+@pytest.mark.parametrize(
+    "url", ["http://i0.hdslb.com/x.jpg", "https://i0.hdslb.com/x.jpg"]
+)
+def test_thumbnail_url_with_scheme_not_double_prefixed(url):
+    """已经带了 scheme 的地址原样保留，不能拼成 https://https://…（http 尤其要注意）。"""
+    resp = _base_response()
+    resp["data"]["clusterHeaderFloorVO"]["clusterImgList"] = [url]
+    assert parser.parse_cluster(resp)["image_url"] == url
+
+
+# ---------------- 调用方保证不了的情况 ----------------
+
+
+@pytest.mark.parametrize("resp", [None, [], 42, "not-a-dict", {"data": []}])
+def test_non_dict_response_is_a_failure_not_a_crash(resp):
+    """响应本身不是 dict（列表/数字/None）时按失败处理，绝不抛异常。"""
+    result = parser.parse_cluster(resp)
+    assert result["ok"] is False
+    assert result["error"]
+
+
+@pytest.mark.parametrize(
+    "resp",
+    [
+        None,
+        [],
+        {"success": True},
+        {"success": True, "data": {"clusterId": "1"}},
+        _base_response(),
+        _base_response()["data"],
+    ],
+)
+def test_result_structure_is_always_the_same(resp):
+    """不管喂进去什么，出口都是固定 7 个键 + 固定类型，界面层不用再判空。"""
+    result = parser.parse_cluster(resp)
+    assert set(result) == {
+        "ok", "error", "name", "price", "avg_price", "deals", "image_url",
+    }
+    assert isinstance(result["ok"], bool)
+    for key in ("error", "name", "price", "avg_price", "image_url"):
+        assert result[key] is None or isinstance(result[key], str)
+    assert isinstance(result["deals"], list)
+    for deal in result["deals"]:
+        assert set(deal) == {"price", "time"}
+        assert isinstance(deal["price"], str) and deal["price"]
+        assert isinstance(deal["time"], str)
+
+
+@pytest.mark.parametrize("error", [ValueError("boom"), ValueError(""), Exception()])
+def test_parse_error_always_has_a_reason(error):
+    """失败结果必须有 error 文案：异常本身没消息时给一句兜底，不留 None。"""
+    result = parser.parse_error(error)
+    assert result["ok"] is False
+    assert isinstance(result["error"], str) and result["error"]
+
+
+# ---------------- 成交记录里的脏数据 ----------------
+
+
+def test_deals_without_price_are_dropped():
+    """没有 dealPrice 的成交记录直接丢掉，不能渲染成「None · 8天前」。"""
+    resp = _base_response()
+    resp["data"]["clusterRecentBuyFloorVO"]["recentDeals"] = [
+        {"dealPrice": 48, "dealTime": "3天前"},
+        {"dealTime": "8天前"},  # 缺价格
+        {"dealPrice": None, "dealTime": "9天前"},
+        {"dealPrice": "", "dealTime": "10天前"},
+    ]
+    result = parser.parse_cluster(resp)
+    assert result["deals"] == [{"price": "¥48", "time": "3天前"}]
+
+
+@pytest.mark.parametrize(
+    "deal_time, expected",
+    [
+        (None, ""),      # 缺失 → 空串（界面按「只有价格」展示，不再是 "· None"）
+        ("", ""),
+        ("   ", ""),
+        ({"a": 1}, ""),  # 认不出来的类型 → 空串
+        (123, "123"),    # 数字会被字符串化，至少不是 None
+        (4.5, "4.5"),
+        ("3天前", "3天前"),
+    ],
+)
+def test_deal_time_is_normalized_to_string(deal_time, expected):
+    """dealTime 统一成字符串：缺失/类型不对时是空串，绝不把 None 渲染到表格里。"""
+    resp = _base_response()
+    resp["data"]["clusterRecentBuyFloorVO"]["recentDeals"] = [
+        {"dealPrice": 48, "dealTime": deal_time}
+    ]
+    assert parser.parse_cluster(resp)["deals"] == [{"price": "¥48", "time": expected}]
+
+
+def test_deals_filtered_before_truncating():
+    """先滤掉脏记录再截断，前几条是垃圾时不会白白占掉 3 个展示位。"""
+    resp = _base_response()
+    resp["data"]["clusterRecentBuyFloorVO"]["recentDeals"] = [
+        None,
+        "garbage",
+        {"dealPrice": 1, "dealTime": "1天前"},
+        {"dealPrice": 2, "dealTime": "2天前"},
+        {"dealPrice": 3, "dealTime": "3天前"},
+        {"dealPrice": 4, "dealTime": "4天前"},
+    ]
+    result = parser.parse_cluster(resp)
+    assert [d["price"] for d in result["deals"]] == ["¥1", "¥2", "¥3"]
+
+
+@pytest.mark.parametrize("recent_deals", [{"a": 1}, "garbage", 42])
+def test_recent_deals_not_a_list(recent_deals):
+    """recentDeals 不是列表时当没有成交处理，不抛异常。"""
+    resp = _base_response()
+    resp["data"]["clusterRecentBuyFloorVO"]["recentDeals"] = recent_deals
+    assert parser.parse_cluster(resp)["deals"] == []
+
+
+def test_only_avg_price_still_counts_as_valid():
+    """只有均价也算接口返回了数据，不该误判成「clusterId 已失效」。"""
+    resp = {"success": True, "data": {"clusterRecentBuyFloorVO": {"avgPrice": 50}}}
+    result = parser.parse_cluster(resp)
+    assert result["ok"] is True
+    assert result["avg_price"] == "¥50"

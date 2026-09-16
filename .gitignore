@@ -6,6 +6,8 @@
 
 # 本地数据
 data/cache.db
+data/cache.db-*
+data/cache.db.bad-*
 data/config.toml
 data/watchlist.txt
 data/watchlist.txt.bak

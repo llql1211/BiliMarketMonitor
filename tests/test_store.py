@@ -187,3 +187,177 @@ def test_data_survives_reopen(db):
     st2 = store.Store(db)
     assert st2.get_item("1001")["name"] == "甲"
     assert st2.get_setting("key") == "value"
+
+
+# ---------------- 空串不能冲掉已有数据 ----------------
+
+
+def test_upsert_empty_string_preserves_old_values(db):
+    """空串要按「没抓到」处理：SQLite 里空串不是 NULL，COALESCE 挡不住它。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "真名", "https://img/a.jpg")
+
+    st.upsert_item("1001", "", "")
+
+    row = st.get_item("1001")
+    assert row["name"] == "真名"
+    assert row["image_url"] == "https://img/a.jpg"
+
+
+@pytest.mark.parametrize("blank", ["", "   ", None])
+def test_upsert_blank_values_keep_old(db, blank):
+    """空白字符串和 None 一样，都保留旧值。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "真名", "https://img/a.jpg")
+    st.upsert_item("1001", blank, blank)
+    row = st.get_item("1001")
+    assert row["name"] == "真名"
+    assert row["image_url"] == "https://img/a.jpg"
+
+
+@pytest.mark.parametrize("image_url", [123, {"a": 1}, ["x"], b"bytes"])
+def test_upsert_non_string_image_is_dropped(db, image_url):
+    """image_url 不是字符串时按「没有」处理：界面会拿它去下载图片，不能是数字。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", image_url)
+    assert st.get_item("1001")["image_url"] is None
+
+
+# ---------------- 入参自带检测 ----------------
+
+
+@pytest.mark.parametrize("cluster_id", [None, "", "abc", True, "1001;"])
+def test_upsert_illegal_id_is_skipped_with_a_note(db, cluster_id):
+    """clusterId 非法时不写库，只记一条 notes（notes 属于「本次操作」，要紧接着读）。"""
+    st = store.Store(db)
+    st.upsert_item(cluster_id, "甲", None)
+
+    assert len(st.notes) == 1 and "clusterId" in st.notes[0]
+    assert st.get_all() == []
+
+
+def test_get_and_delete_illegal_id_are_noops(db):
+    """查/删用的 clusterId 非法时当没查到处理，不抛异常。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", None)
+    assert st.get_item(None) is None
+    assert st.get_item("abc") is None
+    st.delete_item(None)
+    st.delete_item("abc")
+    assert st.get_item("1001") is not None
+
+
+@pytest.mark.parametrize(
+    "item",
+    ["1001", ("1001",), ("1001", "甲", "多余"), ("abc", "甲"), (None, "甲"), None],
+)
+def test_sync_skips_malformed_items(db, item):
+    """条目形状不对时跳过并记 notes，同批里其他条目照常同步。"""
+    st = store.Store(db)
+    added, removed = st.sync([item, ("1002", "乙")])
+
+    assert (added, removed) == (1, 0)
+    assert len(st.notes) == 1 and "跳过" in st.notes[0]  # 紧接着读，别被下次操作清掉
+    assert [r["cluster_id"] for r in st.get_all()] == ["1002"]
+
+
+def test_sync_none_means_empty_list(db):
+    """sync(None) 与 sync([]) 同义：以空清单为准，整库清空。"""
+    st = store.Store(db)
+    st.sync([("1001", "甲")])
+    assert st.sync(None) == (0, 1)
+    assert st.get_all() == []
+
+
+def test_notes_are_reset_per_operation(db):
+    """notes 是「本次操作」的提示，不该一直累积。"""
+    st = store.Store(db)
+    st.upsert_item("abc", "甲", None)
+    assert st.notes
+    st.get_all()
+    assert st.notes == []
+
+
+def test_set_setting_rejects_bad_input(db):
+    """键值类型不对时跳过写入并记 notes，不抛异常。"""
+    st = store.Store(db)
+    st.set_setting("theme", None)
+    assert st.notes
+    st.set_setting(123, "dark")
+    assert st.notes
+
+    assert st.get_setting("theme") is None
+    assert st.get_setting(123, "兜底") == "兜底"  # 非字符串 key 当查不到
+
+
+# ---------------- 缓存库坏了也要能起来 ----------------
+
+
+def test_corrupt_db_is_backed_up_and_rebuilt(db, tmp_path):
+    """cache.db 是垃圾字节时：改名备份 + 重建空库，程序照常起来。"""
+    with open(db, "w", encoding="utf-8") as f:
+        f.write("这不是一个 SQLite 文件" * 10)
+
+    st = store.Store(db)
+
+    backups = list(tmp_path.glob("cache.db.bad-*"))
+    assert len(backups) == 1
+    assert "SQLite" in backups[0].read_text(encoding="utf-8")  # 坏文件留着排查
+    assert any("损坏" in note for note in st.notes)
+    # 新库可用
+    st.upsert_item("1001", "甲", None)
+    assert st.get_item("1001")["name"] == "甲"
+
+
+def test_corrupt_db_keeps_working_after_restart(db, tmp_path):
+    """重建过一次之后，再打开不会再产生第二份备份。"""
+    with open(db, "w", encoding="utf-8") as f:
+        f.write("garbage")
+    st = store.Store(db)
+    st.close()
+
+    st2 = store.Store(db)
+    st2.set_setting("k", "v")
+    assert st2.get_setting("k") == "v"
+    assert len(list(tmp_path.glob("cache.db.bad-*"))) == 1
+    assert st2.notes == []
+
+
+def test_store_creates_missing_parent_directory(tmp_path):
+    """data/ 被删掉（或首次运行）时自己建目录，不让程序起不来。"""
+    path = str(tmp_path / "gone" / "deeper" / "cache.db")
+    st = store.Store(path)
+    st.upsert_item("1001", "甲", None)
+    assert st.get_item("1001")["name"] == "甲"
+
+
+def test_store_survives_path_occupied_by_a_directory(tmp_path):
+    """路径被别的目录占住时也要能起来：能改名就重建，不行就退化成内存缓存。
+
+    这里不限定走哪条降级路径，只要求「有提示 + 功能可用」。
+    """
+    path = str(tmp_path / "cache.db")
+    (tmp_path / "cache.db").mkdir()
+
+    st = store.Store(path)
+    assert st.notes  # 打开时就有降级提示
+    st.upsert_item("1001", "甲", None)
+    assert st.get_item("1001")["name"] == "甲"
+
+
+def test_close_is_idempotent_and_blocks_further_use(db):
+    """close() 可以重复调用；关掉之后再操作要给一句清楚的报错，而不是 sqlite3 的怪话。"""
+    st = store.Store(db)
+    st.close()
+    st.close()
+
+    with pytest.raises(RuntimeError):
+        st.get_all()
+
+
+def test_context_manager_closes(db):
+    """支持 with：出了作用域连接就关掉。"""
+    with store.Store(db) as st:
+        st.upsert_item("1001", "甲", None)
+        assert st.get_item("1001")["name"] == "甲"
+    assert st.conn is None
