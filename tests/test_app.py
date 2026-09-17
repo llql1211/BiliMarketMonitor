@@ -8,7 +8,7 @@ import time
 
 import pytest
 import requests
-from PyQt5.QtCore import QMimeData, QModelIndex, QPoint, QRect, Qt
+from PyQt5.QtCore import QMimeData, QModelIndex, QObject, QPoint, QRect, Qt, pyqtSignal
 from PyQt5.QtGui import (
     QDrag,
     QDragEnterEvent,
@@ -102,13 +102,26 @@ def _fetch_by_id(mapping, log=None):
     return _fetch
 
 
-class FakePoller:
-    """只实现界面用到的那几个方法，用来在不起真线程的情况下测按钮逻辑。"""
+class FakePoller(QObject):
+    """只实现界面用到的那几个方法，用来在不起真线程的情况下测按钮逻辑。
 
-    def __init__(self, running=True, paused=False):
+    信号是真的（Qt 的信号必须真接得上），start() 是空的：线程不跑，
+    结果由用例自己喂给 OnResultReady。构造参数照单全收，
+    这样它也能顶替 PollerThread 交给 OnFetchPrices 去建。
+    """
+
+    result_ready = pyqtSignal(int, dict)
+    progress_changed = pyqtSignal(int, int)
+    finished_all = pyqtSignal()
+
+    def __init__(self, *args, running=True, paused=False, **kwargs):
+        super().__init__()
         self._running = running
         self._paused = paused
         self.stopped = False
+
+    def start(self):
+        pass
 
     def isRunning(self):
         return self._running
@@ -400,14 +413,17 @@ def test_theme_toggle_keeps_rows_and_selection(window):
 CACHED_AT = "2026-09-16T10:30:00"
 
 
-def _seed_cache(w, price="¥50", reference=None, avg=None, sold_out=False, when=CACHED_AT):
-    """往缓存里塞一条「上次抓取」的价格。
+def _seed_cache(
+    w, price="¥50", reference=None, avg=None, sold_out=False, when=CACHED_AT,
+    cluster_id="10000008780",
+):
+    """往缓存里塞一条「上次抓取」的价格（默认第一行那件商品）。
 
     时间是写回去的（upsert 自己记的是当前时间），这样提示语可以断言；
     when=None 模拟老库补列后留下的空时间戳。
     """
     w.store.upsert_item(
-        "10000008780", "甲", None,
+        cluster_id, "甲", None,
         price_text=price, reference_price=reference, avg_text=avg, sold_out=sold_out,
     )
     with w.store.conn:
@@ -626,6 +642,97 @@ def test_painting_a_price_cell_with_a_delta_does_not_blow_up(window, qapp):
     w.table.viewport().grab()
 
     assert w.table.item(0, app_module.COL_PRICE).text() == "¥44 ↓ 6"
+
+
+# ---------------- 抓取前清空价格 ----------------
+
+
+def _start_fetch(w, monkeypatch):
+    """起一轮抓取，并把线程真跑起来这件事挡掉（这里只关心界面状态）。"""
+    monkeypatch.setattr(app_module, "PollerThread", FakePoller)
+    w.OnFetchPrices()
+
+
+def test_fetch_clears_prices_so_progress_is_visible(window, monkeypatch):
+    """点抓取先把价格清成「--」：不然新旧值混在一起，看不出刷到哪一行了。"""
+    w = window("10000008780\n10000000002\n")
+    _seed_cache(w, price="¥138")
+    w.LoadWatchlist(w.watchlist_path)
+    assert w.table.item(0, app_module.COL_PRICE).text() == "¥138"
+
+    _start_fetch(w, monkeypatch)
+
+    for row in (0, 1):
+        for col in (app_module.COL_PRICE, app_module.COL_REF, app_module.COL_AVG):
+            cell = w.table.item(row, col)
+            assert cell.text() == app_module.CLEARED_TEXT
+            assert cell.toolTip() == ""  # 「--」没什么好提示的
+
+
+def test_cleared_row_gets_its_price_back_when_the_result_arrives(window, monkeypatch):
+    """轮到哪一行，哪一行就先填上——这就是"刷到哪了"的进度。"""
+    w = window("10000008780\n10000000002\n")
+    w.LoadWatchlist(w.watchlist_path)
+    _start_fetch(w, monkeypatch)
+
+    w.OnResultReady(0, result_ok(price="¥44"))
+
+    assert w.table.item(0, app_module.COL_PRICE).text() == "¥44"
+    assert w.table.item(1, app_module.COL_PRICE).text() == app_module.CLEARED_TEXT
+
+
+def test_cleared_prices_survive_a_redraw(window, monkeypatch):
+    """抓取中途重画表格（换主题）不能让没抓到的行冒出旧价格。"""
+    w = window("10000008780\n")
+    _seed_cache(w, price="¥138")
+    w.LoadWatchlist(w.watchlist_path)
+    _start_fetch(w, monkeypatch)
+
+    w.RebuildRows()
+
+    assert w.table.item(0, app_module.COL_PRICE).text() == app_module.CLEARED_TEXT
+
+
+def test_pending_prices_come_back_when_the_run_ends(window, monkeypatch):
+    """收尾时把没轮到的行还回来：否则一片「--」看着像价格被弄丢了。"""
+    w = window("10000008780\n10000000002\n")
+    _seed_cache(w, price="¥138", cluster_id="10000000002")  # 只有第二行有缓存
+    w.LoadWatchlist(w.watchlist_path)
+    _start_fetch(w, monkeypatch)
+    w.OnResultReady(0, result_ok(price="¥44"))
+
+    w.OnPollFinished()
+
+    assert w.table.item(0, app_module.COL_PRICE).text() == "¥44"  # 抓到的留着
+    cell = w.table.item(1, app_module.COL_PRICE)
+    assert cell.text() == "¥138"  # 没轮到的退回缓存
+    assert "上次更新时间" in cell.toolTip()
+
+
+def test_stopped_run_also_brings_pending_prices_back(window, monkeypatch):
+    """中途停止也一样：停的是抓取，不是把已有价格抹掉。"""
+    w = window("10000008780\n10000000002\n")
+    _seed_cache(w, price="¥138", cluster_id="10000000002")
+    w.LoadWatchlist(w.watchlist_path)
+    _start_fetch(w, monkeypatch)
+
+    w.OnStopFetch()
+    w.OnPollFinished()
+
+    assert w.table.item(1, app_module.COL_PRICE).text() == "¥138"
+    assert "已停止" in w.progress_label.text()
+
+
+def test_failed_result_also_stops_being_pending(window, monkeypatch):
+    """失败了也算"轮到过"：该退回缓存显示，而不是继续挂着「--」。"""
+    w = window("10000008780\n")
+    _seed_cache(w, price="¥138")
+    w.LoadWatchlist(w.watchlist_path)
+    _start_fetch(w, monkeypatch)
+
+    w.OnResultReady(0, result_fail("HTTP 500"))
+
+    assert w.table.item(0, app_module.COL_PRICE).text() == "¥138"
 
 
 # ---------------- 按钮状态 ----------------

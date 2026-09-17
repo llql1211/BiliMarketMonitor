@@ -71,12 +71,16 @@ HEADERS = ["缩略图", "商品名", "clusterID", "现价", "原价", "近30天�
 
 PENDING_TEXT = "…"      # 等待抓取
 NO_DATA_TEXT = "—"      # 无数据
+CLEARED_TEXT = "--"     # 抓取开始前把价格清成这个，好看出刷到哪一行了
 FAILED_TEXT = "（查询失败）"
 SOLD_OUT_TEXT = "已售罄"  # 现价格的前缀：售罄时那一格装的不是市集现价
 
 DELTA_ROLE = Qt.UserRole + 1        # 「现价」格末尾那截涨跌（形如「↓ 6」）
 DELTA_COLOR_ROLE = Qt.UserRole + 2  # 上面那截的颜色（随主题走，重画时重算）
 DELTA_GAP = " "                     # 现价与涨跌之间空一格
+
+# 「现价」列一律左对齐：涨跌那截的落点是从文本区左边算起的（见 delta_rect）
+PRICE_ALIGN = Qt.AlignLeft | Qt.AlignVCenter
 
 PAUSE_TEXT = "暂停抓取"
 RESUME_TEXT = "继续抓取"
@@ -701,16 +705,18 @@ class MainWindow(QMainWindow):
     def MakeRow(self, entry):
         """行模型字段：
 
-        entry   LinkEntry，来自清单（本工具只跟踪清单里的商品）
-        record  缓存记录（名称、缩略图、上次抓到的价格）
-        values  本次运行抓到的结果，表格重建时用来保留已显示的数据
-        delta   本次抓取相比上次缓存价格的涨跌 (文本, 变化量)，没得比就是 None
+        entry          LinkEntry，来自清单（本工具只跟踪清单里的商品）
+        record         缓存记录（名称、缩略图、上次抓到的价格）
+        values         本次运行抓到的结果，表格重建时用来保留已显示的数据
+        delta          本次抓取相比上次缓存价格的涨跌 (文本, 变化量)，没得比就是 None
+        price_cleared  这一行在本次抓取里还没轮到，价格格留成「--」
         """
         return {
             "entry": entry,
             "record": self.store.get_item(entry.cluster_id),
             "values": None,
             "delta": None,
+            "price_cleared": False,
         }
 
     def RebuildRows(self, keep_values=True):
@@ -718,15 +724,18 @@ class MainWindow(QMainWindow):
         old = {}
         if keep_values:
             old = {
-                item["entry"].cluster_id: (item.get("values"), item.get("delta"))
+                item["entry"].cluster_id: (
+                    item.get("values"), item.get("delta"), item.get("price_cleared")
+                )
                 for item in self.rows
             }
         rows = []
         for entry in self.watch_entries:
             item = self.MakeRow(entry)
-            values, delta = old.get(entry.cluster_id, (None, None))
+            values, delta, cleared = old.get(entry.cluster_id, (None, None, False))
             item["values"] = values
             item["delta"] = delta
+            item["price_cleared"] = cleared
             rows.append(item)
         self.rows = rows
         self.RenderTable()
@@ -812,11 +821,15 @@ class MainWindow(QMainWindow):
             color=theme.muted_color(self.dark),
         )
 
+    def ClearedCell(self):
+        """待抓取中的占位格：一个「--」，不挂提示（提示里只有「--」等于没说）。"""
+        return self.MakeCell(CLEARED_TEXT, tooltip="")
+
     def PriceCell(self, price, sold_out, note="", delta=None):
         """「现价」格：现价（售罄时带前缀）+ 涨跌，涨跌单独上色。
 
-        对齐固定成左对齐：涨跌那截的落点是按"现价从文本区左边起"算的
-        （见 PriceDeltaDelegate），居中或右对齐就会两截叠在一起。
+        对齐固定成 PRICE_ALIGN：涨跌那截的落点是按"现价从文本区左边起"算的
+        （见 delta_rect），居中或右对齐就会两截叠在一起。
 
         note 是「这价格是什么时候抓的」那类补充说明，有它就不再退回"提示即全文"。
         """
@@ -826,7 +839,7 @@ class MainWindow(QMainWindow):
         cell = self.MakeCell(
             text,
             tooltip=_tips(self.PriceTooltip(sold_out), note) or None,
-            align=Qt.AlignLeft | Qt.AlignVCenter,
+            align=PRICE_ALIGN,
         )
         if delta:
             cell.setData(DELTA_ROLE, delta[0])
@@ -843,6 +856,12 @@ class MainWindow(QMainWindow):
         首屏渲染（FillRow）和抓取回填（OnResultReady）都走这里，
         免得同一段渲染逻辑写两遍，哪天真改出不一致来。
         """
+        if item.get("price_cleared"):  # 本次抓取还没轮到它，先留个空
+            self.table.setItem(row, COL_PRICE, self.ClearedCell())
+            self.table.setItem(row, COL_REF, self.ClearedCell())
+            self.table.setItem(row, COL_AVG, self.ClearedCell())
+            return
+
         values = item["values"] or {}
         record = item["record"] or {}
         if values.get("ok"):
@@ -861,6 +880,28 @@ class MainWindow(QMainWindow):
         self.table.setItem(
             row, COL_AVG, self.MakeCell(str(avg) if avg else NO_DATA_TEXT)
         )
+
+    def ClearPrices(self):
+        """抓取开始前把各行的价格清成「--」：从空开始涨，才看得出刷到哪一行了。
+
+        清的是现价/原价/均价三格——它们由同一次请求一起回来，只清一个反而怪。
+        标记记在行模型上（price_cleared），这样抓取中途换主题重画表格时，
+        已经抓到的行照常显示新价，没轮到的还是「--」。
+        """
+        for row, item in enumerate(self.rows):
+            item["price_cleared"] = True
+            self.SetPriceCells(row, item)
+
+    def RestorePendingPrices(self):
+        """收尾：这一轮没轮到的行把价格还回来。
+
+        那些价格只是被"清空待抓"，数据还在缓存里（或者这次抓了个失败）；
+        跑完还留着一片「--」，看起来就像价格被弄丢了。
+        """
+        for row, item in enumerate(self.rows):
+            if item.get("price_cleared"):
+                item["price_cleared"] = False
+                self.SetPriceCells(row, item)
 
     def FillRow(self, row, item):
         """填充一行：优先显示本次抓到的值，其次缓存，最后留待抓取。"""
@@ -1121,6 +1162,7 @@ class MainWindow(QMainWindow):
         self.last_note = ""  # 开始新的一轮抓取，不带着之前的降级提示
         self.names_learned = False
         self.poller_stopped = False
+        self.ClearPrices()  # 先把价格清空，好一眼看出刷到哪一行了
         self.SetBusy(True)
         self.poller = PollerThread(
             tasks,
@@ -1141,6 +1183,7 @@ class MainWindow(QMainWindow):
             return
         item = self.rows[row]
         cluster_id = item["entry"].cluster_id
+        item["price_cleared"] = False  # 这一条有结果了（成没成另说），不再算「待抓取」
 
         if result["ok"]:
             # 涨跌要拿"这次抓取之前"的那个价比，所以先算再写缓存——upsert 之后
@@ -1225,6 +1268,7 @@ class MainWindow(QMainWindow):
 
     def OnPollFinished(self):
         self.SetBusy(False)
+        self.RestorePendingPrices()  # 没轮到的行别一直空着（停止抓取的也一样）
         if self.poller_stopped:
             self.progress_label.setText("已停止抓取，已抓到的结果保留")
             return
