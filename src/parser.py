@@ -14,6 +14,8 @@ import re
 
 RECENT_DEALS_COUNT = 3  # 近 N 次成交，可调（网页一次返回多条，截取即可）
 
+SOLD_OUT_STATE = 2  # clusterPurchaseButton.buttonState：2 就是「已售罄」
+
 # 「9小时前」里的单位换算成秒；接口给的是相对时间，只够粗判新旧
 _RELATIVE_UNITS = {
     "秒": 1,
@@ -65,6 +67,8 @@ def parse_cluster(resp: dict) -> dict:
     取值路径（见 dev_notes/initial_plan.md 字段映射）：
       商品名   data.clusterBasicInfoFloorVO.clusterName
       当前价格 data.clusterPriceFloorVO.priceTag.firstPrice
+      原价     data.clusterPriceFloorVO.priceTag.price（+ priceSymbol）
+      售罄     data.clusterPurchaseButton.buttonState == 2
       近期均价 data.clusterRecentBuyFloorVO.avgPrice（统计口径待确认）
       成交记录 data.clusterRecentBuyFloorVO.recentDeals[]
       缩略图   data.clusterHeaderFloorVO.clusterImgList[0]
@@ -74,9 +78,11 @@ def parse_cluster(resp: dict) -> dict:
         "error": None,
         "name": None,
         "price": None,
+        "reference_price": None,
         "avg_price": None,
         "deals": [],
         "image_url": None,
+        "sold_out": False,
     }
 
     # 调用方传进来的不一定是 dict（None/列表/数字），直接按"查询失败"处理
@@ -94,10 +100,15 @@ def parse_cluster(resp: dict) -> dict:
     # 商品名
     result["name"] = _clean_text(_dig(data, "clusterBasicInfoFloorVO", "clusterName"))
 
-    # 当前价格：price 是"参考价"，一般用 firstPrice（不同商品类型含义待进一步验证）
-    result["price"] = _fmt_price(
-        _dig(data, "clusterPriceFloorVO", "priceTag", "firstPrice")
-    )
+    # 价格区：firstPrice 是「现价」，price 是划线那个「原价」。
+    # 注意售罄时接口整组不返回 price/priceSymbol，此时 firstPrice 装的就是原价
+    # ——所以判售罄不能靠"有没有 price"，得看购买按钮的状态（见下）。
+    price_tag = _dig(data, "clusterPriceFloorVO", "priceTag")
+    if isinstance(price_tag, dict):
+        result["price"] = _fmt_price(price_tag.get("firstPrice"))
+        result["reference_price"] = _fmt_reference_price(price_tag)
+
+    result["sold_out"] = _is_sold_out(_dig(data, "clusterPurchaseButton"))
 
     # 成交相关：字段可能整体不存在
     recent = _dig(data, "clusterRecentBuyFloorVO")
@@ -190,6 +201,39 @@ def _fmt_price(value):
     return f"¥{text}"
 
 
+def _fmt_reference_price(price_tag) -> str | None:
+    """「原价」（网页上现价右边那个划线价）：price + 接口给的货币符号。
+
+    符号单独放在 priceSymbol 里，所以不能直接套 _fmt_price——那会把符号
+    一律当成 ¥，接口哪天换成别的符号就会拼错。价格为空的商品（实测是售罄
+    的那种）这里返回 None，由界面显示 "—"。
+    """
+    if not isinstance(price_tag, dict):
+        return None
+    price = _clean_text(price_tag.get("price"))
+    if price is None:
+        return None
+    symbol = _clean_text(price_tag.get("priceSymbol")) or ""
+    if not symbol or price.startswith(("¥", "￥")):  # 价格里自带符号时别拼两个
+        return _fmt_price(price)
+    return _clean_text(f"{symbol}{price}")
+
+
+def _is_sold_out(button) -> bool:
+    """购买按钮是否处于「已售罄」（buttonState == 2）。
+
+    只有 2 算售罄：3（已下架）、4（未开始）同样"没有市集现价"，但手上没有
+    实例可对照，先不替它们编展示文案；状态认不出来时一律当在售，照常显示
+    价格——宁可少标一次售罄，也不要凭猜测给商品扣帽子。
+    """
+    if not isinstance(button, dict):
+        return False
+    state = button.get("buttonState")
+    if isinstance(state, bool) or not isinstance(state, int):  # 字符串等都不认
+        return False
+    return state == SOLD_OUT_STATE
+
+
 def _normalize_result(result: dict) -> dict:
     """出口兜底：固定各级的键与类型，界面层可以放心直接用，不必再判空。"""
     ok = bool(result.get("ok"))
@@ -216,7 +260,9 @@ def _normalize_result(result: dict) -> dict:
         "error": error,
         "name": _clean_text(result.get("name")),
         "price": _clean_text(result.get("price")),
+        "reference_price": _clean_text(result.get("reference_price")),
         "avg_price": _clean_text(result.get("avg_price")),
         "deals": deals,
         "image_url": _clean_text(result.get("image_url")),
+        "sold_out": bool(result.get("sold_out")),
     }

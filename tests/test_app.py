@@ -36,17 +36,25 @@ import theme
 
 def _raw_response(
     name="测试商品", price="¥44", avg=205, deals=3, img="//i0.hdslb.com/bfs/x.jpg",
-    deal_times=None,
+    deal_times=None, reference=None, sold_out=False,
 ):
     """构造一份 cluster_info 原始响应（走真实 parser，避免手搓结果 dict）。
 
     deal_times 给成交时间（用于高亮相关用例）；不给就按 deals 条数全填「8天前」——
     8 天在默认 24 小时阈值之外，不会被误判成「近期成交」。
+    reference 给划线原价；sold_out=True 时带上「已售罄」的购买按钮（真实形状：
+    售罄响应里 priceTag 没有 price，firstPrice 装的是原价）。
     """
+    price_tag = {"firstPrice": price}
+    if reference is not None:
+        price_tag["price"] = reference
+        price_tag["priceSymbol"] = "¥"
     data = {
         "clusterBasicInfoFloorVO": {"clusterName": name},
-        "clusterPriceFloorVO": {"priceTag": {"firstPrice": price}},
+        "clusterPriceFloorVO": {"priceTag": price_tag},
     }
+    if sold_out:
+        data["clusterPurchaseButton"] = {"buttonState": 2, "buttonText": "已售罄"}
     if avg is not None:
         times = ["8天前"] * deals if deal_times is None else list(deal_times)
         data["clusterRecentBuyFloorVO"] = {
@@ -205,6 +213,7 @@ def test_pending_row_renders_placeholders(window):
     assert w.table.item(0, app_module.COL_NAME).text() == app_module.PENDING_TEXT
     for col in (
         app_module.COL_PRICE,
+        app_module.COL_REF,
         app_module.COL_AVG,
         app_module.COL_DEAL_BASE,
         app_module.COL_DEAL_BASE + 2,
@@ -321,6 +330,60 @@ def test_progress_updates_label(window):
     w = window()
     w.OnProgress(3, 12)
     assert w.progress_label.text() == "查询中 3/12"
+
+
+# ---------------- 原价 / 售罄 ----------------
+
+
+def test_reference_price_gets_its_own_column(window):
+    """现价和原价分列显示：售罄时两个数含义不同，混在一格早晚出事。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, result_ok(reference="110"))
+
+    assert w.table.item(0, app_module.COL_PRICE).text() == "¥44"
+    assert w.table.item(0, app_module.COL_REF).text() == "¥110"
+
+
+def test_sold_out_row_never_passes_the_reference_price_off_as_current(window):
+    """售罄行的现价格必须标出来：那格装的是原价，不是还能买到的价。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, result_ok(price="138", sold_out=True))
+
+    cell = w.table.item(0, app_module.COL_PRICE)
+    assert cell.text() == f"{app_module.SOLD_OUT_TEXT} ¥138"
+    assert "原价" in cell.toolTip()  # 悬停要能看懂这个数为什么在现价列
+    assert w.table.item(0, app_module.COL_REF).text() == app_module.NO_DATA_TEXT
+
+
+def test_reference_column_follows_the_theme(window):
+    """原价列用弱化色，且颜色跟主题走——不重画的话会停在旧主题的色上。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, result_ok(reference="110"))
+
+    before = w.table.item(0, app_module.COL_REF).foreground().color().name()
+    w.OnToggleTheme()
+    after = w.table.item(0, app_module.COL_REF).foreground().color().name()
+
+    assert after == theme.muted_color(w.dark).name()
+    assert after != before
+
+
+def test_theme_toggle_keeps_rows_and_selection(window):
+    """切主题要重画表格，但行和选中态不能跟着丢。"""
+    w = window("10000008780 | 甲\n10000000002 | 乙\n")
+    w.LoadWatchlist(w.watchlist_path)
+    last_col = w.table.columnCount() - 1
+    w.table.setRangeSelected(QTableWidgetSelectionRange(1, 0, 1, last_col), True)
+
+    w.OnToggleTheme()
+
+    assert [item["entry"].cluster_id for item in w.rows] == [
+        "10000008780", "10000000002",
+    ]
+    assert w.SelectedClusterIds() == {"10000000002"}
 
 
 # ---------------- 按钮状态 ----------------
@@ -749,7 +812,7 @@ def test_reorder_keeps_the_whole_selection_together(window):
         ("10000000004", "丁"),
     )
     # selectRow 会顶掉上一次的选择，多选得用 setRangeSelected
-    w.table.setRangeSelected(QTableWidgetSelectionRange(1, 0, 2, 8), True)
+    w.table.setRangeSelected(QTableWidgetSelectionRange(1, 0, 2, w.table.columnCount() - 1), True)
 
     w.OnRowsDropped([1, 2], 4)  # 把「乙」「丙」拖到末尾
 
@@ -930,7 +993,7 @@ def test_reorder_uses_whole_selection(window, monkeypatch):
     """多选时整块一起挪，块内保持原顺序。"""
     w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"), ("10000000003", "丙"))
     # selectRow 会顶掉上一次的选择，多选得用 setRangeSelected
-    w.table.setRangeSelected(QTableWidgetSelectionRange(0, 0, 1, 8), True)
+    w.table.setRangeSelected(QTableWidgetSelectionRange(0, 0, 1, w.table.columnCount() - 1), True)
     monkeypatch.setattr(w.table, "indexAt", lambda pos: QModelIndex())  # 落在空白区
     mime = QMimeData()
     event = QDropEvent(QPoint(10, 10), Qt.MoveAction, mime, Qt.LeftButton, Qt.NoModifier)
@@ -996,7 +1059,7 @@ def test_row_numbers_stand_for_the_position_not_the_item(window):
 def test_row_numbers_shrink_with_the_list(window, monkeypatch):
     """删行后序号得跟着缩短——setRowCount 会把序号清空，靠重画补回来。"""
     w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"), ("10000000003", "丙"))
-    w.table.setRangeSelected(QTableWidgetSelectionRange(2, 0, 2, 8), True)
+    w.table.setRangeSelected(QTableWidgetSelectionRange(2, 0, 2, w.table.columnCount() - 1), True)
     monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.Yes))
 
     w.OnDeleteSelected()

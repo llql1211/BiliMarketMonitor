@@ -36,9 +36,11 @@ def test_parse_error_structure():
         "error": "boom",
         "name": None,
         "price": None,
+        "reference_price": None,
         "avg_price": None,
         "deals": [],
         "image_url": None,
+        "sold_out": False,
     }
 
 
@@ -111,6 +113,97 @@ def test_price_formats(raw, expected):
     resp = _base_response()
     resp["data"]["clusterPriceFloorVO"]["priceTag"]["firstPrice"] = raw
     assert parser.parse_cluster(resp)["price"] == expected
+
+
+# ---------------- 原价（划线价）与售罄 ----------------
+
+
+@pytest.mark.parametrize(
+    "tag, expected",
+    [
+        ({"price": "110", "priceSymbol": "¥"}, "¥110"),
+        ({"price": 110, "priceSymbol": "¥"}, "¥110"),
+        ({"price": "110"}, "¥110"),          # 没有 priceSymbol 时退回 ¥
+        ({"price": "¥110", "priceSymbol": "¥"}, "¥110"),  # 价格自带符号，别拼成 ¥¥110
+        ({"price": "110", "priceSymbol": "$"}, "$110"),   # 符号以接口为准
+        ({"price": None, "priceSymbol": "¥"}, None),      # 售罄时整组不返回
+        ({"priceSymbol": "¥"}, None),
+        ({"price": ""}, None),
+        ({"price": "   "}, None),
+        ({"price": {"a": 1}}, None),
+        (None, None),
+        ("not-a-dict", None),
+    ],
+)
+def test_reference_price_from_price_tag(tag, expected):
+    """原价取 priceTag.price 并带上接口给的货币符号（实测是 "¥"）。"""
+    resp = _base_response()
+    resp["data"]["clusterPriceFloorVO"]["priceTag"] = tag
+    assert parser.parse_cluster(resp)["reference_price"] == expected
+
+
+def test_parse_cluster_full_response_has_reference_price():
+    """字段齐全时原价也跟着出来，界面才有「现价 / 原价」两列可比。"""
+    resp = _base_response()
+    resp["data"]["clusterPriceFloorVO"]["priceTag"] = {
+        "firstPrice": "44",
+        "firstPriceSymbol": "¥",
+        "price": "110",
+        "priceSymbol": "¥",
+    }
+    result = parser.parse_cluster(resp)
+    assert result["price"] == "¥44"
+    assert result["reference_price"] == "¥110"
+    assert result["sold_out"] is False
+
+
+@pytest.mark.parametrize(
+    "button, expected",
+    [
+        ({"buttonState": 2, "buttonText": "已售罄"}, True),
+        ({"buttonState": 1, "buttonText": "最低价仅1件"}, False),
+        ({"buttonState": 3}, False),   # 已下架：没见过实例，先不当售罄
+        ({"buttonState": 4}, False),   # 未开始
+        ({"buttonText": "已售罄"}, False),  # 没有 buttonState 时不猜
+        ({"buttonState": "2"}, False),
+        ({"buttonState": True}, False),  # bool 是 int 的子类，别被当成 2
+        ({"buttonState": None}, False),
+        (None, False),
+        ("not-a-dict", False),
+    ],
+)
+def test_sold_out_follows_button_state(button, expected):
+    """售罄只认 buttonState == 2；认不出来的一律当在售。"""
+    resp = _base_response()
+    if button is None:
+        resp["data"].pop("clusterPurchaseButton", None)
+    else:
+        resp["data"]["clusterPurchaseButton"] = button
+    assert parser.parse_cluster(resp)["sold_out"] is expected
+
+
+def test_sold_out_response_holds_the_reference_price_as_first_price():
+    """售罄商品的实测形状：priceTag 里没有 price，firstPrice 装的是原价。
+
+    拿真实响应（10000001660）改的：同款在售时划线价 138，售罄后 firstPrice
+    就是 138——所以这时候的「现价」必须由界面标成售罄，不能冒充市集现价。
+    """
+    resp = _base_response()
+    resp["data"]["clusterPriceFloorVO"]["priceTag"] = {
+        "firstPriceType": 3,
+        "firstPrice": "138",
+        "firstPricePrefix": "",
+        "firstPriceSymbol": "¥",
+    }
+    resp["data"]["clusterPurchaseButton"] = {
+        "buttonState": 2,
+        "buttonText": "已售罄",
+        "buttonDisabled": True,
+    }
+    result = parser.parse_cluster(resp)
+    assert result["price"] == "¥138"
+    assert result["reference_price"] is None  # 接口没给，界面显示 "—"
+    assert result["sold_out"] is True
 
 
 # ---------------- 缺成交字段 ----------------
@@ -227,10 +320,12 @@ def test_result_structure_is_always_the_same(resp):
     """不管喂进去什么，出口都是固定 7 个键 + 固定类型，界面层不用再判空。"""
     result = parser.parse_cluster(resp)
     assert set(result) == {
-        "ok", "error", "name", "price", "avg_price", "deals", "image_url",
+        "ok", "error", "name", "price", "reference_price", "avg_price",
+        "deals", "image_url", "sold_out",
     }
     assert isinstance(result["ok"], bool)
-    for key in ("error", "name", "price", "avg_price", "image_url"):
+    assert isinstance(result["sold_out"], bool)
+    for key in ("error", "name", "price", "reference_price", "avg_price", "image_url"):
         assert result[key] is None or isinstance(result[key], str)
     assert isinstance(result["deals"], list)
     for deal in result["deals"]:

@@ -50,15 +50,16 @@ IMAGE_SUFFIX = f"@{IMAGE_SIZE}w_{IMAGE_SIZE}h_85q.webp"
 
 ROW_NUMBER_PADDING = 16  # 序号槽左右留白，免得数字贴着分隔线
 
-COL_IMG, COL_NAME, COL_CID, COL_PRICE, COL_AVG = 0, 1, 2, 3, 4
-COL_DEAL_BASE = 5  # 成交① 占 5/6/7 三列
-COL_LINK = 8
-HEADERS = ["缩略图", "商品名", "clusterID", "现价", "近30天均价",
+COL_IMG, COL_NAME, COL_CID, COL_PRICE, COL_REF, COL_AVG = 0, 1, 2, 3, 4, 5
+COL_DEAL_BASE = 6  # 成交① 占 6/7/8 三列
+COL_LINK = 9
+HEADERS = ["缩略图", "商品名", "clusterID", "现价", "原价", "近30天均价",
            "成交①", "成交②", "成交③", "链接（点击打开）"]
 
 PENDING_TEXT = "…"      # 等待抓取
 NO_DATA_TEXT = "—"      # 无数据
 FAILED_TEXT = "（查询失败）"
+SOLD_OUT_TEXT = "已售罄"  # 现价格的前缀：售罄时那一格装的不是市集现价
 
 PAUSE_TEXT = "暂停抓取"
 RESUME_TEXT = "继续抓取"
@@ -396,6 +397,9 @@ class ReorderableTable(QTableWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        # 先定主题标记：下面填单元格时要按它取颜色（「原价」的弱化色等），
+        # 真正的样式在 InitUI 之后由 ApplyTheme 装上
+        self.dark = False
         self.config, self.config_warnings = config.load_config()
         # 近期成交高亮：阈值换算成秒、颜色解析成画刷，启动时各算一次就够
         self.deal_highlight_seconds = self.config["deal_highlight_within_hours"] * 3600
@@ -491,8 +495,9 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(QHeaderView.Interactive)
         self.table.setIconSize(QSize(IMAGE_SIZE, IMAGE_SIZE))
         header.resizeSection(COL_IMG, IMAGE_SIZE + 8)
-        for col in (COL_PRICE, COL_AVG):
-            header.resizeSection(col, 100)
+        header.resizeSection(COL_PRICE, 120)  # 要放得下「¥90.50 ↓ 12.30」这种
+        header.resizeSection(COL_REF, 90)
+        header.resizeSection(COL_AVG, 100)
         for col in (COL_DEAL_BASE, COL_DEAL_BASE + 1, COL_DEAL_BASE + 2):
             header.resizeSection(col, 120)
         header.resizeSection(COL_CID, 100)
@@ -619,10 +624,11 @@ class MainWindow(QMainWindow):
         if item is not None:
             item.setIcon(QIcon(pixmap))
 
-    def MakeCell(self, text, tooltip=None, align=None):
+    def MakeCell(self, text, tooltip=None, align=None, color=None):
         """建单元格。tooltip 默认为该格的完整文本——列宽不够被截断时也能看全。
 
         文本为空或只是占位符（—/…）时不挂，免得弹出来一句没信息量的提示。
+        color 给「原价」这类次要信息用；颜色随主题走，换主题时由调用方重画。
         """
         item = QTableWidgetItem(text)
         if tooltip is None and text not in ("", NO_DATA_TEXT, PENDING_TEXT):
@@ -631,7 +637,30 @@ class MainWindow(QMainWindow):
             item.setToolTip(tooltip)
         if align is not None:
             item.setTextAlignment(align)
+        if color is not None:
+            item.setForeground(QBrush(color))
         return item
+
+    def PriceText(self, price, sold_out) -> str:
+        """「现价」格的文本。
+
+        售罄时接口给的 firstPrice 其实是原价（测过：同款在售时它等于划线价），
+        直接摆进现价列会让人以为还能按这个价买到，所以前面盖一句「已售罄」。
+        """
+        if price and sold_out:
+            return f"{SOLD_OUT_TEXT} {price}"
+        return str(price) if price else NO_DATA_TEXT
+
+    def PriceTooltip(self, sold_out):
+        """售罄行的现价格要解释一句：那个数不是市集现价。"""
+        return "该商品已售罄，这里的价格是原价而非市集现价" if sold_out else None
+
+    def ReferenceCell(self, reference_price):
+        """「原价」格：弱化色显示，跟现价拉开层次。"""
+        return self.MakeCell(
+            str(reference_price) if reference_price else NO_DATA_TEXT,
+            color=theme.muted_color(self.dark),
+        )
 
     def FillRow(self, row, item):
         """填充一行：优先显示本次抓到的值，其次缓存，最后留待抓取。"""
@@ -656,7 +685,13 @@ class MainWindow(QMainWindow):
         def text(value):
             return str(value) if value else NO_DATA_TEXT
 
-        self.table.setItem(row, COL_PRICE, self.MakeCell(text(values.get("price"))))
+        self.table.setItem(
+            row, COL_PRICE, self.MakeCell(
+                self.PriceText(values.get("price"), values.get("sold_out")),
+                tooltip=self.PriceTooltip(values.get("sold_out")),
+            )
+        )
+        self.table.setItem(row, COL_REF, self.ReferenceCell(values.get("reference_price")))
         self.table.setItem(row, COL_AVG, self.MakeCell(text(values.get("avg_price"))))
         self.SetDealCells(row, values.get("deals"))
 
@@ -849,6 +884,14 @@ class MainWindow(QMainWindow):
                     QTableWidgetSelectionRange(row, 0, row, last_col), True
                 )
 
+    def SelectedClusterIds(self):
+        """当前选中的商品（按 clusterId 记，重画表格后行号会变）。"""
+        return {
+            self.rows[index.row()]["entry"].cluster_id
+            for index in self.table.selectedIndexes()
+            if index.row() < len(self.rows)
+        }
+
     def OnRowsDropped(self, rows, target):
         """拖拽排序：按拖拽结果重排行模型，顺序即清单顺序，直接写回文件。
 
@@ -920,7 +963,13 @@ class MainWindow(QMainWindow):
         def text(value):
             return str(value) if value else NO_DATA_TEXT
 
-        self.table.setItem(row, COL_PRICE, self.MakeCell(text(result["price"])))
+        self.table.setItem(
+            row, COL_PRICE, self.MakeCell(
+                self.PriceText(result["price"], result["sold_out"]),
+                tooltip=self.PriceTooltip(result["sold_out"]),
+            )
+        )
+        self.table.setItem(row, COL_REF, self.ReferenceCell(result["reference_price"]))
         self.table.setItem(row, COL_AVG, self.MakeCell(text(result["avg_price"])))
         self.SetDealCells(row, result["deals"])
 
@@ -1021,6 +1070,11 @@ class MainWindow(QMainWindow):
         dark = not self.dark
         self.store.set_setting("theme", "dark" if dark else "light")
         self.ApplyTheme(dark)
+        # 单元格里的颜色（原价的弱化色、涨跌的红绿）都是按主题选的，换主题得
+        # 重画一遍才换得掉；选中态按商品搬回去，免得切个主题就把选中的行丢了
+        selected = self.SelectedClusterIds()
+        self.RenderTable()
+        self.SelectItems(selected)
 
     # ---------------- 收尾 ----------------
 

@@ -23,6 +23,11 @@ TOOLTIP_DELAY_MS = 2000  # 悬停多久才弹提示（Qt 默认约 0.7 秒）
 # 那边是「默认配置」，这边是「配置给的色认不出来时的最后一道」，各守一层。
 DEAL_HIGHLIGHT_COLOR = "#e07000"
 
+# 次要信息的弱化色（「原价」列用它跟现价拉开层次）。深浅各一档：
+# 白底上要比正文浅但仍读得出，暗底上反过来要比正文暗一档但不能糊成一团。
+MUTED_COLOR_LIGHT = "#6e7781"
+MUTED_COLOR_DARK = "#85878e"
+
 DARK_QSS = """
 QWidget {
     background-color: #1e1f22;
@@ -167,6 +172,11 @@ def deal_highlight_color(text) -> QColor:
             return color
     print(f"[theme] 无法识别的成交高亮色 {text!r}，已退回 {DEAL_HIGHLIGHT_COLOR}")
     return QColor(DEAL_HIGHLIGHT_COLOR)
+
+
+def muted_color(dark: bool) -> QColor:
+    """次要信息的弱化色（「原价」这类"有就行、别抢眼"的内容用它）。"""
+    return QColor(MUTED_COLOR_DARK if dark else MUTED_COLOR_LIGHT)
 
 
 def style_placeholder(widget, dark: bool):
