@@ -33,6 +33,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
+    QTableWidgetSelectionRange,
     QVBoxLayout,
     QWidget,
 )
@@ -79,6 +80,20 @@ def _deal_text(deal) -> str:
     return " · ".join(part for part in (deal.get("price"), deal.get("time")) if part)
 
 
+def picked_rows(sources, count):
+    """从 sources 里挑出合法行号（升序去重）：非整数、越界、bool 一律忽略。
+
+    move_rows 用它决定挪哪几行，OnRowsDropped 用它记"挪的是哪几件商品"——
+    两处必须按同一个口径认行号，所以只留这一份。
+    """
+    if not isinstance(sources, (list, tuple, set, frozenset)):
+        return []
+    return sorted({
+        i for i in sources
+        if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < count
+    })
+
+
 def move_rows(items, sources, target):
     """把 items 里 sources 这几行整体挪到 target 处（插在该位置之前），返回新列表。
 
@@ -89,12 +104,7 @@ def move_rows(items, sources, target):
     排序是给人看的，宁可不动也不要把清单弄乱。
     """
     items = list(items)
-    if not isinstance(sources, (list, tuple, set, frozenset)):
-        return items
-    picked = sorted({
-        i for i in sources
-        if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < len(items)
-    })
+    picked = picked_rows(sources, len(items))
     if not picked or not isinstance(target, int) or isinstance(target, bool):
         return items
 
@@ -802,6 +812,23 @@ class MainWindow(QMainWindow):
             f"清单已同步，共 {len(self.rows)} 件商品" + self.last_note
         )
 
+    def SelectItems(self, cluster_ids):
+        """把选中态落到这几件商品此刻所在的行上。
+
+        拖拽重排后必须重新落一次：Qt 的选中态只记得行号，重排后老行号上已经
+        是别的商品了，不搬一下的话选中的仍是"那一行"，而不是"那件商品"。
+        """
+        self.table.clearSelection()
+        if not cluster_ids:
+            return
+        last_col = self.table.columnCount() - 1
+        for row, item in enumerate(self.rows):
+            if item["entry"].cluster_id in cluster_ids:
+                # 逐行 setRangeSelected：它不像 selectRow 那样顶掉上一次的选择
+                self.table.setRangeSelected(
+                    QTableWidgetSelectionRange(row, 0, row, last_col), True
+                )
+
     def OnRowsDropped(self, rows, target):
         """拖拽排序：按拖拽结果重排行模型，顺序即清单顺序，直接写回文件。
 
@@ -811,6 +838,8 @@ class MainWindow(QMainWindow):
         if self.IsPolling():
             return  # 抓取中不许重排，理由见 SetBusy
         before = [item["entry"].cluster_id for item in self.rows]
+        # 先记下被挪的是哪几件商品：重排后行号全变了，只有 clusterId 还认得出人
+        moved = {self.rows[i]["entry"].cluster_id for i in picked_rows(rows, len(self.rows))}
 
         self.rows = move_rows(self.rows, rows, target)
         if [item["entry"].cluster_id for item in self.rows] == before:
@@ -819,6 +848,7 @@ class MainWindow(QMainWindow):
         # 清单条目与行模型一一对应，直接从行模型里取，省得再对齐一次行号
         self.watch_entries = [item["entry"] for item in self.rows]
         self.RenderTable()
+        self.SelectItems(moved)
         if self.SaveWatchlist():
             self.progress_label.setText(
                 f"已调整顺序，共 {len(self.rows)} 件商品，已写回 watchlist.txt"

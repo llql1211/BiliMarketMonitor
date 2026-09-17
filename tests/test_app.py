@@ -630,6 +630,11 @@ def _ids(w):
     return [item["entry"].cluster_id for item in w.rows]
 
 
+def _selected(w):
+    """当前选中的行号（升序）。"""
+    return sorted({index.row() for index in w.table.selectedIndexes()})
+
+
 def _loaded(window, *items):
     """建窗口并把清单载入表格（拖拽相关的用例都要先有行）。"""
     w = window("".join(f"{cid} | {name}\n" for cid, name in items))
@@ -721,6 +726,45 @@ def test_reorder_keeps_fetched_values_with_their_row(window):
     assert w.table.item(0, app_module.COL_NAME).text() == "乙最新"
     assert w.table.item(0, app_module.COL_PRICE).text() == "¥44"
     assert w.table.item(1, app_module.COL_PRICE).text() == app_module.NO_DATA_TEXT
+
+
+def test_reorder_moves_selection_with_the_rows(window):
+    """重排后选中态跟着被挪的行走，不能留在原来的行号上。"""
+    w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"), ("10000000003", "丙"))
+    w.table.selectRow(2)  # 选中「丙」
+
+    w.OnRowsDropped([2], 0)  # 把「丙」拖到最前面
+
+    assert _ids(w) == ["10000000003", "10000008780", "10000000002"]
+    assert _selected(w) == [0]
+
+
+def test_reorder_keeps_the_whole_selection_together(window):
+    """一次拖多行时，选中的几行要一起跟着走，不能只剩最后一行。"""
+    w = _loaded(
+        window,
+        ("10000008780", "甲"),
+        ("10000000002", "乙"),
+        ("10000000003", "丙"),
+        ("10000000004", "丁"),
+    )
+    # selectRow 会顶掉上一次的选择，多选得用 setRangeSelected
+    w.table.setRangeSelected(QTableWidgetSelectionRange(1, 0, 2, 8), True)
+
+    w.OnRowsDropped([1, 2], 4)  # 把「乙」「丙」拖到末尾
+
+    assert _ids(w) == ["10000008780", "10000000004", "10000000002", "10000000003"]
+    assert _selected(w) == [2, 3]
+
+
+def test_reorder_to_same_place_keeps_selection(window, data_files):
+    """原地放下不动表格，选中态也不该被动过。"""
+    w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"))
+    w.table.selectRow(1)
+
+    w.OnRowsDropped([1], 1)
+
+    assert _selected(w) == [1]
 
 
 def test_reorder_to_same_place_changes_nothing(window, data_files):
