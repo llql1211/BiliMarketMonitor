@@ -12,3 +12,11 @@ retry_interval_seconds = 1
 
 # 单次请求超时（秒）
 request_timeout_seconds = 10
+
+# 成交新鲜度高亮：最近一次成交发生在多少小时内，就把成交价格加粗并用下面的颜色显示。
+# 单位是小时；设为 0 表示关闭高亮
+deal_highlight_within_hours = 24
+
+# 高亮成交用的文字颜色，支持 #rrggbb 和颜色名（如 orange）。
+# 默认值在深浅两种主题的表格底色下都看得清，自己换色时留意这一点
+deal_highlight_color = "#e07000"

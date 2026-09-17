@@ -208,3 +208,105 @@ def test_template_value_is_stripped(data_files):
     )
     cfg, _ = config.load_config()
     assert cfg["detail_url_template"] == "https://x.test/p?clusterId={clusterId}"
+
+
+# ---------------- 校验规则登记 ----------------
+#
+# 校验以前是按默认值类型分支的（str 就套 URL 模板规则），加了第二个字符串项
+# 就会被那条规则一律拒掉，所以改成按 key 显式登记。下面这条守住「别漏登记」。
+
+
+def test_every_default_has_a_validator():
+    """DEFAULTS 与 _VALIDATORS 必须一一对应，两个方向漏都会出问题。"""
+    assert set(config._VALIDATORS) == set(config.DEFAULTS)
+
+
+# ---------------- 成交新鲜度高亮 ----------------
+#
+# 阈值 0 是「关闭高亮」，所以这一项允许 0；其余数值项照旧必须大于 0。
+
+
+def test_highlight_defaults(data_files):
+    """两份配置都没写时高亮取代码默认值：24 小时、橙色。"""
+    _remove(data_files, "config.example.toml", "config.toml")
+    cfg, _ = config.load_config()
+    assert cfg["deal_highlight_within_hours"] == 24.0
+    assert cfg["deal_highlight_color"] == "#e07000"
+
+
+@pytest.mark.parametrize("raw_value, expected", [("6", 6.0), ("0.5", 0.5), ("0", 0.0)])
+def test_highlight_hours_accepted(data_files, raw_value, expected):
+    """合法的阈值被接受并归一成 float；0 是合法的（关闭高亮）。"""
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", f"deal_highlight_within_hours = {raw_value}\n")
+    cfg, warnings = config.load_config()
+    assert cfg["deal_highlight_within_hours"] == expected
+    assert not any("deal_highlight_within_hours" in w for w in warnings)
+
+
+@pytest.mark.parametrize(
+    "raw_value, expected_keyword",
+    [
+        ("-1", "必须不小于 0"),
+        ('"6"', "不是数字"),
+        ("true", "不是数字"),
+        ("inf", "有限数字"),
+        ("nan", "有限数字"),
+    ],
+)
+def test_highlight_hours_rejected(data_files, raw_value, expected_keyword):
+    """非法阈值退回默认 24 小时并记一条警告。"""
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", f"deal_highlight_within_hours = {raw_value}\n")
+    cfg, warnings = config.load_config()
+    assert cfg["deal_highlight_within_hours"] == config.DEFAULTS["deal_highlight_within_hours"]
+    assert any(expected_keyword in w and "deal_highlight_within_hours" in w for w in warnings)
+
+
+@pytest.mark.parametrize(
+    "raw_value, expected",
+    [
+        ('"#e07000"', "#e07000"),
+        ('"#abc"', "#abc"),          # 三位简写
+        ('"#ff8c00ff"', "#ff8c00ff"),  # 带 alpha
+        ('"orange"', "orange"),      # 颜色名
+        ('"  orange  "', "orange"),  # 两端空白先剥掉
+    ],
+)
+def test_highlight_color_accepted(data_files, raw_value, expected):
+    """颜色只校验形状：#rrggbb 系和纯字母的颜色名都放行。"""
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", f"deal_highlight_color = {raw_value}\n")
+    cfg, warnings = config.load_config()
+    assert cfg["deal_highlight_color"] == expected
+    assert not any("deal_highlight_color" in w for w in warnings)
+
+
+@pytest.mark.parametrize(
+    "raw_value, expected_keyword",
+    [
+        ("5", "不是有效字符串"),
+        ('""', "不是有效字符串"),
+        ('"   "', "不是有效字符串"),
+        ('"#12345"', "不是合法颜色"),      # 位数不对
+        ('"orange juice"', "不是合法颜色"),  # 带空格的颜色名
+        ('"rgb(1,2,3)"', "不是合法颜色"),
+        ('"#gggggg"', "不是合法颜色"),       # 非十六进制字符
+    ],
+)
+def test_highlight_color_rejected(data_files, raw_value, expected_keyword):
+    """认不出来的颜色退回默认色并记一条警告。"""
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", f"deal_highlight_color = {raw_value}\n")
+    cfg, warnings = config.load_config()
+    assert cfg["deal_highlight_color"] == config.DEFAULTS["deal_highlight_color"]
+    assert any(expected_keyword in w and "deal_highlight_color" in w for w in warnings)
+
+
+def test_unknown_key_still_rejected_with_registry(data_files):
+    """改成登记制之后，未登记的键照旧被拒——别把校验放宽成「什么都放行」。"""
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", "mystery_key = 1\n")
+    cfg, warnings = config.load_config()
+    assert "mystery_key" not in cfg
+    assert any("未知项" in w for w in warnings)

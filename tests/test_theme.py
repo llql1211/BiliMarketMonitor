@@ -8,7 +8,7 @@ import sys
 import types
 
 import pytest
-from PyQt5.QtGui import QPalette
+from PyQt5.QtGui import QColor, QPalette
 from PyQt5.QtWidgets import QPlainTextEdit, QStyle
 
 import theme
@@ -44,6 +44,60 @@ def test_style_placeholder_colors(qapp, dark, expected):
 
     color = editor.palette().color(QPalette.PlaceholderText).name()
     assert color == expected
+
+
+# ---------------- 成交高亮色 ----------------
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("#e07000", "#e07000"),
+        ("#ABC", "#aabbcc"),        # 三位简写，QColor 会展开
+        ("orange", "#ffa500"),      # 颜色名也认
+        ("  #e07000  ", "#e07000"),  # 两端空白先剥掉
+    ],
+)
+def test_deal_highlight_color_parses(text, expected):
+    """配置里的颜色文本解析成 QColor。"""
+    assert theme.deal_highlight_color(text).name() == expected
+
+
+@pytest.mark.parametrize(
+    "text", [None, "", "   ", "orangejuice", "#12345", 42, {"a": 1}, ["orange"]]
+)
+def test_deal_highlight_color_falls_back(text):
+    """认不出来的一律退回默认色并保持有效。
+
+    config 那边只校验「长得像颜色」，像 "orangejuice" 这种过了形状校验、
+    其实并不存在的颜色名落到这里——不兜住的话表格会静默少掉一处高亮。
+    """
+    color = theme.deal_highlight_color(text)
+    assert color.isValid()
+    assert color.name() == theme.DEAL_HIGHLIGHT_COLOR
+
+
+def test_deal_highlight_default_color_is_readable_on_both_themes():
+    """默认高亮色要在深浅两种主题的表格底色下都够亮/够暗（对比度 >= 3:1）。
+
+    这是选默认值的硬约束：#ff8c00 在白底上只有 2.3:1，偏看不清，所以换成了 #e07000。
+    """
+
+    def _luminance(color):
+        channels = []
+        for value in (color.redF(), color.greenF(), color.blueF()):
+            channels.append(
+                value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+            )
+        return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+    def _contrast(fg, bg):
+        high, low = sorted((_luminance(fg), _luminance(bg)), reverse=True)
+        return (high + 0.05) / (low + 0.05)
+
+    color = theme.deal_highlight_color(theme.DEAL_HIGHLIGHT_COLOR)
+    for background in ("#ffffff", "#26272b"):  # 浅色主题表格 / 暗色主题表格
+        assert _contrast(color, QColor(background)) >= 3.0
 
 
 # ---------------- 系统深浅色 ----------------

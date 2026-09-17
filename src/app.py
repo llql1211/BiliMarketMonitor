@@ -18,7 +18,7 @@ import webbrowser
 
 import requests
 from PyQt5.QtCore import QObject, QPoint, QRect, QSize, Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QCursor, QDrag, QIcon, QPainter, QPen, QPixmap
+from PyQt5.QtGui import QBrush, QCursor, QDrag, QIcon, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -385,6 +385,11 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.config, self.config_warnings = config.load_config()
+        # 近期成交高亮：阈值换算成秒、颜色解析成画刷，启动时各算一次就够
+        self.deal_highlight_seconds = self.config["deal_highlight_within_hours"] * 3600
+        self.deal_highlight_brush = QBrush(
+            theme.deal_highlight_color(self.config["deal_highlight_color"])
+        )
         self.store = store.Store(store.default_db_path())
         # 构造阶段的提示（例如缓存库损坏已备份重建）要先留下来：
         # 后面任何一次正式操作都会清空 store.notes
@@ -623,10 +628,7 @@ class MainWindow(QMainWindow):
 
         self.table.setItem(row, COL_PRICE, self.MakeCell(text(values.get("price"))))
         self.table.setItem(row, COL_AVG, self.MakeCell(text(values.get("avg_price"))))
-        deals = values.get("deals") or []
-        for i in range(3):
-            deal_text = _deal_text(deals[i]) if i < len(deals) else NO_DATA_TEXT
-            self.table.setItem(row, COL_DEAL_BASE + i, self.MakeCell(deal_text))
+        self.SetDealCells(row, values.get("deals"))
 
         self.table.setItem(row, COL_IMG, self.MakeCell("", align=Qt.AlignCenter))
         self.SetThumbnail(row, record.get("image_url"))
@@ -636,6 +638,39 @@ class MainWindow(QMainWindow):
         link_item = self.MakeCell("打开", tooltip=url, align=Qt.AlignCenter)
         link_item.setData(Qt.UserRole, url)
         self.table.setItem(row, COL_LINK, link_item)
+
+    def SetDealCells(self, row, deals):
+        """填「成交①/②/③」三格，够新鲜的那几条加粗 + 高亮色。
+
+        首屏渲染（FillRow）和抓取回填（OnResultReady）都走这里，
+        免得同一段渲染逻辑写两遍，哪天真改出不一致来。
+        """
+        deals = deals or []
+        for i in range(3):
+            if i < len(deals):
+                deal = deals[i]
+                item = self.MakeCell(_deal_text(deal))
+                if self.IsFreshDeal(deal):
+                    font = item.font()
+                    font.setBold(True)  # 只改粗细，字号字族照旧
+                    item.setFont(font)
+                    item.setForeground(self.deal_highlight_brush)
+            else:
+                item = self.MakeCell(NO_DATA_TEXT)  # 成交不足 3 条，多的格子留占位符
+            self.table.setItem(row, COL_DEAL_BASE + i, item)
+
+    def IsFreshDeal(self, deal) -> bool:
+        """这条成交是否「够新鲜」——够新鲜才加粗上色。
+
+        阈值为 0 表示关闭高亮；时间认不出来（age_seconds 为 None）的一律不算，
+        宁可少高亮一处，也不要拿猜出来的新旧去误导人。
+        """
+        if self.deal_highlight_seconds <= 0 or not isinstance(deal, dict):
+            return False
+        age = deal.get("age_seconds")
+        if isinstance(age, bool) or not isinstance(age, int):
+            return False
+        return age <= self.deal_highlight_seconds
 
     def IsPolling(self) -> bool:
         return self.poller is not None and self.poller.isRunning()
@@ -837,10 +872,7 @@ class MainWindow(QMainWindow):
 
         self.table.setItem(row, COL_PRICE, self.MakeCell(text(result["price"])))
         self.table.setItem(row, COL_AVG, self.MakeCell(text(result["avg_price"])))
-        deals = result["deals"]
-        for i in range(3):
-            deal_text = _deal_text(deals[i]) if i < len(deals) else NO_DATA_TEXT
-            self.table.setItem(row, COL_DEAL_BASE + i, self.MakeCell(deal_text))
+        self.SetDealCells(row, result["deals"])
 
         # 名称：接口返回的才是最新的；失败时如果原本没有名字，标出来而不是留个"…"
         name_item = self.table.item(row, COL_NAME)

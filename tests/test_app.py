@@ -34,16 +34,24 @@ import theme
 # ---------------- 工具 ----------------
 
 
-def _raw_response(name="测试商品", price="¥44", avg=205, deals=3, img="//i0.hdslb.com/bfs/x.jpg"):
-    """构造一份 cluster_info 原始响应（走真实 parser，避免手搓结果 dict）。"""
+def _raw_response(
+    name="测试商品", price="¥44", avg=205, deals=3, img="//i0.hdslb.com/bfs/x.jpg",
+    deal_times=None,
+):
+    """构造一份 cluster_info 原始响应（走真实 parser，避免手搓结果 dict）。
+
+    deal_times 给成交时间（用于高亮相关用例）；不给就按 deals 条数全填「8天前」——
+    8 天在默认 24 小时阈值之外，不会被误判成「近期成交」。
+    """
     data = {
         "clusterBasicInfoFloorVO": {"clusterName": name},
         "clusterPriceFloorVO": {"priceTag": {"firstPrice": price}},
     }
     if avg is not None:
+        times = ["8天前"] * deals if deal_times is None else list(deal_times)
         data["clusterRecentBuyFloorVO"] = {
             "avgPrice": avg,
-            "recentDeals": [{"dealPrice": "¥205", "dealTime": "8天前"} for _ in range(deals)],
+            "recentDeals": [{"dealPrice": "¥205", "dealTime": t} for t in times],
         }
     if img:
         data["clusterHeaderFloorVO"] = {"clusterImgList": [img]}
@@ -1358,3 +1366,132 @@ def test_close_event_closes_store(window):
     w.close()
 
     assert w.store.conn is None
+
+
+# ---------------- 近期成交高亮 ----------------
+#
+# 阈值（默认 24 小时）内的成交在「成交①/②/③」里加粗 + 上配置色。
+# 判定按每条成交自己的时间走，不依赖接口的排序。
+
+
+def _deal_item(w, index=0):
+    return w.table.item(0, app_module.COL_DEAL_BASE + index)
+
+
+def _highlight_window(window, config_toml=None):
+    """建一个单行窗口并载入清单（高亮用例都从这一步开始）。
+
+    名字避开上面拖拽用例的 _loaded()——那个的第二个参数是清单条目，签名不一样。
+    """
+    w = window("10000008780\n", config_toml=config_toml)
+    w.LoadWatchlist(w.watchlist_path)
+    return w
+
+
+def test_fresh_deal_is_highlighted(window):
+    """24 小时内的成交加粗 + 用默认高亮色。"""
+    w = _highlight_window(window)
+    w.OnResultReady(0, result_ok(deal_times=["2小时前"]))
+
+    item = _deal_item(w)
+    assert item.text() == "¥205 · 2小时前"
+    assert item.font().bold()
+    assert item.foreground().color().name() == "#e07000"
+
+
+def test_stale_deal_is_left_alone(window):
+    """超过阈值的成交保持原样：不加粗，也不设前景色（留着走主题默认色）。"""
+    w = _highlight_window(window)
+    w.OnResultReady(0, result_ok(deal_times=["8天前"]))
+
+    item = _deal_item(w)
+    assert item.text() == "¥205 · 8天前"
+    assert not item.font().bold()
+    assert item.foreground().style() == Qt.NoBrush
+
+
+def test_only_fresh_deals_are_highlighted(window):
+    """三条成交各按自己的时间判定，只亮该亮的那几条。"""
+    w = _highlight_window(window)
+    w.OnResultReady(0, result_ok(deal_times=["2小时前", "8天前", "9小时前"]))
+
+    assert _deal_item(w, 0).font().bold()
+    assert not _deal_item(w, 1).font().bold()
+    assert _deal_item(w, 2).font().bold()
+
+
+@pytest.mark.parametrize(
+    "time_text, expected",
+    [
+        ("刚刚", True),
+        ("23小时前", True),
+        ("24小时前", True),   # 阈值是「不超过」，边界算在内
+        ("25小时前", False),
+        ("2天前", False),
+    ],
+)
+def test_highlight_threshold_boundary(window, time_text, expected):
+    """阈值是「多少小时以内」，边界值算在内。"""
+    w = _highlight_window(window)
+    w.OnResultReady(0, result_ok(deal_times=[time_text]))
+    assert _deal_item(w).font().bold() is expected
+
+
+def test_threshold_comes_from_config(window):
+    """阈值改成 1 小时后，2 小时前的成交就不再高亮。"""
+    w = _highlight_window(window, config_toml="deal_highlight_within_hours = 1\n")
+    w.OnResultReady(0, result_ok(deal_times=["2小时前"]))
+
+    assert w.deal_highlight_seconds == 3600
+    assert not _deal_item(w).font().bold()
+
+
+def test_zero_threshold_disables_highlight(window):
+    """阈值为 0 表示关闭高亮，再新鲜的成交也不上色。"""
+    w = _highlight_window(window, config_toml="deal_highlight_within_hours = 0\n")
+    w.OnResultReady(0, result_ok(deal_times=["刚刚"]))
+
+    assert not _deal_item(w).font().bold()
+    assert _deal_item(w).foreground().style() == Qt.NoBrush
+
+
+def test_highlight_color_comes_from_config(window):
+    """高亮色换成配置里的那个。"""
+    w = _highlight_window(window, config_toml='deal_highlight_color = "#00ff00"\n')
+    w.OnResultReady(0, result_ok(deal_times=["2小时前"]))
+
+    assert _deal_item(w).foreground().color().name() == "#00ff00"
+
+
+def test_unparsable_color_falls_back_instead_of_silently_losing_highlight(window):
+    """配置写了个不存在的颜色名：退回默认色，而不是「功能看起来没生效」。"""
+    w = _highlight_window(window, config_toml='deal_highlight_color = "orangejuice"\n')
+    w.OnResultReady(0, result_ok(deal_times=["2小时前"]))
+
+    assert _deal_item(w).foreground().color().name() == theme.DEAL_HIGHLIGHT_COLOR
+
+
+def test_unknown_deal_time_is_not_highlighted(window):
+    """时间认不出来时不上色——宁可少高亮一处，也不拿猜出来的新旧误导人。"""
+    w = _highlight_window(window)
+    w.OnResultReady(0, result_ok(deal_times=["很久以前"]))
+
+    item = _deal_item(w)
+    assert item.text() == "¥205 · 很久以前"  # 原文照旧显示，只是不上色
+    assert not item.font().bold()
+
+
+def test_highlight_survives_table_rebuild(window):
+    """重画表格（拖拽排序、刷新清单、增删）后高亮还在。
+
+    高亮走 FillRow -> SetDealCells，和抓取回填是同一条渲染路径，
+    不能只在上一次回填时亮一下。
+    """
+    w = _highlight_window(window)
+    w.OnResultReady(0, result_ok(deal_times=["2小时前"]))
+    assert _deal_item(w).font().bold()
+
+    w.RenderTable()
+
+    assert _deal_item(w).font().bold()
+    assert _deal_item(w).foreground().color().name() == "#e07000"

@@ -10,8 +10,48 @@
 """
 
 import math
+import re
 
 RECENT_DEALS_COUNT = 3  # 近 N 次成交，可调（网页一次返回多条，截取即可）
+
+# 「9小时前」里的单位换算成秒；接口给的是相对时间，只够粗判新旧
+_RELATIVE_UNITS = {
+    "秒": 1,
+    "分钟": 60, "分": 60,
+    "小时": 3600, "时": 3600,
+    "天": 86400, "日": 86400,
+    "周": 604800, "星期": 604800, "礼拜": 604800,
+    "个月": 2592000, "月": 2592000,
+    "年": 31536000,
+}
+
+# 已经「刚刚发生」的说法：等价于 0 秒前
+_JUST_NOW_WORDS = ("刚刚", "刚才", "现在", "此刻")
+
+_RELATIVE_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*(.*?)前$")
+
+
+def parse_relative_time(text) -> int | None:
+    """把「9小时前」这类相对时间解析成秒数；认不出来返回 None。
+
+    dealTime 是接口给的人话，不是时间戳（见 dev_notes/initial_plan.md），
+    只够粗判新旧：界面拿它决定要不要高亮。绝对日期、错别字、空值等一律
+    返回 None——调用方据此「不上色」，照旧把原文显示出来，不影响展示。
+    """
+    if not isinstance(text, str):
+        return None
+    text = text.strip()
+    if not text:
+        return None
+    if text in _JUST_NOW_WORDS:
+        return 0
+    match = _RELATIVE_RE.match(text)
+    if match is None:
+        return None
+    unit = _RELATIVE_UNITS.get(match.group(2).strip())  # "9个钟头前"这种就认不出来了
+    if unit is None:
+        return None
+    return int(float(match.group(1)) * unit)
 
 
 def parse_error(err: Exception) -> dict:
@@ -72,10 +112,12 @@ def parse_cluster(resp: dict) -> dict:
             price = _fmt_price(deal.get("dealPrice"))
             if price is None:
                 continue  # 没有价格的成交记录没有展示价值，丢掉而不是渲染成 None
+            time_text = _clean_text(deal.get("dealTime")) or ""
             result["deals"].append(
                 {
                     "price": price,
-                    "time": _clean_text(deal.get("dealTime")) or "",
+                    "time": time_text,
+                    "age_seconds": parse_relative_time(time_text),
                 }
             )
             if len(result["deals"]) >= RECENT_DEALS_COUNT:
@@ -149,7 +191,7 @@ def _fmt_price(value):
 
 
 def _normalize_result(result: dict) -> dict:
-    """出口兜底：固定 7 个键与类型，界面层可以放心直接用，不必再判空。"""
+    """出口兜底：固定各级的键与类型，界面层可以放心直接用，不必再判空。"""
     ok = bool(result.get("ok"))
     error = _clean_text(result.get("error"))
     if not ok and not error:
@@ -157,7 +199,16 @@ def _normalize_result(result: dict) -> dict:
     deals = []
     for deal in result.get("deals") or []:
         if isinstance(deal, dict) and deal.get("price"):
-            deals.append({"price": str(deal["price"]), "time": deal.get("time") or ""})
+            time_text = _clean_text(deal.get("time")) or ""
+            deals.append(
+                {
+                    "price": str(deal["price"]),
+                    "time": time_text,
+                    # 从展示用的时间文本现算，保证「显示的是 9小时前」和
+                    # 「要不要高亮」永远对得上，不受调用方递进来的值影响
+                    "age_seconds": parse_relative_time(time_text),
+                }
+            )
         if len(deals) >= RECENT_DEALS_COUNT:
             break
     return {

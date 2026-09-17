@@ -54,9 +54,9 @@ def test_parse_cluster_full_response():
     assert result["price"] == "¥44.5"
     assert result["avg_price"] == "¥50"
     assert result["deals"] == [
-        {"price": "¥48", "time": "3天前"},
-        {"price": "¥50", "time": "5天前"},
-        {"price": "¥52", "time": "1周前"},
+        {"price": "¥48", "time": "3天前", "age_seconds": 3 * 86400},
+        {"price": "¥50", "time": "5天前", "age_seconds": 5 * 86400},
+        {"price": "¥52", "time": "1周前", "age_seconds": 7 * 86400},
     ]
     assert result["image_url"] == "https://i0.hdslb.com/x.jpg"
 
@@ -82,7 +82,7 @@ def test_parse_cluster_filters_non_dict_deals():
     ]
     result = parser.parse_cluster(resp)
     # 源码先按条数截取再过滤非 dict，所以这里只剩第一条
-    assert result["deals"] == [{"price": "¥1", "time": "1天前"}]
+    assert result["deals"] == [{"price": "¥1", "time": "1天前", "age_seconds": 86400}]
 
 
 # ---------------- 价格格式化（经 firstPrice 路径） ----------------
@@ -234,9 +234,14 @@ def test_result_structure_is_always_the_same(resp):
         assert result[key] is None or isinstance(result[key], str)
     assert isinstance(result["deals"], list)
     for deal in result["deals"]:
-        assert set(deal) == {"price", "time"}
+        assert set(deal) == {"price", "time", "age_seconds"}
         assert isinstance(deal["price"], str) and deal["price"]
         assert isinstance(deal["time"], str)
+        # 时间认不出来时给 None（界面据此不上色），认出来的必须是整数秒
+        assert deal["age_seconds"] is None or (
+            isinstance(deal["age_seconds"], int)
+            and not isinstance(deal["age_seconds"], bool)
+        )
 
 
 @pytest.mark.parametrize("error", [ValueError("boom"), ValueError(""), Exception()])
@@ -260,7 +265,7 @@ def test_deals_without_price_are_dropped():
         {"dealPrice": "", "dealTime": "10天前"},
     ]
     result = parser.parse_cluster(resp)
-    assert result["deals"] == [{"price": "¥48", "time": "3天前"}]
+    assert result["deals"] == [{"price": "¥48", "time": "3天前", "age_seconds": 259200}]
 
 
 @pytest.mark.parametrize(
@@ -281,7 +286,10 @@ def test_deal_time_is_normalized_to_string(deal_time, expected):
     resp["data"]["clusterRecentBuyFloorVO"]["recentDeals"] = [
         {"dealPrice": 48, "dealTime": deal_time}
     ]
-    assert parser.parse_cluster(resp)["deals"] == [{"price": "¥48", "time": expected}]
+    # 只取 price/time 两项比对：本用例管的是时间文本本身，
+    # 成交记录还有别的键（age_seconds，另有专门的用例），不该绊在这里
+    deals = parser.parse_cluster(resp)["deals"]
+    assert [(d["price"], d["time"]) for d in deals] == [("¥48", expected)]
 
 
 def test_deals_filtered_before_truncating():
@@ -313,3 +321,68 @@ def test_only_avg_price_still_counts_as_valid():
     result = parser.parse_cluster(resp)
     assert result["ok"] is True
     assert result["avg_price"] == "¥50"
+
+
+# ---------------- 相对时间 -> 秒数（成交新鲜度） ----------------
+#
+# 接口给的 dealTime 是「9小时前」这样的人话，界面拿它判断要不要高亮，
+# 所以得先换算成秒。认不出来的格式必须是 None（= 不高亮），不能瞎猜。
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("刚刚", 0),
+        ("刚才", 0),
+        ("5秒前", 5),
+        ("30分钟前", 1800),
+        ("9小时前", 9 * 3600),
+        ("1天前", 86400),
+        ("33天前", 33 * 86400),
+        ("1周前", 7 * 86400),
+        ("2星期前", 14 * 86400),
+        ("2个月前", 60 * 86400),
+        ("3月前", 90 * 86400),   # 「月」和「个月」都要认
+        ("1年前", 365 * 86400),
+        (" 9小时前 ", 9 * 3600),  # 两端空白先剥掉
+        ("1.5小时前", 5400),      # 半个钟头也得算得出来
+    ],
+)
+def test_parse_relative_time(text, expected):
+    """常见相对时间都能换算成秒数。"""
+    assert parser.parse_relative_time(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        None,
+        "",
+        "   ",
+        42,              # 不是字符串
+        {"a": 1},
+        "很久以前",       # 没有数字
+        "9个钟头前",      # 数字认得出，单位认不出
+        "前",            # 只有后缀
+        "3天",           # 缺「前」字
+        "2026-08-01",    # 绝对日期：宁可不高亮，也不要猜
+        "3天前（约）",    # 不是干净的相对时间
+    ],
+)
+def test_parse_relative_time_unknown_format(text):
+    """认不出来的格式一律 None——界面据此不上色，照旧显示原文。"""
+    assert parser.parse_relative_time(text) is None
+
+
+def test_deal_age_follows_the_displayed_time():
+    """age_seconds 必须和格子里显示的时间文本对得上，否则颜色会骗人。"""
+    resp = _base_response()
+    resp["data"]["clusterRecentBuyFloorVO"]["recentDeals"] = [
+        {"dealPrice": 48, "dealTime": "9小时前"},
+        {"dealPrice": 50, "dealTime": "最近"},  # 认不出来的时间
+    ]
+    deals = parser.parse_cluster(resp)["deals"]
+    assert [(d["time"], d["age_seconds"]) for d in deals] == [
+        ("9小时前", 9 * 3600),
+        ("最近", None),
+    ]

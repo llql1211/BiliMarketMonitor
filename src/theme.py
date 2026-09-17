@@ -11,6 +11,10 @@ LIGHT_QSS = ""  # 浅色用 Qt 默认样式，不做额外装饰
 
 TOOLTIP_DELAY_MS = 2000  # 悬停多久才弹提示（Qt 默认约 0.7 秒）
 
+# 近期成交高亮色的兜底。与 config.DEFAULTS["deal_highlight_color"] 同值：
+# 那边是「默认配置」，这边是「配置给的色认不出来时的最后一道」，各守一层。
+DEAL_HIGHLIGHT_COLOR = "#e07000"
+
 DARK_QSS = """
 QWidget {
     background-color: #1e1f22;
@@ -135,6 +139,21 @@ def system_uses_dark() -> bool:
 
 def qss_for(dark: bool) -> str:
     return DARK_QSS if dark else LIGHT_QSS
+
+
+def deal_highlight_color(text) -> QColor:
+    """把配置里的「近期成交」高亮色解析成 QColor；认不出来退回默认色。
+
+    config 那边只校验了「长得像个颜色」（#rrggbb 或纯字母），像
+    "orangejuice" 这种过了形状校验、其实并不存在的颜色名归这里兜住——
+    否则表格里会静默少掉一处高亮，用户还以为是功能没生效。
+    """
+    if isinstance(text, str):
+        color = QColor(text.strip())
+        if color.isValid():
+            return color
+    print(f"[theme] 无法识别的成交高亮色 {text!r}，已退回 {DEAL_HIGHLIGHT_COLOR}")
+    return QColor(DEAL_HIGHLIGHT_COLOR)
 
 
 def style_placeholder(widget, dark: bool):
