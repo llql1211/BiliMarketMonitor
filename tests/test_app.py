@@ -488,11 +488,11 @@ def test_no_cache_still_renders_placeholders(window):
     [
         ("¥50", "¥44", "¥44 ↓ 6"),
         ("¥44", "¥50", "¥50 ↑ 6"),
-        ("¥44", "¥44", "¥44 -"),
+        ("¥44", "¥44", "¥44"),  # 没变就不尾随「-」，格子里就一个价格
     ],
 )
 def test_price_delta_is_appended_to_the_current_price(window, cached, fetched, expected):
-    """涨跌拼在现价后面，符号只用 ↑↓-。"""
+    """涨跌拼在现价后面，符号只有 ↑↓。"""
     w = window("10000008780\n")
     _seed_cache(w, price=cached)
     w.LoadWatchlist(w.watchlist_path)
@@ -1948,7 +1948,7 @@ def test_deal_text(deal, expected):
     [
         ("¥50", False, "¥44", False, ("↓ 6", -6)),
         ("¥44", False, "¥50", False, ("↑ 6", 6)),
-        ("¥44", False, "¥44.00", False, ("-", 0)),      # 没变也要说「没变」
+        ("¥44", False, "¥44.00", False, None),          # 没变就不提，别挂个「-」
         ("¥44.20", False, "¥50.70", False, ("↑ 6.5", 6.5)),
         ("¥1,299.50", False, "¥1,299.75", False, ("↑ 0.25", 0.25)),
         ("¥138", True, "¥44", False, None),             # 上次售罄
@@ -1959,7 +1959,7 @@ def test_deal_text(deal, expected):
     ],
 )
 def test_price_delta(previous, previous_sold_out, current, current_sold_out, expected):
-    """涨跌：红涨绿跌的方向与数字，售罄和认不出数字时宁可不说。"""
+    """涨跌：红涨绿跌的方向与数字，售罄、认不出数字、价格没变时都不说。"""
     assert (
         app_module.price_delta(previous, previous_sold_out, current, current_sold_out)
         == expected

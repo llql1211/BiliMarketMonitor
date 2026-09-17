@@ -122,12 +122,11 @@ def _amount(value) -> str:
 def price_delta(previous_price, previous_sold_out, current_price, current_sold_out):
     """两次抓取之间现价的变化，返回 (显示文本, 变化量)；没法比就给 None。
 
-    两种情况不给涨跌：
+    三种情况不给涨跌：
     - 有一边是售罄：售罄行的价格装的是原价，跟市集现价比出来的"涨跌"没有意义，
       售罄前后更是两个不同的东西；
-    - 价格认不出数字：宁可这一格不显示涨跌，也不要拿猜出来的数去误导人。
-
-    持平照样返回（显示「-」）：让用户看出是"没变"，而不是"没抓到"。
+    - 价格认不出数字：宁可这一格不显示涨跌，也不要拿猜出来的数去误导人；
+    - 两边一样：没变就不占地方，格子里干干净净一个价格，别尾随个「-」。
     """
     if previous_sold_out or current_sold_out:
         return None
@@ -140,7 +139,7 @@ def price_delta(previous_price, previous_sold_out, current_price, current_sold_o
         return f"↑ {_amount(change)}", change
     if change < 0:
         return f"↓ {_amount(change)}", change
-    return "-", 0
+    return None
 
 
 def split_price_text(text, delta):
