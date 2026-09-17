@@ -366,8 +366,8 @@ def test_reference_price_gets_its_own_column(window):
     assert w.table.item(0, app_module.COL_REF).text() == "¥110"
 
 
-def test_sold_out_row_never_passes_the_reference_price_off_as_current(window):
-    """售罄行的现价格必须标出来：那格装的是原价，不是还能买到的价。"""
+def test_sold_out_row_marks_its_price_and_fills_the_reference_column(window):
+    """售罄行的现价格必须标出来（那格装的是原价，不是还能买到的价），原价列照抄一份。"""
     w = window("10000008780\n")
     w.LoadWatchlist(w.watchlist_path)
     w.OnResultReady(0, result_ok(price="138", sold_out=True))
@@ -375,6 +375,26 @@ def test_sold_out_row_never_passes_the_reference_price_off_as_current(window):
     cell = w.table.item(0, app_module.COL_PRICE)
     assert cell.text() == f"{app_module.SOLD_OUT_TEXT} ¥138"
     assert "原价" in cell.toolTip()  # 悬停要能看懂这个数为什么在现价列
+    assert w.table.item(0, app_module.COL_REF).text() == "¥138"
+
+
+def test_sold_out_row_keeps_a_reference_the_interface_actually_sent(window):
+    """售罄行自带 price/priceSymbol 时不拿现价顶掉它——原价照接口给的来。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, result_ok(price="138", reference="199", sold_out=True))
+
+    assert w.table.item(0, app_module.COL_PRICE).text() == f"{app_module.SOLD_OUT_TEXT} ¥138"
+    assert w.table.item(0, app_module.COL_REF).text() == "¥199"
+
+
+def test_sold_out_row_without_any_price_leaves_both_columns_empty(window):
+    """售罄又没抓到价：两列都留占位符，别把「—」当原价抄过去。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, result_ok(price=None, sold_out=True))
+
+    assert w.table.item(0, app_module.COL_PRICE).text() == app_module.NO_DATA_TEXT
     assert w.table.item(0, app_module.COL_REF).text() == app_module.NO_DATA_TEXT
 
 
@@ -450,7 +470,7 @@ def test_cached_price_shows_on_startup_with_its_timestamp(window):
 
 
 def test_cached_sold_out_row_says_so_on_startup(window):
-    """缓存里记着售罄：价格前缀和「那是原价」的解释都要跟着回来。"""
+    """缓存里记着售罄：价格前缀和「那是原价」的解释都要跟着回来，原价列也补上。"""
     w = window("10000008780\n")
     _seed_cache(w, price="¥138", sold_out=True)
 
@@ -460,6 +480,7 @@ def test_cached_sold_out_row_says_so_on_startup(window):
     assert cell.text() == f"{app_module.SOLD_OUT_TEXT} ¥138"
     assert "原价" in cell.toolTip()
     assert "上次更新时间" in cell.toolTip()
+    assert w.table.item(0, app_module.COL_REF).text() == "¥138"
 
 
 @pytest.mark.parametrize("when", [None, "", "   "])

@@ -985,6 +985,12 @@ class MainWindow(QMainWindow):
             reference, avg = record.get("reference_price"), record.get("avg_text")
             note = _cached_note(record.get("price_updated_at"))
 
+        if sold_out and not reference:
+            # 售罄时接口整组不返回 price/priceSymbol，现价格里那个数就是原价
+            # （见 PriceText）。原价列照抄一份：不然同一行「现价」顶着个数字、
+            # 「原价」空着，看着像这格没抓到。
+            reference = price
+
         self.table.setItem(
             row, COL_PRICE, self.PriceCell(price, sold_out, note, item.get("delta"))
         )
