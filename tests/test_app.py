@@ -1528,6 +1528,170 @@ def test_image_fetcher_survives_download_failure(qapp, wait_until):
     assert got == []
 
 
+def test_image_fetcher_reports_download_failure(qapp, wait_until):
+    """下载不了要说一声（大图那头靠它把「正在加载」换成失败文案）。"""
+    fetcher = app_module.ImageFetcher()
+    failed = []
+    fetcher.failed.connect(failed.append)
+
+    fetcher.fetch(7, "https://example.test/broken.png")
+
+    assert wait_until(lambda: failed)
+    assert failed == [7]
+
+
+def test_image_fetcher_reports_a_response_that_is_not_an_image(
+    qapp, wait_until, monkeypatch
+):
+    """200 也可能不是图（CDN 出错时回一页 HTML）：一样算失败。"""
+
+    class _Resp:
+        content = b"<html>not an image</html>"
+
+    monkeypatch.setattr(requests, "get", lambda url, timeout=None: _Resp())
+    fetcher = app_module.ImageFetcher()
+    failed = []
+    fetcher.failed.connect(failed.append)
+
+    fetcher.fetch(0, "https://example.test/nope.png")
+
+    assert wait_until(lambda: failed)
+    assert failed == [0]
+
+
+# ---------------- 双击看大图 ----------------
+
+
+def _row_with_image(w, monkeypatch, image_url="https://img.test/a.jpg", name="甲"):
+    """备一行缓存里有缩略图的商品，返回记录大图请求的列表（线程挡掉，只看请求）。"""
+    w.store.upsert_item("10000008780", name, image_url)
+    w.LoadWatchlist(w.watchlist_path)
+    requested = []
+    monkeypatch.setattr(
+        w.preview_fetcher, "fetch", lambda key, url: requested.append((key, url))
+    )
+    return requested
+
+
+def test_thumbnail_cell_hints_at_the_double_click(window):
+    """双击这个动作没有可见的入口，缩略图格的提示里得说一句。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+    assert w.table.item(0, app_module.COL_IMG).toolTip() == "双击查看大图"
+
+
+def test_double_clicking_a_thumbnail_opens_the_big_image(window, monkeypatch):
+    """双击缩略图：开窗 + 按 480w 后缀去下大图（不是把 96 的缩略图放大）。"""
+    w = window("10000008780 | 甲\n")
+    requested = _row_with_image(w, monkeypatch)
+
+    dialog = w.PreviewRow(0)
+
+    assert requested == [(1, "https://img.test/a.jpg" + app_module.PREVIEW_SUFFIX)]
+    assert dialog.windowTitle() == "甲"
+    assert dialog.isModal() is False  # 看图的当口还想顺手点点表格
+    assert dialog.label.text() == app_module.PREVIEW_LOADING_TEXT
+    assert dialog.isVisible()
+
+
+def test_double_clicking_another_column_opens_nothing(window, monkeypatch):
+    """别的格子双击另有用途（比如拖列宽），别顺手弹出大图。"""
+    w = window("10000008780 | 甲\n")
+    requested = _row_with_image(w, monkeypatch)
+
+    w.OnCellDoubleClick(0, app_module.COL_IMG)
+    assert len(requested) == 1
+
+    w.OnCellDoubleClick(0, app_module.COL_PRICE)
+    w.OnCellDoubleClick(0, app_module.COL_NAME)
+
+    assert len(requested) == 1  # 只有缩略图那一下发起了请求
+
+
+def test_preview_shows_the_downloaded_image(window, monkeypatch):
+    """大图回来后贴进窗口，并记下来供下次复用。"""
+    w = window("10000008780 | 甲\n")
+    _row_with_image(w, monkeypatch)
+    dialog = w.PreviewRow(0)
+    pixmap = QPixmap(app_module.PREVIEW_SIZE, app_module.PREVIEW_SIZE)
+    pixmap.fill(Qt.red)
+
+    w.OnPreviewFetched(1, pixmap)
+
+    assert dialog.label.pixmap() is not None
+    assert not dialog.label.pixmap().isNull()
+    assert dialog.label.text() == ""
+    assert w.previews == {}  # 已经贴上了，不用再等
+    assert w.preview_images["https://img.test/a.jpg"] is pixmap
+
+
+def test_second_look_reuses_the_downloaded_image(window, monkeypatch):
+    """同一件商品再看一次不再下一遍：大图有 30 多 KB，没必要反复拉。"""
+    w = window("10000008780 | 甲\n")
+    requested = _row_with_image(w, monkeypatch)
+    w.PreviewRow(0)
+    pixmap = QPixmap(app_module.PREVIEW_SIZE, app_module.PREVIEW_SIZE)
+    pixmap.fill(Qt.red)
+    w.OnPreviewFetched(1, pixmap)
+
+    dialog = w.PreviewRow(0)
+
+    assert requested == [(1, "https://img.test/a.jpg" + app_module.PREVIEW_SUFFIX)]
+    assert not dialog.label.pixmap().isNull()  # 一开窗就是图，不经过「正在加载」
+    assert dialog.label.text() == ""
+
+
+def test_preview_failure_says_so_instead_of_loading_forever(window, monkeypatch):
+    """大图下不下来时窗口里要有个交代，不能一直挂着「正在加载大图…」。"""
+    w = window("10000008780 | 甲\n")
+    _row_with_image(w, monkeypatch)
+    dialog = w.PreviewRow(0)
+
+    w.OnPreviewFailed(1)
+
+    assert dialog.label.text() == app_module.PREVIEW_FAILED_TEXT
+    assert w.previews == {}
+
+
+def test_closing_a_preview_before_the_image_arrives_drops_it(window, monkeypatch):
+    """等图的时候把窗口关了：图回来就丢掉，不往已销毁的窗口上贴。"""
+    w = window("10000008780 | 甲\n")
+    _row_with_image(w, monkeypatch)
+    dialog = w.PreviewRow(0)
+
+    dialog.close()
+    assert w.previews == {}  # 关窗即摘牌
+
+    pixmap = QPixmap(app_module.PREVIEW_SIZE, app_module.PREVIEW_SIZE)
+    pixmap.fill(Qt.red)
+    w.OnPreviewFetched(1, pixmap)  # 不抛异常即通过
+
+    assert w.preview_images == {}  # 没人看的大图不值得占内存
+
+
+def test_preview_result_for_an_unknown_request_is_ignored(window, monkeypatch):
+    """回包认不出是谁要的（号码对不上）就当没收到。"""
+    w = window("10000008780 | 甲\n")
+    _row_with_image(w, monkeypatch)
+    pixmap = QPixmap(4, 4)
+
+    w.OnPreviewFetched(99, pixmap)
+    w.OnPreviewFailed(99)  # 不抛异常即通过
+
+    assert w.preview_images == {}
+
+
+def test_preview_without_a_thumbnail_tells_the_user(window):
+    """还没抓到缩略图的行双击不出窗口，只在状态栏说一句。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    assert w.PreviewRow(0) is None
+
+    assert app_module.NO_THUMBNAIL_TEXT in w.progress_label.text()
+    assert w.previews == {}
+
+
 # ---------------- 轮询线程 ----------------
 
 

@@ -61,6 +61,13 @@ import theme
 IMAGE_SIZE = 96  # 缩略图边长（配合 CDN 裁剪后缀减小流量）
 IMAGE_SUFFIX = f"@{IMAGE_SIZE}w_{IMAGE_SIZE}h_85q.webp"
 
+# 双击缩略图看的大图：原图是 1280x1280、动辄 1MB 出头，480w 有 30 多 KB 就够看清了
+PREVIEW_SIZE = 480
+PREVIEW_SUFFIX = f"@{PREVIEW_SIZE}w_{PREVIEW_SIZE}h_85q.webp"
+PREVIEW_LOADING_TEXT = "正在加载大图…"
+PREVIEW_FAILED_TEXT = "大图没下下来，稍后再双击试试"
+NO_THUMBNAIL_TEXT = "这一行还没有缩略图，先抓取一次再双击查看"
+
 ROW_NUMBER_PADDING = 16  # 序号槽左右留白，免得数字贴着分隔线
 
 COL_IMG, COL_NAME, COL_CID, COL_PRICE, COL_REF, COL_AVG = 0, 1, 2, 3, 4, 5
@@ -305,22 +312,30 @@ class PollerThread(QThread):
 
 
 class ImageFetcher(QObject):
-    """在普通子线程里拉取缩略图，通过信号回传 QPixmap（避免卡界面）。"""
+    """在普通子线程里拉图，通过信号回传 QPixmap（避免卡界面）。
+
+    信号里带的是调用方自己认的 key：缩略图用行号，双击放大用预览请求号。
+    下载失败时发 failed 而不是静默丢弃——大图下不下来得跟用户说一声，
+    缩略图那边不接这个信号，等于照旧不吭声。
+    """
 
     fetched = pyqtSignal(int, QPixmap)
+    failed = pyqtSignal(int)
 
-    def fetch(self, row, url):
-        threading.Thread(target=self._work, args=(row, url), daemon=True).start()
+    def fetch(self, key, url):
+        threading.Thread(target=self._work, args=(key, url), daemon=True).start()
 
-    def _work(self, row, url):
+    def _work(self, key, url):
+        pixmap = QPixmap()
         try:
             req = requests.get(url, timeout=10)
-            pixmap = QPixmap()
             pixmap.loadFromData(req.content)
         except Exception:
-            return
-        if not pixmap.isNull():
-            self.fetched.emit(row, pixmap)
+            pass  # 拿不到就当空图，统一走下面的失败分支
+        if pixmap.isNull():
+            self.failed.emit(key)
+        else:
+            self.fetched.emit(key, pixmap)
 
 
 class PriceDeltaDelegate(QStyledItemDelegate):
@@ -364,6 +379,44 @@ class PriceDeltaDelegate(QStyledItemDelegate):
         painter.setPen(index.data(DELTA_COLOR_ROLE) or style_option.palette.text().color())
         painter.drawText(rect, Qt.AlignLeft | Qt.AlignVCenter, delta)
         painter.restore()
+
+
+class ImagePreviewDialog(QDialog):
+    """双击缩略图弹出的大图。
+
+    开窗不等图：大图比缩略图大几百倍，下载要一会儿，所以先把窗口摆出来，
+    里面写着「正在加载大图…」，图回来了再换上（见 MainWindow.OnPreviewFetched）。
+    窗口不开模态——看图的当口还想顺手点点表格，是很自然的事。
+    """
+
+    def __init__(self, title="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title or "商品图")
+        # 固定成图那么大：换成图时不至于整窗跳一下，也省得被长文案撑变形
+        self.setFixedSize(PREVIEW_SIZE + 48, PREVIEW_SIZE + 80)
+
+        layout = QVBoxLayout(self)
+        self.label = QLabel(PREVIEW_LOADING_TEXT)
+        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setFixedSize(PREVIEW_SIZE, PREVIEW_SIZE)
+        layout.addWidget(self.label, alignment=Qt.AlignCenter)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.button(QDialogButtonBox.Close).setText("关闭")
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def SetImage(self, pixmap):
+        """贴上大图。缩放兜个底：CDN 裁剪理论上给的就是 480，万一不是也别撑破窗口。"""
+        self.label.setText("")
+        self.label.setPixmap(
+            pixmap.scaled(
+                PREVIEW_SIZE, PREVIEW_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+        )
+
+    def SetFailed(self):
+        self.label.setText(PREVIEW_FAILED_TEXT)
 
 
 class AddDialog(QDialog):
@@ -565,8 +618,16 @@ class MainWindow(QMainWindow):
         self.poller = None
         self.names_learned = False  # 本次抓取是否学到了新名称（决定要不要回写清单）
         self.poller_stopped = False  # 本次抓取是否被「停止抓取」中止
-        self.image_fetcher = ImageFetcher()
+        self.image_fetcher = ImageFetcher()  # 缩略图：key 是行号
         self.image_fetcher.fetched.connect(self.OnImageFetched)
+        # 双击放大：另起一个 fetcher，因为它的 key 是预览请求号而不是行号。
+        # 共用一个的话，两种号会混在一个槽里分不清谁是谁
+        self.preview_fetcher = ImageFetcher()
+        self.preview_fetcher.fetched.connect(self.OnPreviewFetched)
+        self.preview_fetcher.failed.connect(self.OnPreviewFailed)
+        self.preview_seq = 0     # 大图请求号的发号器，一次一张，回包靠它认领
+        self.previews = {}       # 未回来的大图请求号 -> (预览窗口, 图片地址)
+        self.preview_images = {}  # 图片地址 -> 大图，看过的不再下一遍
         self.InitUI()
         self.ApplyTheme(self.InitialDark())
 
@@ -657,6 +718,7 @@ class MainWindow(QMainWindow):
             f"点击「打开」用浏览器访问商品详情页\n链接由配置里的模板拼出：\n{template}"
         )
         self.table.cellClicked.connect(self.OnCellClick)
+        self.table.cellDoubleClicked.connect(self.OnCellDoubleClick)
         self.table.rows_dropped.connect(self.OnRowsDropped)
         layout.addWidget(self.table)
 
@@ -782,6 +844,57 @@ class MainWindow(QMainWindow):
         item = self.table.item(row, COL_IMG)
         if item is not None:
             item.setIcon(QIcon(pixmap))
+
+    def OnCellDoubleClick(self, row, col):
+        """双击缩略图看大图。双击别的格子不管：那儿的双击另有用途（改列宽等）。"""
+        if col != COL_IMG:
+            return
+        self.PreviewRow(row)
+
+    def PreviewRow(self, row):
+        """打开某行的商品大图。这一行还没有缩略图时只在状态栏说一声。"""
+        url = self.row_images.get(row)
+        if not url:
+            self.progress_label.setText(NO_THUMBNAIL_TEXT + self.last_note)
+            return None
+        name = self.rows[row]["entry"].name if row < len(self.rows) else ""
+        return self.OpenPreview(url, name or f"第 {row + 1} 行")
+
+    def OpenPreview(self, image_url, title=""):
+        """开一个预览窗口显示大图：看过的一张直接贴，没看过的后台去下。
+
+        大图不并进 icons 那个缓存：那里存的是缩略图，混进 480 的大图之后，
+        同一个地址下次渲染缩略图时就会拿到大图（96 的格子塞 480 的图）。
+        """
+        dialog = ImagePreviewDialog(title, self)
+        dialog.show()
+
+        pixmap = self.preview_images.get(image_url)
+        if pixmap is not None:
+            dialog.SetImage(pixmap)
+            return dialog
+
+        self.preview_seq += 1
+        request = self.preview_seq
+        self.previews[request] = (dialog, image_url)
+        # 关窗就把请求号摘掉：回包时人已经走了，别往一个已销毁的窗口上贴图
+        dialog.finished.connect(lambda _code, req=request: self.previews.pop(req, None))
+        self.preview_fetcher.fetch(request, image_url + PREVIEW_SUFFIX)
+        return dialog
+
+    def OnPreviewFetched(self, request, pixmap):
+        """大图到手：还在等的窗口才贴，已经关掉的就当没下过。"""
+        pending = self.previews.pop(request, None)
+        if pending is None:
+            return
+        dialog, image_url = pending
+        self.preview_images[image_url] = pixmap
+        dialog.SetImage(pixmap)
+
+    def OnPreviewFailed(self, request):
+        pending = self.previews.pop(request, None)
+        if pending is not None:
+            pending[0].SetFailed()  # 窗口还开着才提示，关掉了就当没这回事
 
     def MakeCell(self, text, tooltip=None, align=None, color=None):
         """建单元格。tooltip 默认为该格的完整文本——列宽不够被截断时也能看全。
@@ -926,7 +1039,9 @@ class MainWindow(QMainWindow):
         self.SetPriceCells(row, item)
         self.SetDealCells(row, values.get("deals"))
 
-        self.table.setItem(row, COL_IMG, self.MakeCell("", align=Qt.AlignCenter))
+        self.table.setItem(
+            row, COL_IMG, self.MakeCell("", tooltip="双击查看大图", align=Qt.AlignCenter)
+        )
         self.SetThumbnail(row, record.get("image_url"))
 
         url = links.build_detail_url(cluster_id, self.config["detail_url_template"])
