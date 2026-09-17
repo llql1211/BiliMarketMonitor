@@ -1,4 +1,4 @@
-"""SQLite 缓存：保存商品的 clusterID、名称、缩略图，供下次启动复用。
+"""SQLite 缓存：保存商品的 clusterID、名称、缩略图、上次抓到的价格。
 
 watchlist.txt 是唯一的跟踪标准——每次同步都以它为准：
 清单里有、缓存里没有的补上；缓存里有、清单里没有的删掉。
@@ -13,6 +13,21 @@ import sqlite3
 from datetime import datetime
 
 DB_FILENAME = "cache.db"
+
+# items 表的列。建表和"给老库补列"都从这里生成，免得两处写岔、
+# 出现"新建的库有这列、老库没有"这种只在别人机器上炸的毛病。
+# 加字段就往这里加，不用管老库——_ensure_item_columns 会补上。
+ITEM_COLUMNS = (
+    ("cluster_id", "TEXT PRIMARY KEY"),
+    ("name", "TEXT"),
+    ("image_url", "TEXT"),
+    ("updated_at", "TEXT"),         # 名称 / 缩略图的抓取时间
+    ("price_text", "TEXT"),         # 上次抓到的现价原文（如「¥44」）
+    ("reference_price", "TEXT"),    # 上次抓到的原价（划线价）
+    ("avg_text", "TEXT"),           # 上次抓到的近 30 天均价
+    ("sold_out", "INTEGER"),        # 上次抓到的是不是售罄（0/1）
+    ("price_updated_at", "TEXT"),   # 上面三个价格字段是什么时候抓的
+)
 
 
 class Store:
@@ -68,12 +83,9 @@ class Store:
     def _init_db(self, conn):
         with conn:
             conn.execute(
-                """CREATE TABLE IF NOT EXISTS items (
-                       cluster_id TEXT PRIMARY KEY,
-                       name       TEXT,
-                       image_url  TEXT,
-                       updated_at TEXT
-                   )"""
+                "CREATE TABLE IF NOT EXISTS items ("
+                + ", ".join(f"{name} {decl}" for name, decl in ITEM_COLUMNS)
+                + ")"
             )
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS settings (
@@ -81,6 +93,19 @@ class Store:
                        value TEXT
                    )"""
             )
+            self._ensure_item_columns(conn)
+
+    def _ensure_item_columns(self, conn):
+        """给老库补上后来新增的列。
+
+        CREATE TABLE IF NOT EXISTS 不会改已有的表：老缓存库缺列时，后面每次
+        写入都会整条失败（no such column），而这是"能起来就行"的缓存库最不该
+        出的岔子。补出来的列是空的，效果跟删掉缓存重建一样，省得用户去删库。
+        """
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(items)")}
+        for name, decl in ITEM_COLUMNS:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE items ADD COLUMN {name} {decl}")
 
     def _begin(self):
         """每个公开操作的第一句：清掉上次的提示，并确认连接还在。"""
@@ -182,8 +207,25 @@ class Store:
 
         return added, removed
 
-    def upsert_item(self, cluster_id: str, name, image_url):
+    def upsert_item(
+        self,
+        cluster_id: str,
+        name,
+        image_url,
+        price_text=None,
+        reference_price=None,
+        avg_text=None,
+        sold_out=False,
+    ):
         """保存抓取结果；新值为空时保留旧值。
+
+        空串按"没抓到"处理：SQLite 里空串不是 NULL，COALESCE 挡不住它，
+        会把已经缓存好的名字/缩略图冲掉。
+
+        价格那几列是一份快照，一起写、一起留：price_text 为 None 表示这次没抓到
+        价格，整组（含时间戳和售罄标记）原样保留，免得出现"价格是上次的、时间却
+        写着刚刚"这种对不上的缓存。反之 price_text 有值时整组都按这次的结果写，
+        没抓到的字段就存空——上次的参考价跟这次的新现价摆在一起只会算错折扣。
 
         空串按"没抓到"处理：SQLite 里空串不是 NULL，COALESCE 挡不住它，
         会把已经缓存好的名字/缩略图冲掉。
@@ -193,19 +235,40 @@ class Store:
         if cluster_id is None:
             self._note("抓取结果里的 clusterId 不合法，已跳过缓存写入")
             return
+        now = _now()
         with self.conn:
             self.conn.execute(
-                """INSERT INTO items (cluster_id, name, image_url, updated_at)
-                   VALUES (?, ?, ?, ?)
+                """INSERT INTO items (cluster_id, name, image_url, updated_at,
+                                      price_text, reference_price, avg_text,
+                                      sold_out, price_updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(cluster_id) DO UPDATE SET
                        name       = COALESCE(excluded.name, name),
                        image_url  = COALESCE(excluded.image_url, image_url),
-                       updated_at = excluded.updated_at""",
+                       updated_at = excluded.updated_at,
+                       price_text = COALESCE(excluded.price_text, price_text),
+                       reference_price  = CASE WHEN excluded.price_text IS NULL
+                                               THEN reference_price
+                                               ELSE excluded.reference_price END,
+                       avg_text         = CASE WHEN excluded.price_text IS NULL
+                                               THEN avg_text
+                                               ELSE excluded.avg_text END,
+                       sold_out         = CASE WHEN excluded.price_text IS NULL
+                                               THEN sold_out
+                                               ELSE excluded.sold_out END,
+                       price_updated_at = CASE WHEN excluded.price_text IS NULL
+                                               THEN price_updated_at
+                                               ELSE excluded.price_updated_at END""",
                 (
                     cluster_id,
                     _clean_name(name),
                     _clean_cached_text(image_url),
-                    _now(),
+                    now,
+                    _clean_cached_text(price_text),
+                    _clean_cached_text(reference_price),
+                    _clean_cached_text(avg_text),
+                    int(bool(sold_out)),
+                    now,
                 ),
             )
 

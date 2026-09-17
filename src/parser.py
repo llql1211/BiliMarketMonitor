@@ -32,6 +32,9 @@ _JUST_NOW_WORDS = ("刚刚", "刚才", "现在", "此刻")
 
 _RELATIVE_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*(.*?)前$")
 
+# 价格文本里认数字：只取第一个数，千分位逗号在匹配前先抹掉
+_PRICE_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
 
 def parse_relative_time(text) -> int | None:
     """把「9小时前」这类相对时间解析成秒数；认不出来返回 None。
@@ -54,6 +57,26 @@ def parse_relative_time(text) -> int | None:
     if unit is None:
         return None
     return int(float(match.group(1)) * unit)
+
+
+def price_number(text) -> float | None:
+    """把「¥1,299.50」这类价格还原成数字，用来比较两次抓取的涨跌。
+
+    只认数字本身：货币符号、千分位逗号、空白都先脱掉，取第一个数。
+    认不出来（"面议"、空值、dict 等）返回 None——调用方据此不显示涨跌，
+    宁可少显示一处，也不要拿三个问号去猜这个价格是多少。
+    """
+    if text is None or isinstance(text, bool):  # bool 是 int 的子类，先挡掉
+        return None
+    if isinstance(text, (int, float)):
+        return float(text) if math.isfinite(text) else None
+    if not isinstance(text, str):
+        return None
+    match = _PRICE_NUMBER_RE.search(text.replace(",", "").replace("，", ""))
+    if match is None:
+        return None
+    value = float(match.group())
+    return value if math.isfinite(value) else None
 
 
 def parse_error(err: Exception) -> dict:

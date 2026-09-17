@@ -28,6 +28,13 @@ DEAL_HIGHLIGHT_COLOR = "#e07000"
 MUTED_COLOR_LIGHT = "#6e7781"
 MUTED_COLOR_DARK = "#85878e"
 
+# 涨跌色：红涨绿跌。深浅各一套——暗色底下纯红（#c62828）几乎沉进背景里，
+# 得提亮到粉红才读得出；绿色同理。
+PRICE_UP_COLOR_LIGHT = "#c62828"
+PRICE_DOWN_COLOR_LIGHT = "#1a7f37"
+PRICE_UP_COLOR_DARK = "#ff7b72"
+PRICE_DOWN_COLOR_DARK = "#3fb950"
+
 DARK_QSS = """
 QWidget {
     background-color: #1e1f22;
@@ -177,6 +184,19 @@ def deal_highlight_color(text) -> QColor:
 def muted_color(dark: bool) -> QColor:
     """次要信息的弱化色（「原价」这类"有就行、别抢眼"的内容用它）。"""
     return QColor(MUTED_COLOR_DARK if dark else MUTED_COLOR_LIGHT)
+
+
+def price_delta_color(change: int, dark: bool) -> QColor:
+    """价格涨跌那一小段的颜色：涨红、跌绿。
+
+    持平（change == 0）走弱化色：没有方向可指的时候用红绿只会误导人。
+    其他认不出来的值也一并按持平处理。
+    """
+    if change > 0:
+        return QColor(PRICE_UP_COLOR_DARK if dark else PRICE_UP_COLOR_LIGHT)
+    if change < 0:
+        return QColor(PRICE_DOWN_COLOR_DARK if dark else PRICE_DOWN_COLOR_LIGHT)
+    return muted_color(dark)
 
 
 def style_placeholder(widget, dark: bool):

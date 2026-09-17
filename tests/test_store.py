@@ -1,5 +1,7 @@
 """store 的回归测试：建表、sync 语义、upsert 保留旧值、排序与设置读写。"""
 
+import sqlite3
+
 import pytest
 
 import store
@@ -113,6 +115,131 @@ def test_upsert_item_updates_with_new_values(db):
     row = st.get_item("1001")
     assert row["name"] == "新名"
     assert row["image_url"] == "https://img/new.jpg"
+
+
+# ---------------- 价格快照 ----------------
+
+
+def test_upsert_item_saves_price_snapshot(db):
+    """抓到价格时，价格几列连同 price_updated_at 一起写进去。"""
+    st = store.Store(db)
+    st.upsert_item(
+        "1001", "甲", None, price_text="¥44", reference_price="¥99", avg_text="¥40"
+    )
+    row = st.get_item("1001")
+    assert row["price_text"] == "¥44"
+    assert row["reference_price"] == "¥99"
+    assert row["avg_text"] == "¥40"
+    assert row["price_updated_at"] == row["updated_at"]
+
+
+def test_upsert_item_saves_sold_out_flag(db):
+    """售罄标记按 0/1 存，取出来是整数。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", None, price_text="¥138", sold_out=True)
+    st.upsert_item("1002", "乙", None, price_text="¥44", sold_out=False)
+    assert st.get_item("1001")["sold_out"] == 1
+    assert st.get_item("1002")["sold_out"] == 0
+
+
+def test_upsert_without_price_keeps_the_whole_snapshot(db, monkeypatch):
+    """没抓到价格时整组原样保留，连 price_updated_at 都不动。"""
+    stamps = iter(["2024-01-01T10:00:00", "2024-01-02T10:00:00"])
+    monkeypatch.setattr(store, "_now", lambda: next(stamps))
+    st = store.Store(db)
+    st.upsert_item(
+        "1001",
+        "甲",
+        None,
+        price_text="¥44",
+        reference_price="¥99",
+        avg_text="¥40",
+        sold_out=True,
+    )
+
+    st.upsert_item("1001", "甲", None)  # 这次没抓到价格
+
+    row = st.get_item("1001")
+    assert row["price_text"] == "¥44"
+    assert row["reference_price"] == "¥99"
+    assert row["avg_text"] == "¥40"
+    assert row["sold_out"] == 1
+    assert row["price_updated_at"] == "2024-01-01T10:00:00"
+    assert row["updated_at"] == "2024-01-02T10:00:00"  # 名称那组照常更新
+
+
+def test_upsert_with_price_replaces_the_whole_snapshot(db):
+    """抓到价格时整组按这次的写：这次没有的字段就存空，不留上次的旧值。
+
+    上次的参考价跟这次的新现价摆在一起，算出来的折扣是错的。
+    """
+    st = store.Store(db)
+    st.upsert_item(
+        "1001",
+        "甲",
+        None,
+        price_text="¥44",
+        reference_price="¥99",
+        avg_text="¥40",
+        sold_out=True,
+    )
+
+    st.upsert_item("1001", "甲", None, price_text="¥38")
+
+    row = st.get_item("1001")
+    assert row["price_text"] == "¥38"
+    assert row["reference_price"] is None
+    assert row["avg_text"] is None
+    assert row["sold_out"] == 0
+
+
+@pytest.mark.parametrize("blank", ["", "   ", None, 44])
+def test_upsert_blank_price_is_treated_as_missing(db, blank):
+    """价格是空串或非字符串时按「没抓到」处理，不会冲掉已有快照。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", None, price_text="¥44", sold_out=True)
+
+    st.upsert_item("1001", "甲", None, price_text=blank)
+
+    row = st.get_item("1001")
+    assert row["price_text"] == "¥44"
+    assert row["sold_out"] == 1
+
+
+# ---------------- 老缓存库补列 ----------------
+
+
+def test_old_db_without_price_columns_is_upgraded(db):
+    """老库（只有四列）打开时自动补上价格列，且原有数据不受影响。"""
+    conn = sqlite3.connect(db)
+    with conn:
+        conn.execute(
+            """CREATE TABLE items (
+                   cluster_id TEXT PRIMARY KEY,
+                   name       TEXT,
+                   image_url  TEXT,
+                   updated_at TEXT
+               )"""
+        )
+        conn.execute("INSERT INTO items VALUES ('1001', '甲', 'img', '2024-01-01T00:00:00')")
+    conn.close()
+
+    st = store.Store(db)
+
+    assert st.get_item("1001")["name"] == "甲"  # 老数据还在
+    assert st.get_item("1001")["price_text"] is None
+    st.upsert_item("1001", "甲", None, price_text="¥44")  # 缺列时写入会整条失败
+    assert st.get_item("1001")["price_text"] == "¥44"
+    assert st.notes == []  # 补列不该给用户报错
+
+
+def test_ensure_item_columns_is_idempotent(db):
+    """补列跑第二遍不会报错，也不会把列补重。"""
+    store.Store(db).close()
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", None, price_text="¥44")
+    columns = [row["name"] for row in st.conn.execute("PRAGMA table_info(items)")]
+    assert columns == [name for name, _ in store.ITEM_COLUMNS]
 
 
 # ---------------- get_item / delete_item ----------------

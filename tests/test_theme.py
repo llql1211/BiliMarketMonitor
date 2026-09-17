@@ -15,6 +15,24 @@ from PyQt5.QtWidgets import QPlainTextEdit, QStyle
 import theme
 
 
+# ---------------- 工具 ----------------
+
+
+def _luminance(color):
+    """WCAG 相对亮度，用来验算配色对比度。"""
+    channels = []
+    for value in (color.redF(), color.greenF(), color.blueF()):
+        channels.append(
+            value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+        )
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def _contrast(fg, bg):
+    high, low = sorted((_luminance(fg), _luminance(bg)), reverse=True)
+    return (high + 0.05) / (low + 0.05)
+
+
 # ---------------- 样式表 ----------------
 
 
@@ -106,22 +124,54 @@ def test_deal_highlight_default_color_is_readable_on_both_themes():
 
     这是选默认值的硬约束：#ff8c00 在白底上只有 2.3:1，偏看不清，所以换成了 #e07000。
     """
-
-    def _luminance(color):
-        channels = []
-        for value in (color.redF(), color.greenF(), color.blueF()):
-            channels.append(
-                value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
-            )
-        return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
-
-    def _contrast(fg, bg):
-        high, low = sorted((_luminance(fg), _luminance(bg)), reverse=True)
-        return (high + 0.05) / (low + 0.05)
-
     color = theme.deal_highlight_color(theme.DEAL_HIGHLIGHT_COLOR)
     for background in ("#ffffff", "#26272b"):  # 浅色主题表格 / 暗色主题表格
         assert _contrast(color, QColor(background)) >= 3.0
+
+
+# ---------------- 涨跌配色 ----------------
+
+
+@pytest.mark.parametrize(
+    "change, dark, color",
+    [
+        (1, False, theme.PRICE_UP_COLOR_LIGHT),
+        (-1, False, theme.PRICE_DOWN_COLOR_LIGHT),
+        (1, True, theme.PRICE_UP_COLOR_DARK),
+        (-1, True, theme.PRICE_DOWN_COLOR_DARK),
+    ],
+)
+def test_price_delta_color_direction_and_theme(change, dark, color):
+    """红涨绿跌，且按主题取色。"""
+    assert theme.price_delta_color(change, dark).name() == color
+
+
+def test_price_delta_color_flat_is_muted():
+    """持平不用红绿——没有方向可指时上色只会让人以为涨了或跌了。"""
+    for dark in (False, True):
+        assert theme.price_delta_color(0, dark).name() == theme.muted_color(dark).name()
+
+
+@pytest.mark.parametrize("change", [0, 1, -1, 7])
+def test_price_delta_colors_are_readable_on_their_theme(change):
+    """涨跌色要压得住自家主题的表格底色（对比度 >= 3:1），别糊进背景里。
+
+    暗色那套红绿就是照着这个挑的：直接用浅色主题的 #c62828 在 #26272b 上
+    只有 2.2:1，跟背景糊成一片。
+    """
+    up = theme.price_delta_color(change, dark=True)
+    down = theme.price_delta_color(change, dark=False)
+    assert _contrast(up, QColor("#26272b")) >= 3.0
+    assert _contrast(down, QColor("#ffffff")) >= 3.0
+
+
+def test_price_delta_colors_differ_from_each_other_and_across_themes():
+    """两套主题的红绿得各是各的，抄错一份就白搭。"""
+    light_up = theme.price_delta_color(1, dark=False).name()
+    dark_up = theme.price_delta_color(1, dark=True).name()
+    light_down = theme.price_delta_color(-1, dark=False).name()
+    dark_down = theme.price_delta_color(-1, dark=True).name()
+    assert len({light_up, dark_up, light_down, dark_down}) == 4
 
 
 # ---------------- 系统深浅色 ----------------

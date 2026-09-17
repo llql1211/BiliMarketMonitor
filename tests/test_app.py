@@ -15,12 +15,14 @@ from PyQt5.QtGui import (
     QDragLeaveEvent,
     QDragMoveEvent,
     QDropEvent,
+    QFontMetrics,
     QPixmap,
 )
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QDialog,
     QMessageBox,
+    QStyleOptionViewItem,
     QTableWidgetSelectionRange,
 )
 
@@ -313,16 +315,22 @@ def test_result_for_unknown_row_is_ignored(window):
 
 
 def test_rebuild_rows_keeps_or_drops_values(window):
-    """重建表格：keep_values 默认保留本次抓到的数据，False 时退回占位符。"""
+    """重建表格：keep_values 默认保留本次抓到的数据（连涨跌），False 时退回缓存那一份。"""
     w = window("10000008780\n")
+    _seed_cache(w, price="¥50")
     w.LoadWatchlist(w.watchlist_path)
     w.OnResultReady(0, result_ok(price="¥99"))
 
     w.RebuildRows()
-    assert w.table.item(0, app_module.COL_PRICE).text() == "¥99"
+    assert w.table.item(0, app_module.COL_PRICE).text() == "¥99 ↑ 49"
 
     w.RebuildRows(keep_values=False)
-    assert w.table.item(0, app_module.COL_PRICE).text() == app_module.NO_DATA_TEXT
+
+    assert w.rows[0]["values"] is None  # 模型里确实丢掉本次那份了
+    cell = w.table.item(0, app_module.COL_PRICE)
+    assert cell.text() == "¥99"  # 但缓存里存着刚抓到的价，所以数字还在
+    assert "上次更新时间" in cell.toolTip()  # 只是标明这是缓存里的
+    assert _delta(w) is None  # 没有"本次 vs 上次"可比，涨跌就没了
 
 
 def test_progress_updates_label(window):
@@ -384,6 +392,240 @@ def test_theme_toggle_keeps_rows_and_selection(window):
         "10000008780", "10000000002",
     ]
     assert w.SelectedClusterIds() == {"10000000002"}
+
+
+# ---------------- 缓存价格 / 涨跌 ----------------
+
+
+CACHED_AT = "2026-09-16T10:30:00"
+
+
+def _seed_cache(w, price="¥50", reference=None, avg=None, sold_out=False, when=CACHED_AT):
+    """往缓存里塞一条「上次抓取」的价格。
+
+    时间是写回去的（upsert 自己记的是当前时间），这样提示语可以断言；
+    when=None 模拟老库补列后留下的空时间戳。
+    """
+    w.store.upsert_item(
+        "10000008780", "甲", None,
+        price_text=price, reference_price=reference, avg_text=avg, sold_out=sold_out,
+    )
+    with w.store.conn:
+        w.store.conn.execute("UPDATE items SET price_updated_at = ?", (when,))
+
+
+def _delta(w, row=0):
+    """「现价」格末尾那截涨跌的文本（没有就是 None）。"""
+    return w.table.item(row, app_module.COL_PRICE).data(app_module.DELTA_ROLE)
+
+
+def test_cached_price_shows_on_startup_with_its_timestamp(window):
+    """重开程序先显示上次抓到的价格，并说清是什么时候抓的。"""
+    w = window("10000008780\n")
+    _seed_cache(w, price="¥138", reference="¥199", avg="¥150")
+
+    w.LoadWatchlist(w.watchlist_path)
+
+    cell = w.table.item(0, app_module.COL_PRICE)
+    assert cell.text() == "¥138"
+    assert cell.toolTip() == "上次更新时间：2026-09-16 10:30:00"
+    assert w.table.item(0, app_module.COL_REF).text() == "¥199"
+    assert w.table.item(0, app_module.COL_AVG).text() == "¥150"
+
+
+def test_cached_sold_out_row_says_so_on_startup(window):
+    """缓存里记着售罄：价格前缀和「那是原价」的解释都要跟着回来。"""
+    w = window("10000008780\n")
+    _seed_cache(w, price="¥138", sold_out=True)
+
+    w.LoadWatchlist(w.watchlist_path)
+
+    cell = w.table.item(0, app_module.COL_PRICE)
+    assert cell.text() == f"{app_module.SOLD_OUT_TEXT} ¥138"
+    assert "原价" in cell.toolTip()
+    assert "上次更新时间" in cell.toolTip()
+
+
+@pytest.mark.parametrize("when", [None, "", "   "])
+def test_cached_price_without_timestamp_never_claims_a_time(window, when):
+    """没有时间戳就只说价格，不要拿别的钟点凑一句「上次更新时间」。"""
+    w = window("10000008780\n")
+    _seed_cache(w, price="¥138", when=when)
+
+    w.LoadWatchlist(w.watchlist_path)
+
+    assert w.table.item(0, app_module.COL_PRICE).toolTip() == "¥138"
+
+
+def test_no_cache_still_renders_placeholders(window):
+    """缓存里没有价格就还是占位符。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    cell = w.table.item(0, app_module.COL_PRICE)
+    assert cell.text() == app_module.NO_DATA_TEXT
+    assert cell.toolTip() == ""
+
+
+@pytest.mark.parametrize(
+    "cached, fetched, expected",
+    [
+        ("¥50", "¥44", "¥44 ↓ 6"),
+        ("¥44", "¥50", "¥50 ↑ 6"),
+        ("¥44", "¥44", "¥44 -"),
+    ],
+)
+def test_price_delta_is_appended_to_the_current_price(window, cached, fetched, expected):
+    """涨跌拼在现价后面，符号只用 ↑↓-。"""
+    w = window("10000008780\n")
+    _seed_cache(w, price=cached)
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.OnResultReady(0, result_ok(price=fetched))
+
+    assert w.table.item(0, app_module.COL_PRICE).text() == expected
+
+
+def test_first_fetch_has_no_delta(window):
+    """第一次抓到，没有上一次可比，就不显示涨跌——而不是显示 0。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.OnResultReady(0, result_ok(price="¥44"))
+
+    assert w.table.item(0, app_module.COL_PRICE).text() == "¥44"
+    assert _delta(w) is None
+
+
+def test_delta_is_skipped_when_previous_fetch_was_sold_out(window):
+    """上次售罄时那一格装的是原价，跟市集现价比出来的「涨跌」没有意义。"""
+    w = window("10000008780\n")
+    _seed_cache(w, price="¥138", sold_out=True)
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.OnResultReady(0, result_ok(price="¥44"))
+
+    assert w.table.item(0, app_module.COL_PRICE).text() == "¥44"
+    assert _delta(w) is None
+
+
+def test_delta_is_skipped_when_the_item_just_sold_out(window):
+    """这次售罄：现价格已经标了「已售罄」，再跟上一比就是在比两个不同的东西。"""
+    w = window("10000008780\n")
+    _seed_cache(w, price="¥44")
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.OnResultReady(0, result_ok(price="138", sold_out=True))
+
+    assert w.table.item(0, app_module.COL_PRICE).text() == f"{app_module.SOLD_OUT_TEXT} ¥138"
+    assert _delta(w) is None
+
+
+def test_delta_color_follows_the_theme(window):
+    """涨跌的颜色按主题选，换主题重画时要跟着换（不然会停在旧主题的色上）。"""
+    w = window("10000008780\n")
+    _seed_cache(w, price="¥50")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, result_ok(price="¥44"))
+
+    def color():
+        return w.table.item(0, app_module.COL_PRICE).data(app_module.DELTA_COLOR_ROLE)
+
+    before = color().name()
+    assert before == theme.price_delta_color(-6, w.dark).name()
+
+    w.OnToggleTheme()
+
+    assert color().name() == theme.price_delta_color(-6, w.dark).name()
+    assert color().name() != before
+
+
+def test_delta_survives_a_table_rebuild(window):
+    """重画表格（换主题、拖拽排序）不能把涨跌弄丢。"""
+    w = window("10000008780\n")
+    _seed_cache(w, price="¥50")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, result_ok(price="¥44"))
+
+    w.RebuildRows()
+
+    assert w.table.item(0, app_module.COL_PRICE).text() == "¥44 ↓ 6"
+    assert _delta(w) == "↓ 6"
+
+
+def test_failed_fetch_falls_back_to_the_cached_price(window):
+    """抓失败不清空价格：还显示上次抓到的那个数，说清时间，涨跌撤掉。"""
+    w = window("10000008780\n")
+    _seed_cache(w, price="¥50")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, result_ok(price="¥44"))
+    assert _delta(w) == "↓ 6"
+
+    w.OnResultReady(0, result_fail("读取超时"))
+
+    cell = w.table.item(0, app_module.COL_PRICE)
+    assert cell.text() == "¥44"
+    assert "上次更新时间" in cell.toolTip()
+    assert _delta(w) is None
+
+
+def test_failed_fetch_without_any_cache_stays_placeholder(window):
+    """失败且本来就没有价格可退：还是占位符，提示里也别提什么更新时间。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.OnResultReady(0, result_fail("HTTP 500"))
+
+    cell = w.table.item(0, app_module.COL_PRICE)
+    assert cell.text() == app_module.NO_DATA_TEXT
+    assert cell.toolTip() == ""
+
+
+def test_price_delegate_hands_only_the_price_to_the_base_style(window):
+    """交给基类的文本要去掉涨跌那一截——位置由基类说了算，两截才不会叠在一起。"""
+    w = window("10000008780\n")
+    _seed_cache(w, price="¥50")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, result_ok(price="¥44"))
+
+    index = w.table.model().index(0, app_module.COL_PRICE)
+    option = QStyleOptionViewItem()
+    w.table.itemDelegateForColumn(app_module.COL_PRICE).initStyleOption(option, index)
+
+    assert index.data(Qt.DisplayRole) == "¥44 ↓ 6"
+    assert option.text == "¥44 "  # 分隔的空格留着，基类按它把现价摆在该在的地方
+
+
+def test_delta_rect_sits_right_after_the_price(qapp):
+    """涨跌的落点紧接在现价右边，且跟现价同一行——位置对不上两截就会叠住。"""
+    metrics = QFontMetrics(qapp.font())
+    text_rect = QRect(0, 0, 120, 20)
+    rect = app_module.delta_rect(metrics, text_rect, "¥44 ", "↓ 6")
+
+    assert rect.left() == metrics.horizontalAdvance("¥44 ")
+    assert rect.top() == text_rect.top()
+    assert rect.height() == text_rect.height()
+    assert rect.right() == text_rect.right()
+
+
+def test_delta_rect_gives_up_when_it_does_not_fit(qapp):
+    """格子窄到放不下就干脆不画：宁可不显示涨跌，也不要糊成一团。"""
+    metrics = QFontMetrics(qapp.font())
+    assert app_module.delta_rect(metrics, QRect(0, 0, 8, 20), "¥44 ", "↓ 6") is None
+
+
+def test_painting_a_price_cell_with_a_delta_does_not_blow_up(window, qapp):
+    """整条绘制路径真走一遍（离屏渲染看不到字，但崩了会立刻现形）。"""
+    w = window("10000008780\n")
+    _seed_cache(w, price="¥50")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, result_ok(price="¥44"))
+    w.show()
+    qapp.processEvents()
+
+    w.table.viewport().grab()
+
+    assert w.table.item(0, app_module.COL_PRICE).text() == "¥44 ↓ 6"
 
 
 # ---------------- 按钮状态 ----------------
@@ -1428,6 +1670,54 @@ def test_skipped_note(duplicated, invalid, expected):
 def test_deal_text(deal, expected):
     """成交格的文本：有价格有时间才拼「·」，缺一半时不留分隔符。"""
     assert app_module._deal_text(deal) == expected
+
+
+@pytest.mark.parametrize(
+    "previous, previous_sold_out, current, current_sold_out, expected",
+    [
+        ("¥50", False, "¥44", False, ("↓ 6", -6)),
+        ("¥44", False, "¥50", False, ("↑ 6", 6)),
+        ("¥44", False, "¥44.00", False, ("-", 0)),      # 没变也要说「没变」
+        ("¥44.20", False, "¥50.70", False, ("↑ 6.5", 6.5)),
+        ("¥1,299.50", False, "¥1,299.75", False, ("↑ 0.25", 0.25)),
+        ("¥138", True, "¥44", False, None),             # 上次售罄
+        ("¥44", False, "¥138", True, None),             # 这次售罄
+        ("", False, "¥44", False, None),                # 没有上次的价格
+        ("面议", False, "¥44", False, None),             # 认不出数字
+        ("¥44", False, None, False, None),              # 这次没抓到价格
+    ],
+)
+def test_price_delta(previous, previous_sold_out, current, current_sold_out, expected):
+    """涨跌：红涨绿跌的方向与数字，售罄和认不出数字时宁可不说。"""
+    assert (
+        app_module.price_delta(previous, previous_sold_out, current, current_sold_out)
+        == expected
+    )
+
+
+def test_split_price_text():
+    """拆现价与涨跌：涨跌段永远在末尾，按长度切；对不上就原样返回。"""
+    assert app_module.split_price_text("¥44 ↓ 6", "↓ 6") == ("¥44 ", "↓ 6")
+    assert app_module.split_price_text("已售罄 ¥138", None) == ("已售罄 ¥138", "")
+    assert app_module.split_price_text("¥44", "↓ 6") == ("¥44", "")
+    assert app_module.split_price_text("", "↓ 6") == ("", "")
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("2026-09-16T10:30:00", "上次更新时间：2026-09-16 10:30:00"),
+        ("2026-09-16T10:30:00.123456", "上次更新时间：2026-09-16 10:30:00"),
+        (None, ""),
+        ("", ""),
+        ("   ", ""),
+        (123, ""),
+        ("认不出来的时间", "上次更新时间：认不出来的时间"),  # 原样带出来，别假装没有
+    ],
+)
+def test_cached_note(value, expected):
+    """缓存价格的提示语：没有时间戳就什么都不说，认不出来的原样带出来。"""
+    assert app_module._cached_note(value) == expected
 
 
 # ---------------- 子模块降级提示的接线 ----------------

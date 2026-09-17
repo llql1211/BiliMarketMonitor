@@ -481,3 +481,51 @@ def test_deal_age_follows_the_displayed_time():
         ("9小时前", 9 * 3600),
         ("最近", None),
     ]
+
+
+# ---------------- 价格文本 -> 数字（算涨跌用） ----------------
+#
+# 缓存和结果里存的都是「¥44」这样的展示文本，要算涨跌得先把数字抠出来。
+# 抠不出来的必须是 None：界面据此不显示涨跌，不能把「面议」当成 0。
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("¥44", 44.0),
+        ("￥44", 44.0),
+        ("44", 44.0),
+        ("¥44.5", 44.5),
+        ("¥1,299.50", 1299.5),   # 千分位逗号要脱掉，否则只能读到 1
+        ("¥1，299.50", 1299.5),  # 全角逗号同理
+        ("  ¥44  ", 44.0),
+        ("¥138元", 138.0),       # 数字后面跟文字不影响取值
+        (44, 44.0),              # 数字原样接受
+        (44.5, 44.5),
+        ("已售罄 ¥138", 138.0),  # 展示文本里混着前缀也能抠出来
+    ],
+)
+def test_price_number(text, expected):
+    """常见的价格形态都能还原成数字。"""
+    assert parser.price_number(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        None,
+        "",
+        "   ",
+        "面议",          # 没有数字
+        "¥",             # 只有符号
+        True,            # bool 是 int 的子类，不能被当成 1
+        False,
+        {"a": 1},
+        [44],
+        float("nan"),
+        float("inf"),
+    ],
+)
+def test_price_number_unknown(text):
+    """认不出来的价格一律 None——界面据此不显示涨跌。"""
+    assert parser.price_number(text) is None

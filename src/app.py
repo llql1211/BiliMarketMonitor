@@ -15,10 +15,20 @@ import sys
 import threading
 import time
 import webbrowser
+from datetime import datetime
 
 import requests
 from PyQt5.QtCore import QObject, QPoint, QRect, QSize, Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QBrush, QCursor, QDrag, QIcon, QPainter, QPen, QPixmap
+from PyQt5.QtGui import (
+    QBrush,
+    QCursor,
+    QDrag,
+    QFontMetrics,
+    QIcon,
+    QPainter,
+    QPen,
+    QPixmap,
+)
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -31,6 +41,9 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTableWidget,
     QTableWidgetItem,
     QTableWidgetSelectionRange,
@@ -61,6 +74,10 @@ NO_DATA_TEXT = "—"      # 无数据
 FAILED_TEXT = "（查询失败）"
 SOLD_OUT_TEXT = "已售罄"  # 现价格的前缀：售罄时那一格装的不是市集现价
 
+DELTA_ROLE = Qt.UserRole + 1        # 「现价」格末尾那截涨跌（形如「↓ 6」）
+DELTA_COLOR_ROLE = Qt.UserRole + 2  # 上面那截的颜色（随主题走，重画时重算）
+DELTA_GAP = " "                     # 现价与涨跌之间空一格
+
 PAUSE_TEXT = "暂停抓取"
 RESUME_TEXT = "继续抓取"
 ADD_PLACEHOLDER = "粘贴商品 ID 或分享链接，一行一个…"
@@ -81,6 +98,87 @@ def _deal_text(deal) -> str:
     if not isinstance(deal, dict):  # 渲染路径上多一层保险，别让脏数据把表格卡住
         return ""
     return " · ".join(part for part in (deal.get("price"), deal.get("time")) if part)
+
+
+def _amount(value) -> str:
+    """涨跌的数字：优先整数，其次两位小数（末尾凑数的 0 去掉，别写「6.50」）。"""
+    rounded = round(abs(value), 2)
+    if rounded == int(rounded):
+        return str(int(rounded))
+    return f"{rounded:.2f}".rstrip("0")
+
+
+def price_delta(previous_price, previous_sold_out, current_price, current_sold_out):
+    """两次抓取之间现价的变化，返回 (显示文本, 变化量)；没法比就给 None。
+
+    两种情况不给涨跌：
+    - 有一边是售罄：售罄行的价格装的是原价，跟市集现价比出来的"涨跌"没有意义，
+      售罄前后更是两个不同的东西；
+    - 价格认不出数字：宁可这一格不显示涨跌，也不要拿猜出来的数去误导人。
+
+    持平照样返回（显示「-」）：让用户看出是"没变"，而不是"没抓到"。
+    """
+    if previous_sold_out or current_sold_out:
+        return None
+    old = parser.price_number(previous_price)
+    new = parser.price_number(current_price)
+    if old is None or new is None:
+        return None
+    change = round(new - old, 2)
+    if change > 0:
+        return f"↑ {_amount(change)}", change
+    if change < 0:
+        return f"↓ {_amount(change)}", change
+    return "-", 0
+
+
+def split_price_text(text, delta):
+    """把「¥44 ↓ 6」拆成现价和涨跌两截（前半截连分隔的空格一起留下）。
+
+    涨跌段永远拼在末尾，按长度切比找分隔符稳——价格前面还顶着「已售罄」，
+    里面也没准带空格。
+    """
+    if not delta or not text.endswith(delta):
+        return text, ""
+    return text[: len(text) - len(delta)], delta
+
+
+def delta_rect(metrics, text_rect, prefix, delta):
+    """涨跌那截该画在哪儿：紧接在现价右边缘，跟现价同一行；挤不下就返回 None。
+
+    位置按「基类给文字留的矩形 + 现价量出来的宽度」算——基类画现价时用的也是
+    同一块矩形，所以两截能接上。prefix 带着分隔的空格，量出来的间距就跟
+    单元格文本里的一致。
+    """
+    left = text_rect.left() + metrics.horizontalAdvance(prefix)
+    # QRect.right() 是闭区间，算宽度时要补回这 1 像素，不然右边会缺一条
+    if left + metrics.horizontalAdvance(delta) > text_rect.right() + 1:
+        return None
+    return QRect(left, text_rect.top(), text_rect.right() + 1 - left, text_rect.height())
+
+
+def _display_time(value) -> str:
+    """缓存里的 ISO 时间串 →「2026-09-16 10:30:00」；认不出来就原样返回。"""
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    try:
+        return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return value
+
+
+def _cached_note(updated_at) -> str:
+    """「这价格是什么时候抓的」的提示语；没有时间戳就什么都不说。
+
+    宁可少一句提示，也不要拿当前时间凑一个，那是在骗人。
+    """
+    stamp = _display_time(updated_at)
+    return f"上次更新时间：{stamp}" if stamp else ""
+
+
+def _tips(*parts) -> str:
+    """拼提示文本：只留非空的那几段，一行一句。"""
+    return "\n".join(part for part in parts if part)
 
 
 def picked_rows(sources, count):
@@ -219,6 +317,49 @@ class ImageFetcher(QObject):
             return
         if not pixmap.isNull():
             self.fetched.emit(row, pixmap)
+
+
+class PriceDeltaDelegate(QStyledItemDelegate):
+    """「现价」列的绘制：现价照常画，末尾那截涨跌单独上色。
+
+    一个 QTableWidgetItem 只有一种前景色，而「¥44 ↓ 6」要两截颜色，所以这一列
+    自己画：先让基类按平常的样子画（背景、隔行色、选中态、对齐都一样），只是
+    交给它的文本先收窄成现价那半截，再按同一个文本矩形接着往后补上涨跌。
+
+    文本位置由基类说了算，这里不自己摆——列宽不够时基类会加省略号，位置对不上
+    的话两截会叠在一起。
+    """
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        option.text, _ = split_price_text(option.text, index.data(DELTA_ROLE))
+
+    def paint(self, painter, option, index):
+        delta = index.data(DELTA_ROLE)
+        if not delta:
+            super().paint(painter, option, index)
+            return
+
+        super().paint(painter, option, index)  # 现价那半截（已由上面收窄）
+
+        prefix, delta = split_price_text(index.data(Qt.DisplayRole) or "", delta)
+        style_option = QStyleOptionViewItem(option)
+        self.initStyleOption(style_option, index)
+        style = option.widget.style() if option.widget else QApplication.style()
+        # 基类给文字留的那块地方：界面上"现价"取的就是它的左边缘
+        text_rect = style.subElementRect(
+            QStyle.SE_ItemViewItemText, style_option, option.widget
+        )
+
+        rect = delta_rect(QFontMetrics(style_option.font), text_rect, prefix, delta)
+        if rect is None:
+            return  # 挤不下就只留现价，完整的「¥44 ↓ 6」还在悬停提示里
+
+        painter.save()
+        painter.setFont(style_option.font)
+        painter.setPen(index.data(DELTA_COLOR_ROLE) or style_option.palette.text().color())
+        painter.drawText(rect, Qt.AlignLeft | Qt.AlignVCenter, delta)
+        painter.restore()
 
 
 class AddDialog(QDialog):
@@ -481,6 +622,8 @@ class MainWindow(QMainWindow):
         # 表格
         self.table = ReorderableTable(0, len(HEADERS))
         self.table.setHorizontalHeaderLabels(HEADERS)
+        # 现价列自己画：现价和涨跌要两截颜色（见 PriceDeltaDelegate）
+        self.table.setItemDelegateForColumn(COL_PRICE, PriceDeltaDelegate(self.table))
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -559,24 +702,31 @@ class MainWindow(QMainWindow):
         """行模型字段：
 
         entry   LinkEntry，来自清单（本工具只跟踪清单里的商品）
-        record  缓存的 {name, image_url}
+        record  缓存记录（名称、缩略图、上次抓到的价格）
         values  本次运行抓到的结果，表格重建时用来保留已显示的数据
+        delta   本次抓取相比上次缓存价格的涨跌 (文本, 变化量)，没得比就是 None
         """
         return {
             "entry": entry,
             "record": self.store.get_item(entry.cluster_id),
             "values": None,
+            "delta": None,
         }
 
     def RebuildRows(self, keep_values=True):
         """按清单重建行模型；keep_values=False 时丢弃本次抓到的数据。"""
         old = {}
         if keep_values:
-            old = {item["entry"].cluster_id: item.get("values") for item in self.rows}
+            old = {
+                item["entry"].cluster_id: (item.get("values"), item.get("delta"))
+                for item in self.rows
+            }
         rows = []
         for entry in self.watch_entries:
             item = self.MakeRow(entry)
-            item["values"] = old.get(entry.cluster_id)
+            values, delta = old.get(entry.cluster_id, (None, None))
+            item["values"] = values
+            item["delta"] = delta
             rows.append(item)
         self.rows = rows
         self.RenderTable()
@@ -653,13 +803,63 @@ class MainWindow(QMainWindow):
 
     def PriceTooltip(self, sold_out):
         """售罄行的现价格要解释一句：那个数不是市集现价。"""
-        return "该商品已售罄，这里的价格是原价而非市集现价" if sold_out else None
+        return "该商品已售罄，这里的价格是原价而非市集现价" if sold_out else ""
 
     def ReferenceCell(self, reference_price):
         """「原价」格：弱化色显示，跟现价拉开层次。"""
         return self.MakeCell(
             str(reference_price) if reference_price else NO_DATA_TEXT,
             color=theme.muted_color(self.dark),
+        )
+
+    def PriceCell(self, price, sold_out, note="", delta=None):
+        """「现价」格：现价（售罄时带前缀）+ 涨跌，涨跌单独上色。
+
+        对齐固定成左对齐：涨跌那截的落点是按"现价从文本区左边起"算的
+        （见 PriceDeltaDelegate），居中或右对齐就会两截叠在一起。
+
+        note 是「这价格是什么时候抓的」那类补充说明，有它就不再退回"提示即全文"。
+        """
+        text = self.PriceText(price, sold_out)
+        if delta:
+            text += DELTA_GAP + delta[0]
+        cell = self.MakeCell(
+            text,
+            tooltip=_tips(self.PriceTooltip(sold_out), note) or None,
+            align=Qt.AlignLeft | Qt.AlignVCenter,
+        )
+        if delta:
+            cell.setData(DELTA_ROLE, delta[0])
+            cell.setData(DELTA_COLOR_ROLE, theme.price_delta_color(delta[1], self.dark))
+        return cell
+
+    def SetPriceCells(self, row, item):
+        """填「现价 / 原价 / 近30天均价」三格。
+
+        取值优先级：这次抓到的 > 缓存里上次抓到的 > 占位符。抓失败时退回缓存，
+        而不是把已经看到过的价格清掉——一次网络抖动不该让人白记一遍；代价是
+        得在提示里说清这个数是什么时候抓的（_cached_note）。
+
+        首屏渲染（FillRow）和抓取回填（OnResultReady）都走这里，
+        免得同一段渲染逻辑写两遍，哪天真改出不一致来。
+        """
+        values = item["values"] or {}
+        record = item["record"] or {}
+        if values.get("ok"):
+            price, sold_out = values.get("price"), values.get("sold_out")
+            reference, avg = values.get("reference_price"), values.get("avg_price")
+            note = ""
+        else:
+            price, sold_out = record.get("price_text"), record.get("sold_out")
+            reference, avg = record.get("reference_price"), record.get("avg_text")
+            note = _cached_note(record.get("price_updated_at"))
+
+        self.table.setItem(
+            row, COL_PRICE, self.PriceCell(price, sold_out, note, item.get("delta"))
+        )
+        self.table.setItem(row, COL_REF, self.ReferenceCell(reference))
+        self.table.setItem(
+            row, COL_AVG, self.MakeCell(str(avg) if avg else NO_DATA_TEXT)
         )
 
     def FillRow(self, row, item):
@@ -682,17 +882,7 @@ class MainWindow(QMainWindow):
 
         self.table.setItem(row, COL_CID, self.MakeCell(cluster_id))
 
-        def text(value):
-            return str(value) if value else NO_DATA_TEXT
-
-        self.table.setItem(
-            row, COL_PRICE, self.MakeCell(
-                self.PriceText(values.get("price"), values.get("sold_out")),
-                tooltip=self.PriceTooltip(values.get("sold_out")),
-            )
-        )
-        self.table.setItem(row, COL_REF, self.ReferenceCell(values.get("reference_price")))
-        self.table.setItem(row, COL_AVG, self.MakeCell(text(values.get("avg_price"))))
+        self.SetPriceCells(row, item)
         self.SetDealCells(row, values.get("deals"))
 
         self.table.setItem(row, COL_IMG, self.MakeCell("", align=Qt.AlignCenter))
@@ -953,24 +1143,34 @@ class MainWindow(QMainWindow):
         cluster_id = item["entry"].cluster_id
 
         if result["ok"]:
-            # 第一次抓到的新商品写入缓存；已缓存的也顺手刷新名称/缩略图
-            self.store.upsert_item(cluster_id, result["name"], result["image_url"])
+            # 涨跌要拿"这次抓取之前"的那个价比，所以先算再写缓存——upsert 之后
+            # item["record"] 就成了新值，再比只能比出 0 来
+            previous = item["record"] or {}
+            item["delta"] = price_delta(
+                previous.get("price_text"),
+                previous.get("sold_out"),
+                result["price"],
+                result["sold_out"],
+            )
+            # 第一次抓到的新商品写入缓存；已缓存的也顺手刷新名称、缩略图和价格
+            self.store.upsert_item(
+                cluster_id,
+                result["name"],
+                result["image_url"],
+                price_text=result["price"],
+                reference_price=result["reference_price"],
+                avg_text=result["avg_price"],
+                sold_out=result["sold_out"],
+            )
             item["record"] = self.store.get_item(cluster_id)
             if result["name"] and result["name"] != item["entry"].name:
                 self.names_learned = True
+        else:
+            # 这次没抓到，还显示缓存里的价格，涨跌自然也就无从谈起
+            item["delta"] = None
         item["values"] = result  # 失败的也记下来，重建表格时不会退回"待抓取"
 
-        def text(value):
-            return str(value) if value else NO_DATA_TEXT
-
-        self.table.setItem(
-            row, COL_PRICE, self.MakeCell(
-                self.PriceText(result["price"], result["sold_out"]),
-                tooltip=self.PriceTooltip(result["sold_out"]),
-            )
-        )
-        self.table.setItem(row, COL_REF, self.ReferenceCell(result["reference_price"]))
-        self.table.setItem(row, COL_AVG, self.MakeCell(text(result["avg_price"])))
+        self.SetPriceCells(row, item)
         self.SetDealCells(row, result["deals"])
 
         # 名称：接口返回的才是最新的；失败时如果原本没有名字，标出来而不是留个"…"
