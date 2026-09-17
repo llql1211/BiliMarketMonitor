@@ -962,6 +962,70 @@ def test_thumbnails_are_reused_across_redraws(window, monkeypatch):
     assert not w.table.item(0, app_module.COL_IMG).icon().isNull()
 
 
+# ---------------- 序号 ----------------
+
+
+def _numbers(w):
+    """表格里各行的序号文本，按表格顺序。"""
+    header = w.table.verticalHeader()
+    return [header.model().headerData(row, Qt.Vertical) for row in range(w.table.rowCount())]
+
+
+def test_row_numbers_start_at_one(window):
+    """序号从 1 数起，与行序一一对应。"""
+    w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"), ("10000000003", "丙"))
+
+    assert _numbers(w) == ["1", "2", "3"]
+    # 用例里窗口不 show()，isVisible() 恒为假；isVisibleTo 问的是"父窗口露出来时它露不露"
+    assert w.table.verticalHeader().isVisibleTo(w.table)
+
+
+def test_row_numbers_stand_for_the_position_not_the_item(window):
+    """序号是"第几行"，不是"这件商品的编号"：重排后要重编一遍。
+
+    不重编的话序号会跟着商品走，变成 3 1 2 这种跳号。
+    """
+    w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"), ("10000000003", "丙"))
+
+    w.OnRowsDropped([2], 0)  # 把「丙」拖到最前面
+
+    assert _ids(w) == ["10000000003", "10000008780", "10000000002"]
+    assert _numbers(w) == ["1", "2", "3"]
+
+
+def test_row_numbers_shrink_with_the_list(window, monkeypatch):
+    """删行后序号得跟着缩短——setRowCount 会把序号清空，靠重画补回来。"""
+    w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"), ("10000000003", "丙"))
+    w.table.setRangeSelected(QTableWidgetSelectionRange(2, 0, 2, 8), True)
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.Yes))
+
+    w.OnDeleteSelected()
+
+    assert _numbers(w) == ["1", "2"]
+
+
+def test_row_numbers_clear_with_the_list(window, data_files):
+    """换成空清单后不该残留上一份清单的序号。"""
+    w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"))
+    (data_files / "watchlist.txt").write_text("", encoding="utf-8")
+
+    w.LoadWatchlist(w.watchlist_path)
+
+    assert w.rows == []
+    assert _numbers(w) == []
+
+
+def test_row_number_width_grows_with_the_digits(window):
+    """序号涨到两位数时槽要跟着变宽，否则数字会被截掉一半。"""
+    w = _loaded(window, *[(f"1000000000{i}", f"商品{i}") for i in range(9)])
+    one_digit = w.table.verticalHeader().width()
+
+    w2 = _loaded(window, *[(f"1000000000{i}", f"商品{i}") for i in range(12)])
+
+    assert _numbers(w2)[-1] == "12"
+    assert w2.table.verticalHeader().width() > one_digit
+
+
 # ---------------- 主题 ----------------
 
 

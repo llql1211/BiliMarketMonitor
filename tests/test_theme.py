@@ -4,6 +4,7 @@ system_uses_dark 依赖 Windows 注册表，这里用假的 winreg 模块覆盖�
 免得测试结果随本机主题设置变化。
 """
 
+import re
 import sys
 import types
 
@@ -18,9 +19,32 @@ import theme
 
 
 def test_qss_follows_flag():
-    """暗色用 DARK_QSS，浅色交给 Qt 默认样式（空串）。"""
+    """暗色用 DARK_QSS，浅色基本交给 Qt 默认样式。"""
     assert theme.qss_for(True) == theme.DARK_QSS
-    assert theme.qss_for(False) == theme.LIGHT_QSS == ""
+    assert theme.qss_for(False) == theme.LIGHT_QSS
+
+
+def test_light_qss_stays_minimal():
+    """浅色主题只补必要的那几条，不趁机做整体装饰。
+
+    现在唯一的例外是序号槽尾部的底色（见 theme.LIGHT_QSS 注释）。
+    """
+    assert "QHeaderView" in theme.LIGHT_QSS
+    assert "QTableWidget" not in theme.LIGHT_QSS
+    assert "QPushButton" not in theme.LIGHT_QSS
+
+
+@pytest.mark.parametrize("dark, table_bg", [(True, "#26272b"), (False, "#ffffff")])
+def test_row_number_gutter_matches_the_table_background(dark, table_bg):
+    """序号槽尾部要和表格空白区同色，否则槽会拖一条深色竖条到底部。
+
+    这是量出来的：暗色槽尾 #1e1f22 对表格 #26272b，浅色 #f0f0f0 对 #ffffff。
+    浅色的 #ffffff 是 Qt 默认表格底色（LIGHT_QSS 里没写 QTableWidget）。
+    """
+    header_bg = re.search(r"QHeaderView\s*\{[^}]*?background-color:\s*(\S+);",
+                          theme.qss_for(dark))
+    assert header_bg is not None, "序号槽底色没显式指定，尾部会露馅"
+    assert header_bg.group(1) == table_bg
 
 
 @pytest.mark.parametrize("dark", [True, False])

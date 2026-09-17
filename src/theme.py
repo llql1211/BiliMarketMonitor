@@ -7,7 +7,15 @@
 from PyQt5.QtGui import QColor, QPalette
 from PyQt5.QtWidgets import QProxyStyle, QStyle
 
-LIGHT_QSS = ""  # 浅色用 Qt 默认样式，不做额外装饰
+# 浅色基本用 Qt 默认样式。这一条是例外：序号槽（垂直表头）在最后一行下方的
+# 空白区，Qt 默认刷的是表头那种浅灰，表格空白区是白的，于是序号槽会拖一条
+# 更深色的竖条到底部。显式跟表格对齐，接缝就没了。
+# 水平表头铺满列宽（商品名那列是 Stretch），用不到这条。
+LIGHT_QSS = """
+QHeaderView {
+    background-color: #ffffff;
+}
+"""
 
 TOOLTIP_DELAY_MS = 2000  # 悬停多久才弹提示（Qt 默认约 0.7 秒）
 
@@ -29,6 +37,11 @@ QTableWidget {
 }
 QTableWidget::item {
     padding: 2px;
+}
+QHeaderView {
+    /* 序号槽在最后一行下方的空白区：不显式指定的话会刷成 QWidget 那层底色，
+       比表格空白区深，于是序号槽拖一条深色竖条到底部 */
+    background-color: #26272b;
 }
 QHeaderView::section {
     background-color: #2f3136;

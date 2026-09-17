@@ -48,6 +48,8 @@ import theme
 IMAGE_SIZE = 96  # 缩略图边长（配合 CDN 裁剪后缀减小流量）
 IMAGE_SUFFIX = f"@{IMAGE_SIZE}w_{IMAGE_SIZE}h_85q.webp"
 
+ROW_NUMBER_PADDING = 16  # 序号槽左右留白，免得数字贴着分隔线
+
 COL_IMG, COL_NAME, COL_CID, COL_PRICE, COL_AVG = 0, 1, 2, 3, 4
 COL_DEAL_BASE = 5  # 成交① 占 5/6/7 三列
 COL_LINK = 8
@@ -481,7 +483,10 @@ class MainWindow(QMainWindow):
         # 行可拖拽排序（抓取中会被 SetBusy 关掉）
         self.table.setDragDropMode(QAbstractItemView.InternalMove)
         self.table.setAlternatingRowColors(True)
-        self.table.verticalHeader().setVisible(False)
+        # 序号槽（垂直表头）：排在数据列左边，横向滚动时钉在最左，不跟着列走
+        row_number = self.table.verticalHeader()
+        row_number.setVisible(True)
+        row_number.setDefaultAlignment(Qt.AlignCenter)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
         self.table.setIconSize(QSize(IMAGE_SIZE, IMAGE_SIZE))
@@ -571,9 +576,24 @@ class MainWindow(QMainWindow):
         self.rows = rows
         self.RenderTable()
 
+    def NumberRows(self):
+        """重编序号。序号就是清单顺序，重排、增删、刷新后都得再编一遍。
+
+        setRowCount 会把序号清空，所以每次重画都得跟着走。
+        """
+        count = len(self.rows)
+        self.table.setVerticalHeaderLabels([str(i + 1) for i in range(count)])
+        # 按最大序号定宽，涨到两位数、三位数时它自己会变宽；位数没变就不动，
+        # 免得每重画一次就抖一下
+        header = self.table.verticalHeader()
+        width = header.fontMetrics().horizontalAdvance(str(max(count, 1))) + ROW_NUMBER_PADDING
+        if header.width() != width:
+            header.setFixedWidth(width)
+
     def RenderTable(self):
         """按行模型重画整张表（已抓到的数据通过 values 保留）。"""
         self.table.setRowCount(len(self.rows))
+        self.NumberRows()
         self.row_urls.clear()
         self.row_images.clear()  # 行号会整体挪位，缩略图的归属得跟着重算
         for row, item in enumerate(self.rows):
