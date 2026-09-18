@@ -10,6 +10,7 @@
 通过信号槽把每条结果回传主线程刷新表格，避免界面假死。
 """
 
+import html
 import os
 import sys
 import threading
@@ -47,6 +48,7 @@ from PyQt5.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTableWidgetSelectionRange,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -92,6 +94,20 @@ PRICE_ALIGN = Qt.AlignLeft | Qt.AlignVCenter
 PAUSE_TEXT = "暂停抓取"
 RESUME_TEXT = "继续抓取"
 ADD_PLACEHOLDER = "粘贴商品 ID 或分享链接，一行一个…"
+
+# 一轮抓取跑完后的总结窗口（见 SummaryDialog）
+SUMMARY_TITLE = "本轮抓取总结"
+NO_CHANGE_TEXT = "本次没有价格变动"
+CHANGE_UP, CHANGE_DOWN = "up", "down"
+CHANGE_SOLD_OUT, CHANGE_ON_SALE = "sold_out", "on_sale"
+CHANGE_LABELS = {
+    CHANGE_DOWN: "降价",
+    CHANGE_UP: "涨价",
+    CHANGE_SOLD_OUT: "新售罄",
+    CHANGE_ON_SALE: "恢复在售",
+}
+# 分类在头一句话里的排列顺序：先跌后涨，再状态变化
+CHANGE_KINDS = (CHANGE_DOWN, CHANGE_UP, CHANGE_SOLD_OUT, CHANGE_ON_SALE)
 
 
 def _skipped_note(duplicated: int, invalid: int) -> str:
@@ -142,6 +158,47 @@ def price_delta(previous_price, previous_sold_out, current_price, current_sold_o
     return None
 
 
+def price_change(previous, result):
+    """本次抓到的结果相比缓存记录的一条变动；没变动（或没得比）就是 None。
+
+    previous 是抓取前的缓存记录（可能为空），result 是本次解析成功的结果。
+    返回的 dict 供总结窗口用：
+      kind       up / down / sold_out / on_sale 四选一
+      old_price  上一次的现价原文
+      new_price  这一次的现价原文
+      change     涨跌数字（只有 up/down 有，其余为 None）
+      delta      形如「↓ 6」的显示文本（同上）
+
+    判"没得比"的口径与 price_delta 一致：之前没抓到过价格就没有比较的基准
+    （首次抓到不算变动）。售罄前后同样不比价格——那两个数不是一回事
+    （见 PriceText）；但状态本身变了是实打实的一条变化，所以单独归成
+    sold_out / on_sale 报出去。
+    """
+    if not isinstance(previous, dict) or not previous.get("price_text"):
+        return None
+    old_price = previous["price_text"]
+    was_sold_out = bool(previous.get("sold_out"))
+    is_sold_out = bool(result.get("sold_out"))
+    if was_sold_out != is_sold_out:
+        return {
+            "kind": CHANGE_SOLD_OUT if is_sold_out else CHANGE_ON_SALE,
+            "old_price": old_price,
+            "new_price": result.get("price"),
+            "change": None,
+            "delta": "",
+        }
+    delta = price_delta(old_price, was_sold_out, result.get("price"), is_sold_out)
+    if delta is None:
+        return None
+    return {
+        "kind": CHANGE_UP if delta[1] > 0 else CHANGE_DOWN,
+        "old_price": old_price,
+        "new_price": result.get("price"),
+        "change": delta[1],
+        "delta": delta[0],
+    }
+
+
 def split_price_text(text, delta):
     """把「¥44 ↓ 6」拆成现价和涨跌两截（前半截连分隔的空格一起留下）。
 
@@ -189,6 +246,82 @@ def _cached_note(updated_at) -> str:
 def _tips(*parts) -> str:
     """拼提示文本：只留非空的那几段，一行一句。"""
     return "\n".join(part for part in parts if part)
+
+
+def _esc(value) -> str:
+    """转义要放进 HTML 的文本（商品名是接口给的，什么都可能有）。"""
+    return html.escape("" if value is None else str(value))
+
+
+def change_headline(changes) -> str:
+    """总结窗口的头一句话：共几条变动、各是哪几类；没有变动就直说。
+
+    总数与后面的分类计数都按传进来的条数算——分类认不出来时宁可在明细里
+    照常列出来，也不能让头一句话的"共 N 条"对不上。
+    """
+    changes = [c for c in changes or [] if isinstance(c, dict)]
+    if not changes:
+        return NO_CHANGE_TEXT
+    counts = {}
+    for change in changes:
+        kind = change.get("kind")
+        counts[kind] = counts.get(kind, 0) + 1
+    parts = [
+        f"{CHANGE_LABELS[kind]} {counts[kind]}"
+        for kind in CHANGE_KINDS
+        if counts.get(kind)
+    ]
+    unknown = len(changes) - sum(counts.get(kind, 0) for kind in CHANGE_KINDS)
+    if unknown:
+        parts.append(f"其他 {unknown}")
+    return f"共 {len(changes)} 条变动：" + " · ".join(parts)
+
+
+def change_subtitle(total, failures) -> str:
+    """总结窗口的第二行：这一轮抓了多少件、几件没抓到。
+
+    查询失败的那几件这次没有可比的价格，不说明的话，"没有变动"看起来就像
+    它们也没事——失败本身得在总结里有个交代。
+    """
+    text = f"本次共抓取 {total} 件商品"
+    if failures:
+        text += f"，其中 {failures} 件查询失败（这几件看不出变动）"
+    return text
+
+
+def changes_html(changes, dark) -> str:
+    """变动明细的 HTML 表格：序号 / 商品 / 价格 / 变动，涨跌那格上色。
+
+    只用 QTextEdit 确定认得的几个标签（table / td / span）：这是给总结窗口
+    渲染的，不是网页。商品名一律转义，名字里出现尖括号也不能把表格拆了。
+    """
+    muted = theme.muted_color(dark).name()
+
+    def head_cell(title):
+        # 表头用弱化色：跟下面几条拉开层次，但不跟涨跌的红绿抢眼
+        return f'<td><span style="color:{muted}">{title}</span></td>'
+
+    cells = ["<tr>" + "".join(head_cell(t) for t in ("#", "商品", "价格", "变动")) + "</tr>"]
+    for i, change in enumerate(changes or [], 1):
+        kind = change.get("kind")
+        if kind in (CHANGE_UP, CHANGE_DOWN):
+            price = f'{_esc(change.get("old_price"))} → {_esc(change.get("new_price"))}'
+            detail = _esc(change.get("delta"))
+            color = theme.price_delta_color(change.get("change"), dark).name()
+        elif kind == CHANGE_SOLD_OUT:
+            price, detail, color = "已售罄", "此前现价 " + _esc(change.get("old_price")), muted
+        else:  # CHANGE_ON_SALE：状态写在价格那格，价格有就跟着报一下
+            price, detail, color = "恢复在售", _join("现价", _esc(change.get("new_price"))), muted
+        cells.append(
+            f'<tr><td>{i}</td><td>{_esc(change.get("name"))}</td><td>{price}</td>'
+            f'<td><span style="color:{color}">{detail}</span></td></tr>'
+        )
+    return f'<table cellspacing="0" cellpadding="6" width="100%">{"".join(cells)}</table>'
+
+
+def _join(*parts) -> str:
+    """拼一段文本：只留非空的那几段，中间空一格。"""
+    return " ".join(str(part) for part in parts if part)
 
 
 def picked_rows(sources, count):
@@ -447,6 +580,63 @@ class AddDialog(QDialog):
         return self.editor.toPlainText()
 
 
+class SummaryDialog(QDialog):
+    """一轮抓取跑完后的总结窗口：先说共几条变动，再逐条列出明细。
+
+    不开模态（和看图那个窗口同理）：总结是"看一眼"的东西，读的时候顺手点点
+    表格、打开个详情页都很自然，没必要把主窗口锁住。
+
+    没有变动时也照样弹（用户要的是每轮都有个收尾交代），此时藏掉明细那块空框。
+    """
+
+    def __init__(self, changes, total, failures, dark, parent=None):
+        super().__init__(parent)
+        self.changes = [c for c in changes or [] if isinstance(c, dict)]
+        self.total = total
+        self.failures = failures
+        self.setWindowTitle(SUMMARY_TITLE)
+        self.setMinimumWidth(360)  # 没有明细时窗口会收得很窄，别让按钮挤成一团
+
+        layout = QVBoxLayout(self)
+        self.headline = QLabel()
+        font = self.headline.font()
+        font.setBold(True)  # 头一句「共 N 条变动」要压过下面的明细
+        self.headline.setFont(font)
+        self.subtitle = QLabel()
+        self.subtitle.setWordWrap(True)
+        layout.addWidget(self.headline)
+        layout.addWidget(self.subtitle)
+
+        self.detail = QTextEdit()
+        self.detail.setReadOnly(True)  # 只读，但留着选中复制
+        self.detail.setMinimumSize(520, 240)
+        layout.addWidget(self.detail)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.button(QDialogButtonBox.Close).setText("关闭")
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.SetDark(dark)
+        # 定个大小而不是 adjustSize()：QTextEdit 的 sizeHint 跟着内容长，
+        # 几十条变动时会把窗口撑成一条竖带。写死之后长清单在里面滚。
+        if self.changes:
+            self.resize(620, 420)
+        else:
+            self.resize(460, 180)  # 没有明细，矮一点就够
+
+    def SetDark(self, dark):
+        """按主题重新渲染文案与配色（主窗口切换主题时再叫一次）。
+
+        文案本来跟主题无关，但一起重渲染最省事——改动只有一处，
+        不会出现"换了主题、数字还是旧的"这种对不上的情况。
+        """
+        self.headline.setText(change_headline(self.changes))
+        self.subtitle.setText(change_subtitle(self.total, self.failures))
+        self.detail.setHtml(changes_html(self.changes, dark))
+        self.detail.setVisible(bool(self.changes))  # 没有明细就别摆个空框
+
+
 class ReorderableTable(QTableWidget):
     """行可以拖拽排序的表格：把行拖到别处松手，顺序就变了。
 
@@ -617,6 +807,9 @@ class MainWindow(QMainWindow):
         self.poller = None
         self.names_learned = False  # 本次抓取是否学到了新名称（决定要不要回写清单）
         self.poller_stopped = False  # 本次抓取是否被「停止抓取」中止
+        self.run_changes = []    # 本次抓取的价格变动，跑完弹总结用（见 price_change）
+        self.run_failures = 0    # 本次抓取查询失败的条数：失败的那几件看不出变动
+        self.summary_dialog = None  # 最近一次弹的总结窗口，切主题时要跟着重画
         self.image_fetcher = ImageFetcher()  # 缩略图：key 是行号
         self.image_fetcher.fetched.connect(self.OnImageFetched)
         # 双击放大：另起一个 fetcher，因为它的 key 是预览请求号而不是行号。
@@ -1282,6 +1475,8 @@ class MainWindow(QMainWindow):
         self.last_note = ""  # 开始新的一轮抓取，不带着之前的降级提示
         self.names_learned = False
         self.poller_stopped = False
+        self.run_changes = []  # 上一轮的变动和失败数不带到这一轮的总结里
+        self.run_failures = 0
         self.ClearPrices()  # 先把价格清空，好一眼看出刷到哪一行了
         self.SetBusy(True)
         self.poller = PollerThread(
@@ -1315,6 +1510,11 @@ class MainWindow(QMainWindow):
                 result["price"],
                 result["sold_out"],
             )
+            change = price_change(previous, result)
+            if change is not None:
+                # 名字取这次抓到的（学不到就退回清单里的名字），总结里好认人
+                change["name"] = result["name"] or item["entry"].name or cluster_id
+                self.run_changes.append(change)
             # 第一次抓到的新商品写入缓存；已缓存的也顺手刷新名称、缩略图和价格
             self.store.upsert_item(
                 cluster_id,
@@ -1329,8 +1529,10 @@ class MainWindow(QMainWindow):
             if result["name"] and result["name"] != item["entry"].name:
                 self.names_learned = True
         else:
-            # 这次没抓到，还显示缓存里的价格，涨跌自然也就无从谈起
+            # 这次没抓到，还显示缓存里的价格，涨跌自然也就无从谈起；
+            # 但得记一笔，总结里"没有变动"才不至于连失败一起含糊过去
             item["delta"] = None
+            self.run_failures += 1
         item["values"] = result  # 失败的也记下来，重建表格时不会退回"待抓取"
 
         self.SetPriceCells(row, item)
@@ -1398,8 +1600,25 @@ class MainWindow(QMainWindow):
                 self.progress_label.setText(
                     "完成，已把商品名写回 watchlist.txt" + self.last_note
                 )
+            self.ShowSummary()
             return
         self.progress_label.setText("完成" + self.last_note)
+        self.ShowSummary()
+
+    def ShowSummary(self):
+        """弹总结窗口，说清这一轮的涨跌（见 SummaryDialog）。
+
+        只在正常跑完时弹：中途「停止抓取」那一轮只抓了一半，拿半份数据当
+        "总结"很容易让人以为其余商品没变化——那种情况该看的是表格里的「--」。
+        """
+        if self.summary_dialog is not None:
+            self.summary_dialog.close()
+            # 上一份还没关就换掉，顺手回收；留着引用会越堆越多
+            self.summary_dialog.deleteLater()
+        self.summary_dialog = SummaryDialog(
+            self.run_changes, len(self.rows), self.run_failures, self.dark, self
+        )
+        self.summary_dialog.show()
 
     def OnCellClick(self, row, col):
         if col == COL_LINK:
@@ -1439,6 +1658,9 @@ class MainWindow(QMainWindow):
         selected = self.SelectedClusterIds()
         self.RenderTable()
         self.SelectItems(selected)
+        # 总结窗口还没关的话，涨跌那几格的颜色也得跟着换（它不在表格的重画范围内）
+        if self.summary_dialog is not None and self.summary_dialog.isVisible():
+            self.summary_dialog.SetDark(self.dark)
 
     # ---------------- 收尾 ----------------
 

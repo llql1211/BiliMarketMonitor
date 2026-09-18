@@ -865,6 +865,177 @@ def test_poll_finished_without_new_names(window, data_files):
     assert (data_files / "watchlist.txt").read_text(encoding="utf-8") == before
 
 
+# ---------------- 抓取总结 ----------------
+
+
+def _wait_run(w, wait_until):
+    """等这一轮抓取跑完，返回是否等到了。
+
+    不能等 IsPolling()：OnFetchPrices 里线程要先 start()，那一下 isRunning()
+    还是 False，等它等于白等（抓取根本还没跑起来）。「开始抓取」按钮放开才是
+    收尾干完了（见 SetBusy），和另一个抓取用例同一个口径。
+    """
+    return wait_until(lambda: w.btn_fetch.isEnabled(), timeout=10)
+
+
+def test_full_run_pops_a_summary_of_the_changes(window, monkeypatch, wait_until):
+    """跑完弹总结：先说共几条变动，再逐条列出是谁、从多少变到多少。"""
+    w = window("10000008780 | 甲\n10000000002 | 乙\n")
+    _seed_cache(w, price="¥50")  # 甲：50 -> 44
+    _seed_cache(w, price="¥44", cluster_id="10000000002")  # 乙：44 -> 50
+    w.LoadWatchlist(w.watchlist_path)
+    monkeypatch.setattr(
+        client,
+        "fetch_cluster",
+        _fetch_by_id(
+            {
+                "10000008780": raw_ok(name="甲", price="¥44"),
+                "10000000002": raw_ok(name="乙", price="¥50"),
+            }
+        ),
+    )
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
+
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+
+    dialog = w.summary_dialog
+    assert dialog is not None and dialog.isVisible()
+    assert dialog.windowTitle() == app_module.SUMMARY_TITLE
+    assert dialog.headline.text() == "共 2 条变动：降价 1 · 涨价 1"
+    assert dialog.subtitle.text() == "本次共抓取 2 件商品"
+    # 明细按清单顺序：甲在前、乙在后，各自的涨跌对得上
+    detail = dialog.detail.toPlainText()
+    assert detail.index("甲") < detail.index("乙")
+    assert "¥50 → ¥44" in detail and "↓ 6" in detail
+    assert "¥44 → ¥50" in detail and "↑ 6" in detail
+
+
+def test_summary_still_pops_when_nothing_changed(window, monkeypatch, wait_until):
+    """价格没变也弹一次：每轮都有个明确收尾，此时没有明细可列。"""
+    w = window("10000008780 | 甲\n")
+    _seed_cache(w, price="¥44")
+    w.LoadWatchlist(w.watchlist_path)
+    monkeypatch.setattr(
+        client, "fetch_cluster", _fetch_by_id({"10000008780": raw_ok(name="甲", price="¥44")})
+    )
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
+
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+
+    assert w.summary_dialog.headline.text() == app_module.NO_CHANGE_TEXT
+    assert w.summary_dialog.subtitle.text() == "本次共抓取 1 件商品"
+    assert w.summary_dialog.detail.isVisible() is False  # 别摆个空框
+
+
+def test_first_fetch_is_not_counted_as_a_change(window, monkeypatch, wait_until):
+    """第一次抓到价格的商品不算"变动"：没有上一次可比，报了看着像在涨价。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    monkeypatch.setattr(
+        client, "fetch_cluster", _fetch_by_id({"10000008780": raw_ok(name="甲", price="¥44")})
+    )
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
+
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+
+    assert w.summary_dialog.headline.text() == app_module.NO_CHANGE_TEXT
+
+
+def test_sold_out_transition_reaches_the_summary(window, monkeypatch, wait_until):
+    """售罄状态变了也是变动：该报的报，但不拿售罄价跟之前的价格算涨跌。"""
+    w = window("10000008780 | 甲\n")
+    _seed_cache(w, price="¥44")
+    w.LoadWatchlist(w.watchlist_path)
+    monkeypatch.setattr(
+        client,
+        "fetch_cluster",
+        # 售罄响应里 firstPrice 装的是原价（见 parser 的说明）
+        _fetch_by_id({"10000008780": raw_ok(name="甲", price="¥138", sold_out=True)}),
+    )
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
+
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+
+    assert w.summary_dialog.headline.text() == "共 1 条变动：新售罄 1"
+    detail = w.summary_dialog.detail.toPlainText()
+    assert "已售罄" in detail
+    assert "¥44" in detail  # 此前现价留着，好知道它是从多少涨到售罄的
+    assert "↓" not in detail and "↑" not in detail
+
+
+def test_summary_mentions_failed_queries(window, monkeypatch, wait_until):
+    """有条目没抓到时要说一声：那几件这次看不出变动，不然"没变动"像在撒谎。"""
+    w = window("10000008780 | 甲\n10000000002 | 乙\n")
+    _seed_cache(w, price="¥50")  # 甲：50 -> 44
+    _seed_cache(w, price="¥44", cluster_id="10000000002")
+    w.LoadWatchlist(w.watchlist_path)
+    monkeypatch.setattr(
+        client,
+        "fetch_cluster",
+        _fetch_by_id(
+            {
+                "10000008780": raw_ok(name="甲", price="¥44"),
+                "10000000002": client.ApiError("查询失败"),
+            }
+        ),
+    )
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
+
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+
+    assert w.summary_dialog.headline.text() == "共 1 条变动：降价 1"
+    assert w.summary_dialog.subtitle.text() == (
+        "本次共抓取 2 件商品，其中 1 件查询失败（这几件看不出变动）"
+    )
+
+
+def test_stopped_run_shows_no_summary(window):
+    """中途「停止抓取」不弹总结：那轮只抓了一半，拿半份数据当总结会误导人。"""
+    w = window("10000008780\n")
+    w.poller_stopped = True
+    w.SetBusy(True)
+
+    w.OnPollFinished()
+
+    assert w.summary_dialog is None
+
+
+def test_next_summary_closes_the_previous_one(window):
+    """连抓两轮：上一份总结还开着就先关掉，别一窗一窗地往上堆。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.ShowSummary()
+    first = w.summary_dialog
+    w.ShowSummary()
+
+    assert w.summary_dialog is not first
+    assert first.isVisible() is False
+
+
+def test_summary_keeps_its_colors_when_the_theme_toggles(window):
+    """总结窗口不在表格的重画范围内，切主题时得单独叫它重画一遍。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.ApplyTheme(False)
+    w.run_changes = [
+        {"kind": "down", "name": "甲", "old_price": "¥50", "new_price": "¥44",
+         "delta": "↓ 6", "change": -6}
+    ]
+    w.ShowSummary()
+    assert theme.PRICE_DOWN_COLOR_LIGHT in w.summary_dialog.detail.toHtml().lower()
+
+    w.OnToggleTheme()
+
+    assert w.dark is True
+    assert theme.PRICE_DOWN_COLOR_DARK in w.summary_dialog.detail.toHtml().lower()
+
+
 # ---------------- 添加 / 删除 / 整理 ----------------
 
 
@@ -1985,6 +2156,108 @@ def test_price_delta(previous, previous_sold_out, current, current_sold_out, exp
         app_module.price_delta(previous, previous_sold_out, current, current_sold_out)
         == expected
     )
+
+
+@pytest.mark.parametrize(
+    "previous, result, kind, delta",
+    [
+        ({"price_text": "¥44"}, {"price": "¥50"}, "up", "↑ 6"),
+        ({"price_text": "¥50"}, {"price": "¥44"}, "down", "↓ 6"),
+        # 售罄前后不比价格（那两个数不是一回事），但状态本身变了要报
+        ({"price_text": "¥44"}, {"price": "¥50", "sold_out": True}, "sold_out", ""),
+        ({"price_text": "¥138", "sold_out": 1}, {"price": "¥44"}, "on_sale", ""),
+        # 没得比或没变：价格没动、两边都售罄、之前压根没抓到过价格
+        ({"price_text": "¥44"}, {"price": "¥44"}, None, ""),
+        ({"price_text": "¥44", "sold_out": 1}, {"price": "¥99", "sold_out": True}, None, ""),
+        ({"price_text": None}, {"price": "¥44"}, None, ""),
+        ({}, {"price": "¥44"}, None, ""),
+        (None, {"price": "¥44"}, None, ""),
+        ({"price_text": "面议"}, {"price": "¥44"}, None, ""),
+    ],
+)
+def test_price_change(previous, result, kind, delta):
+    """总结里的一条变动：涨/跌/售罄/恢复在售，没得比就不算一条。"""
+    change = app_module.price_change(previous, result)
+
+    if kind is None:
+        assert change is None
+        return
+    assert (change["kind"], change["delta"]) == (kind, delta)
+    assert change["old_price"] == previous["price_text"]
+    assert change["new_price"] == result["price"]
+
+
+def test_price_change_up_and_down_carry_the_number():
+    """涨跌那条要把数字带上，总结里才排得出「降了多少」。"""
+    up = app_module.price_change({"price_text": "¥44"}, {"price": "¥50"})
+    down = app_module.price_change({"price_text": "¥50"}, {"price": "¥44"})
+
+    assert up["change"] == 6
+    assert down["change"] == -6
+
+
+def test_change_headline_counts_first_then_breaks_down():
+    """头一句话先说共几条，再分门别类报数；顺序固定为跌、涨、售罄、恢复。"""
+    changes = [
+        {"kind": "up"},
+        {"kind": "down"},
+        {"kind": "down"},
+        {"kind": "sold_out"},
+    ]
+    assert app_module.change_headline(changes) == (
+        "共 4 条变动：降价 2 · 涨价 1 · 新售罄 1"
+    )
+
+
+@pytest.mark.parametrize("changes", [[], None, ["乱写的一条"]])
+def test_change_headline_without_changes(changes):
+    """一条变动都没有时直说没有，别报「共 0 条」。"""
+    assert app_module.change_headline(changes) == app_module.NO_CHANGE_TEXT
+
+
+def test_change_subtitle_mentions_failures():
+    """查失败的几件要交代：它们这次看不出变动，不说就像"一切正常"。"""
+    assert app_module.change_subtitle(12, 0) == "本次共抓取 12 件商品"
+    assert app_module.change_subtitle(12, 2) == (
+        "本次共抓取 12 件商品，其中 2 件查询失败（这几件看不出变动）"
+    )
+
+
+def test_changes_html_escapes_the_name():
+    """商品名是接口给的，带尖括号也不能把表格拆了。"""
+    markup = app_module.changes_html(
+        [{"kind": "up", "name": "<b>甲</b>", "old_price": "¥1", "new_price": "¥2",
+          "delta": "↑ 1", "change": 1}],
+        dark=False,
+    )
+
+    assert "&lt;b&gt;甲&lt;/b&gt;" in markup
+    assert "<b>甲</b>" not in markup
+
+
+@pytest.mark.parametrize(
+    "kind, expected",
+    [("sold_out", "已售罄"), ("on_sale", "恢复在售")],
+)
+def test_changes_html_shows_the_state_instead_of_a_delta(kind, expected):
+    """售罄那两类没有可比的价格：状态写在价格那格，不摆一个假的涨跌。"""
+    markup = app_module.changes_html(
+        [{"kind": kind, "name": "甲", "old_price": "¥44", "new_price": "¥138",
+          "delta": "", "change": None}],
+        dark=False,
+    )
+
+    assert expected in markup
+    assert "↑" not in markup and "↓" not in markup
+
+
+def test_changes_html_colors_the_delta_by_theme():
+    """涨跌那格的颜色跟着主题走，和表格里的涨跌是同一套色。"""
+    change = {"kind": "down", "name": "甲", "old_price": "¥50", "new_price": "¥44",
+              "delta": "↓ 6", "change": -6}
+
+    assert theme.PRICE_DOWN_COLOR_LIGHT in app_module.changes_html([change], dark=False)
+    assert theme.PRICE_DOWN_COLOR_DARK in app_module.changes_html([change], dark=True)
 
 
 def test_split_price_text():

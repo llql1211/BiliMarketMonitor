@@ -87,7 +87,8 @@ QPushButton:disabled {
 QLabel {
     background: transparent;
 }
-QPlainTextEdit {
+QPlainTextEdit, QTextEdit {
+    /* QTextEdit 用在抓取总结窗口里（渲染 HTML 明细表），配色与输入框一致 */
     background-color: #26272b;
     color: #e3e3e3;
     border: 1px solid #4a4d55;

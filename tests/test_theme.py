@@ -65,6 +65,14 @@ def test_row_number_gutter_matches_the_table_background(dark, table_bg):
     assert header_bg.group(1) == table_bg
 
 
+def test_dark_qss_paints_the_summary_editor_like_the_input_box():
+    """抓取总结的明细是 QTextEdit：暗色下得跟输入框同底色，不然是一块白。"""
+    assert re.search(
+        r"QPlainTextEdit\s*,\s*QTextEdit\s*\{[^}]*background-color:\s*#26272b",
+        theme.DARK_QSS,
+    ), "QTextEdit 没跟着 QPlainTextEdit 一起配色"
+
+
 @pytest.mark.parametrize("dark", [True, False])
 def test_apply_theme_sets_app_stylesheet(qapp, dark):
     """apply_theme 把对应 QSS 落到整个应用上。"""
