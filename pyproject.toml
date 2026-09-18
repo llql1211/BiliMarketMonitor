@@ -21,6 +21,7 @@ platforms = ["win-64"]
 
 [tool.pixi.tasks]
 start = { cmd = "python src/app.py", cwd = "." }
+shot = { cmd = "python tools/shot.py", cwd = "." }
 
 # pixi 不认 [project.optional-dependencies]，同一份依赖得在这里再写一次；
 # 把 test feature 并进默认环境，`pixi run test` 和 `pixi run start` 共用一个环境。

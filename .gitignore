@@ -4,6 +4,9 @@
 
 *.pyc
 
+# 临时脚本与产物：用完就删，不进仓库（可复用的工具在 tools/）
+tmp/
+
 # 本地数据
 data/cache.db
 data/cache.db-*
