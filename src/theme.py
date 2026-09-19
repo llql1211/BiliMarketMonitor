@@ -87,6 +87,20 @@ QPushButton:disabled {
 QLabel {
     background: transparent;
 }
+QLineEdit {
+    /* 设预期价格那个输入框。不给边框的话，输入框底色跟 QWidget 那层的对话框
+       底色一模一样，看上去就只剩两行字，看不出哪儿能填 */
+    background-color: #26272b;
+    color: #e3e3e3;
+    border: 1px solid #4a4d55;
+    border-radius: 4px;
+    padding: 4px;
+    selection-background-color: #3d5a80;
+    selection-color: #ffffff;
+}
+QLineEdit:focus {
+    border-color: #3d5a80;
+}
 QPlainTextEdit, QTextEdit {
     /* QTextEdit 用在抓取总结窗口里（渲染 HTML 明细表），配色与输入框一致 */
     background-color: #26272b;
@@ -198,6 +212,16 @@ def price_delta_color(change: int, dark: bool) -> QColor:
     if change < 0:
         return QColor(PRICE_DOWN_COLOR_DARK if dark else PRICE_DOWN_COLOR_LIGHT)
     return muted_color(dark)
+
+
+def expected_reached_color(dark: bool) -> QColor:
+    """现价跌到预期价以下时，「预期价格」那格的颜色：跟跌色同一个绿。
+
+    到价就是"便宜到位了"，方向和降价一致，没必要另调一个色。单写一个函数只是
+    让调用处读起来是「到价色」而不是「跌色」——颜色本身仍然只有
+    PRICE_DOWN_COLOR 一处定义，改配色时不会漏掉这一格。
+    """
+    return price_delta_color(-1, dark)
 
 
 def style_placeholder(widget, dark: bool):

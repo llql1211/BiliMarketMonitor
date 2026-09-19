@@ -37,6 +37,7 @@ from PyQt5.QtWidgets import (
     QDialogButtonBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -72,10 +73,10 @@ NO_THUMBNAIL_TEXT = "这一行还没有缩略图，先抓取一次再双击查�
 
 ROW_NUMBER_PADDING = 16  # 序号槽左右留白，免得数字贴着分隔线
 
-COL_IMG, COL_NAME, COL_CID, COL_PRICE, COL_REF, COL_AVG = 0, 1, 2, 3, 4, 5
-COL_DEAL_BASE = 6  # 成交① 占 6/7/8 三列
-COL_LINK = 9
-HEADERS = ["缩略图", "商品名", "clusterID", "现价", "原价", "近30天均价",
+COL_IMG, COL_NAME, COL_CID, COL_PRICE, COL_EXPECT, COL_REF, COL_AVG = 0, 1, 2, 3, 4, 5, 6
+COL_DEAL_BASE = 7  # 成交① 占 7/8/9 三列
+COL_LINK = 10
+HEADERS = ["缩略图", "商品名", "clusterID", "现价", "预期价格", "原价", "近30天均价",
            "成交①", "成交②", "成交③", "链接（点击打开）"]
 
 PENDING_TEXT = "…"      # 等待抓取
@@ -83,6 +84,19 @@ NO_DATA_TEXT = "—"      # 无数据
 CLEARED_TEXT = "--"     # 抓取开始前把价格清成这个，好看出刷到哪一行了
 FAILED_TEXT = "（查询失败）"
 SOLD_OUT_TEXT = "已售罄"  # 现价格的前缀：售罄时那一格装的不是市集现价
+
+# 「预期价格」列（用户自己设的参照价，存在 watchlist.txt 里）
+EXPECTED_DIALOG_TITLE = "设置预期价格"
+EXPECTED_DIALOG_LABEL = "现价低于它时这一格会变色；留空表示不设。"
+EXPECTED_HEADER_TIP = (
+    "自己设的目标价：现价低于它时这一格会变绿加粗\n"
+    "双击任意一行的这一格即可设置或修改，留空表示不设\n"
+    "存在 watchlist.txt 里，跟着清单一起备份"
+)
+SET_EXPECTED_TIP = "双击设置预期价格"
+EDIT_EXPECTED_TIP = "双击修改预期价格"
+EXPECTED_BAD_INPUT = "预期价格得是大于 0 的数字，比如 50 或 ¥50。"
+EXPECTED_BAD_TITLE = "预期价格认不出来"
 
 DELTA_ROLE = Qt.UserRole + 1        # 「现价」格末尾那截涨跌（形如「↓ 6」）
 DELTA_COLOR_ROLE = Qt.UserRole + 2  # 上面那截的颜色（随主题走，重画时重算）
@@ -156,6 +170,23 @@ def price_delta(previous_price, previous_sold_out, current_price, current_sold_o
     if change < 0:
         return f"↓ {_amount(change)}", change
     return None
+
+
+def expected_reached(expected_price, price, sold_out) -> bool:
+    """现价是不是已经跌到预期价以下了（到价）。
+
+    判"没得比"的口径与 price_delta 一致：
+    - 售罄行不比：那格的"现价"装的其实是原价（见 PriceText），拿它跟预期价
+      比出来的"到价"没有意义；
+    - 有一边认不出数字就不比：宁可这格不变色，也不要拿猜出来的数骗人。
+    """
+    if sold_out:
+        return False
+    target = parser.price_number(expected_price)
+    current = parser.price_number(price)
+    if target is None or current is None:
+        return False
+    return current < target
 
 
 def price_change(previous, result):
@@ -896,6 +927,7 @@ class MainWindow(QMainWindow):
         self.table.setIconSize(QSize(IMAGE_SIZE, IMAGE_SIZE))
         header.resizeSection(COL_IMG, IMAGE_SIZE + 8)
         header.resizeSection(COL_PRICE, 120)  # 要放得下「¥90.50 ↓ 12.30」这种
+        header.resizeSection(COL_EXPECT, 90)
         header.resizeSection(COL_REF, 90)
         header.resizeSection(COL_AVG, 100)
         for col in (COL_DEAL_BASE, COL_DEAL_BASE + 1, COL_DEAL_BASE + 2):
@@ -909,6 +941,7 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeaderItem(COL_LINK).setToolTip(
             f"点击「打开」用浏览器访问商品详情页\n链接由配置里的模板拼出：\n{template}"
         )
+        self.table.horizontalHeaderItem(COL_EXPECT).setToolTip(EXPECTED_HEADER_TIP)
         self.table.cellClicked.connect(self.OnCellClick)
         self.table.cellDoubleClicked.connect(self.OnCellDoubleClick)
         self.table.rows_dropped.connect(self.OnRowsDropped)
@@ -1038,10 +1071,72 @@ class MainWindow(QMainWindow):
             item.setIcon(QIcon(pixmap))
 
     def OnCellDoubleClick(self, row, col):
-        """双击缩略图看大图。双击别的格子不管：那儿的双击另有用途（改列宽等）。"""
-        if col != COL_IMG:
+        """双击缩略图看大图，双击「预期价格」改预期价。
+
+        双击别的格子不管：那儿的双击另有用途（改列宽等）。
+        """
+        if col == COL_IMG:
+            self.PreviewRow(row)
+        elif col == COL_EXPECT:
+            self.EditExpectedPrice(row)
+
+    def ExpectedPriceDialog(self, row):
+        """构造「设置预期价格」对话框（只造不弹）。
+
+        跟 exec_ 拆开是为了让测试和截图工具能直接拿到它：模态弹窗得有人点，
+        而这两个地方都不该被卡住。
+        """
+        entry = self.rows[row]["entry"]
+        dialog = QInputDialog(self)
+        dialog.setWindowTitle(EXPECTED_DIALOG_TITLE)
+        dialog.setInputMode(QInputDialog.TextInput)
+        dialog.setLabelText(f"{entry.name or entry.cluster_id} 的预期价格\n"
+                            f"{EXPECTED_DIALOG_LABEL}")
+        dialog.setTextValue(entry.expected_price or "")
+        # 按钮文字跟着项目里其他对话框走，别冒出一对英文
+        dialog.setOkButtonText("确定")
+        dialog.setCancelButtonText("取消")
+        return dialog
+
+    def EditExpectedPrice(self, row):
+        """双击「预期价格」格：弹输入框改这一行的预期价，确定后立刻写回清单。"""
+        if not 0 <= row < len(self.rows):
             return
-        self.PreviewRow(row)
+        dialog = self.ExpectedPriceDialog(row)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        text = dialog.textValue().strip()
+        if text:
+            value = parser.price_number(text)
+            # 认不出或不是正数就拦下来：存进去也永远不会到价，不如当场说清楚
+            if value is None or value <= 0:
+                QMessageBox.warning(self, EXPECTED_BAD_TITLE, EXPECTED_BAD_INPUT)
+                return
+        self.SetExpectedPrice(row, text)
+
+    def SetExpectedPrice(self, row, text):
+        """把预期价写进行模型并落盘；写文件失败就回滚。
+
+        不回滚的话会出现"表格里绿着、清单里其实没写"这种对不上的状态，
+        下次刷新清单一开，用户设的价就凭空没了。
+        """
+        entry = self.rows[row]["entry"]
+        before = entry.expected_price
+        entry.expected_price = text
+        self.SetPriceCells(row, self.rows[row])  # 只这一行要重画
+
+        if not self.SaveWatchlist():
+            entry.expected_price = before
+            self.SetPriceCells(row, self.rows[row])
+            return False
+
+        what = f"预期价 {text}" if text else "预期价（已清除）"
+        self.progress_label.setText(
+            f"已设置「{entry.name or entry.cluster_id}」的{what}，已写回 watchlist.txt"
+            + self.last_note
+        )
+        return True
 
     def PreviewRow(self, row):
         """打开某行的商品大图。这一行还没有缩略图时只在状态栏说一声。"""
@@ -1151,12 +1246,50 @@ class MainWindow(QMainWindow):
             cell.setData(DELTA_COLOR_ROLE, theme.price_delta_color(delta[1], self.dark))
         return cell
 
+    def ExpectedCell(self, expected_price, price, sold_out):
+        """「预期价格」格：到价了才变色，没到价就弱化显示。
+
+        没设 → 占位符 + 弱化色；设了没到价 → 原文 + 弱化色（它是用户设的参照值，
+        跟「原价」一样属于"有就行、别抢眼"）；到价 → 原文加粗 + 到价色，扫一眼
+        就看得见。这里不用判"值是不是个价格"：能进到 expected_price 的值要么是
+        输入框校验过的，要么是 links 解析时认过数字的（认不出的那段会被当成
+        名字的一部分，见 _split_fields）。
+
+        加粗跟近期成交那个高亮同一个路子：单靠颜色，色觉障碍的人看不出差别，
+        截图里也容易糊成一片。
+        """
+        text = str(expected_price) if expected_price else ""
+        if not text:
+            return self.MakeCell(
+                NO_DATA_TEXT, tooltip=SET_EXPECTED_TIP,
+                color=theme.muted_color(self.dark),
+            )
+
+        reached = expected_reached(text, price, sold_out)
+        cell = self.MakeCell(
+            text,
+            tooltip=_tips(
+                f"现价 {price} 已低于预期价 {text}" if reached else "",
+                EDIT_EXPECTED_TIP,
+            ),
+            color=(theme.expected_reached_color(self.dark) if reached
+                   else theme.muted_color(self.dark)),
+        )
+        if reached:
+            font = cell.font()
+            font.setBold(True)
+            cell.setFont(font)
+        return cell
+
     def SetPriceCells(self, row, item):
-        """填「现价 / 原价 / 近30天均价」三格。
+        """填「现价 / 原价 / 近30天均价」三格，外加跟着它们走的「预期价格」格。
 
         取值优先级：这次抓到的 > 缓存里上次抓到的 > 占位符。抓失败时退回缓存，
         而不是把已经看到过的价格清掉——一次网络抖动不该让人白记一遍；代价是
         得在提示里说清这个数是什么时候抓的（_cached_note）。
+
+        预期价是用户设的不是抓来的，但它变不变色要看现价，所以跟着一起重画：
+        不然抓完一轮，到价的行还挂着上一轮的旧颜色。
 
         首屏渲染（FillRow）和抓取回填（OnResultReady）都走这里，
         免得同一段渲染逻辑写两遍，哪天真改出不一致来。
@@ -1165,37 +1298,45 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, COL_PRICE, self.ClearedCell())
             self.table.setItem(row, COL_REF, self.ClearedCell())
             self.table.setItem(row, COL_AVG, self.ClearedCell())
-            return
-
-        values = item["values"] or {}
-        record = item["record"] or {}
-        if values.get("ok"):
-            price, sold_out = values.get("price"), values.get("sold_out")
-            reference, avg = values.get("reference_price"), values.get("avg_price")
-            note = ""
+            # 预期价不跟着清：它不是抓来的，没有"还没轮到"这回事，
+            # 只是暂时没得比，按没到价的样子摆着
+            price, sold_out = None, None
         else:
-            price, sold_out = record.get("price_text"), record.get("sold_out")
-            reference, avg = record.get("reference_price"), record.get("avg_text")
-            note = _cached_note(record.get("price_updated_at"))
+            values = item["values"] or {}
+            record = item["record"] or {}
+            if values.get("ok"):
+                price, sold_out = values.get("price"), values.get("sold_out")
+                reference, avg = values.get("reference_price"), values.get("avg_price")
+                note = ""
+            else:
+                price, sold_out = record.get("price_text"), record.get("sold_out")
+                reference, avg = record.get("reference_price"), record.get("avg_text")
+                note = _cached_note(record.get("price_updated_at"))
 
-        if sold_out and not reference:
-            # 售罄时接口整组不返回 price/priceSymbol，现价格里那个数就是原价
-            # （见 PriceText）。原价列照抄一份：不然同一行「现价」顶着个数字、
-            # 「原价」空着，看着像这格没抓到。
-            reference = price
+            if sold_out and not reference:
+                # 售罄时接口整组不返回 price/priceSymbol，现价格里那个数就是原价
+                # （见 PriceText）。原价列照抄一份：不然同一行「现价」顶着个数字、
+                # 「原价」空着，看着像这格没抓到。
+                reference = price
+
+            self.table.setItem(
+                row, COL_PRICE, self.PriceCell(price, sold_out, note, item.get("delta"))
+            )
+            self.table.setItem(row, COL_REF, self.ReferenceCell(reference))
+            self.table.setItem(
+                row, COL_AVG, self.MakeCell(str(avg) if avg else NO_DATA_TEXT)
+            )
 
         self.table.setItem(
-            row, COL_PRICE, self.PriceCell(price, sold_out, note, item.get("delta"))
-        )
-        self.table.setItem(row, COL_REF, self.ReferenceCell(reference))
-        self.table.setItem(
-            row, COL_AVG, self.MakeCell(str(avg) if avg else NO_DATA_TEXT)
+            row, COL_EXPECT,
+            self.ExpectedCell(item["entry"].expected_price, price, sold_out),
         )
 
     def ClearPrices(self):
         """抓取开始前把各行的价格清成「--」：从空开始涨，才看得出刷到哪一行了。
 
         清的是现价/原价/均价三格——它们由同一次请求一起回来，只清一个反而怪。
+        「预期价格」不在此列：那是用户设的，跟这次抓没抓到没关系（见 SetPriceCells）。
         标记记在行模型上（price_cleared），这样抓取中途换主题重画表格时，
         已经抓到的行照常显示新价，没轮到的还是「--」。
         """
@@ -1307,7 +1448,10 @@ class MainWindow(QMainWindow):
             values = item["values"] or {}
             record = item["record"] or {}
             name = (values.get("name") or record.get("name") or item["entry"].name or "")
-            items.append((item["entry"].cluster_id, name))
+            # 预期价跟着行走：清单是它的家（见 links 模块的说明），改过就得写回去
+            items.append(
+                (item["entry"].cluster_id, name, item["entry"].expected_price)
+            )
         notes = []
         try:
             links.save_watchlist(self.watchlist_path, items, notes)

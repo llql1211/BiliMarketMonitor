@@ -427,6 +427,227 @@ def test_theme_toggle_keeps_rows_and_selection(window):
     assert w.SelectedClusterIds() == {"10000000002"}
 
 
+# ---------------- 预期价格 ----------------
+
+
+@pytest.mark.parametrize(
+    "expected, price, sold_out, reached",
+    [
+        ("50", "¥44", False, True),      # 现价低于预期 → 到价
+        ("50", "¥50", False, False),     # 持平不算到价，用户要的是"低于"
+        ("50", "¥55", False, False),     # 还没跌到
+        ("50", "¥44", True, False),      # 售罄行不比：那格的"现价"其实是原价
+        ("五十", "¥44", False, False),   # 预期价认不出数字
+        ("50", "面议", False, False),    # 现价认不出数字
+        ("", "¥44", False, False),       # 没设预期价
+        (None, "¥44", False, False),
+    ],
+)
+def test_expected_reached(expected, price, sold_out, reached):
+    """到价判断：口径与 price_delta 一致，售罄和认不出数字都不比。"""
+    assert app_module.expected_reached(expected, price, sold_out) is reached
+
+
+def _expected_cell(w, row=0):
+    return w.table.item(row, app_module.COL_EXPECT)
+
+
+def test_expected_cell_states(window):
+    """预期价格格三态：没设 / 设了没到价 / 到价。"""
+    w = window("10000008780 | 甲 | 50\n10000008781 | 乙 | 60\n10000008782 | 丙\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, result_ok(price="¥44"))  # 44 < 50 → 到价
+    w.OnResultReady(1, result_ok(price="¥66"))  # 66 > 60 → 没到
+
+    reached = _expected_cell(w, 0)
+    assert reached.text() == "50"
+    assert reached.font().bold()
+    assert reached.foreground().color().name() == theme.expected_reached_color(w.dark).name()
+    assert "已低于预期价" in reached.toolTip()
+
+    waiting = _expected_cell(w, 1)
+    assert waiting.text() == "60"
+    assert not waiting.font().bold()  # 只有到价才加粗
+    assert waiting.foreground().color().name() == theme.muted_color(w.dark).name()
+
+    unset = _expected_cell(w, 2)
+    assert unset.text() == app_module.NO_DATA_TEXT
+    assert unset.toolTip() == app_module.SET_EXPECTED_TIP
+
+
+def test_expected_cell_follows_theme(window):
+    """到价色跟主题走——不重画的话换完主题会停在旧主题的绿上。"""
+    w = window("10000008780 | 甲 | 50\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, result_ok(price="¥44"))
+
+    before = _expected_cell(w).foreground().color().name()
+    w.OnToggleTheme()
+    after = _expected_cell(w).foreground().color().name()
+
+    assert after == theme.expected_reached_color(w.dark).name()
+    assert after != before
+
+
+def test_expected_cell_ignores_sold_out_price(window):
+    """售罄行的现价格装的是原价，不能拿它算到价——不然整屏假绿。"""
+    w = window("10000008780 | 甲 | 50\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, result_ok(price="¥44", sold_out=True))
+
+    assert not _expected_cell(w).font().bold()
+    assert _expected_cell(w).foreground().color().name() == theme.muted_color(w.dark).name()
+
+
+def test_expected_cell_ignores_unreadable_value_from_file(window):
+    """清单里手写的末段不是个数字：不当预期价，整段留在名字里（不丢内容）。"""
+    w = window("10000008780 | 甲 | 面议\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    assert w.rows[0]["entry"].expected_price == ""
+    # 整段都留在名字里，没被当成两截丢掉
+    assert w.table.item(0, app_module.COL_NAME).text() == "甲 面议"
+
+    w.OnResultReady(0, result_ok(price="¥44"))
+    assert _expected_cell(w).text() == app_module.NO_DATA_TEXT
+    assert _expected_cell(w).toolTip() == app_module.SET_EXPECTED_TIP
+
+
+def test_expected_cell_survives_price_clearing(window):
+    """抓取开始前清价格时，预期价不清——它不是抓来的，只是暂时没得比。"""
+    w = window("10000008780 | 甲 | 50\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, result_ok(price="¥44"))
+    assert _expected_cell(w).font().bold()
+
+    w.ClearPrices()
+
+    assert _expected_cell(w).text() == "50"  # 还在
+    assert not _expected_cell(w).font().bold()  # 现价没了，按没到价摆着
+    assert w.table.item(0, app_module.COL_PRICE).text() == app_module.CLEARED_TEXT
+
+
+def _fake_expected_dialog(monkeypatch, text, accepted=True):
+    """把预期价输入框换成直接给文本的假弹窗（真弹窗会卡住测试）。"""
+
+    class _Dialog:
+        def exec_(self):
+            return QDialog.Accepted if accepted else QDialog.Rejected
+
+        def textValue(self):
+            return text
+
+    monkeypatch.setattr(
+        app_module.MainWindow, "ExpectedPriceDialog", lambda self, row: _Dialog()
+    )
+
+
+def test_double_click_expected_cell_opens_editor(window, monkeypatch):
+    """双击缩略图看大图，双击预期价格格才开编辑器，双击别的格子什么都不做。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    opened = []
+    monkeypatch.setattr(w, "PreviewRow", lambda row: opened.append(("preview", row)))
+    monkeypatch.setattr(
+        w, "EditExpectedPrice", lambda row: opened.append(("expected", row))
+    )
+
+    w.OnCellDoubleClick(0, app_module.COL_IMG)
+    w.OnCellDoubleClick(0, app_module.COL_EXPECT)
+    w.OnCellDoubleClick(0, app_module.COL_PRICE)
+    w.OnCellDoubleClick(0, app_module.COL_NAME)
+
+    assert opened == [("preview", 0), ("expected", 0)]
+
+
+def test_set_expected_price_writes_watchlist(window, monkeypatch):
+    """设了预期价要立刻落盘，重新读清单还在（不然关掉程序就白设了）。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    _fake_expected_dialog(monkeypatch, "50")
+
+    w.EditExpectedPrice(0)
+
+    assert w.rows[0]["entry"].expected_price == "50"
+    assert "预期价 50" in w.progress_label.text()
+    reloaded = links.load_links(w.watchlist_path)
+    assert [(e.cluster_id, e.expected_price) for e in reloaded] == [("10000008780", "50")]
+    # 落盘了就该按新价重画：现价 44 低于 50，这一格得绿起来
+    w.OnResultReady(0, result_ok(price="¥44"))
+    assert _expected_cell(w).font().bold()
+
+
+def test_clear_expected_price(window, monkeypatch):
+    """输入框留空 = 取消设置：清单里那段跟着消失，格子回到占位符。"""
+    w = window("10000008780 | 甲 | 50\n")
+    w.LoadWatchlist(w.watchlist_path)
+    _fake_expected_dialog(monkeypatch, "   ")
+
+    w.EditExpectedPrice(0)
+
+    assert w.rows[0]["entry"].expected_price == ""
+    assert _expected_cell(w).text() == app_module.NO_DATA_TEXT
+    assert "已清除" in w.progress_label.text()
+    assert [e.expected_price for e in links.load_links(w.watchlist_path)] == [""]
+
+
+def test_cancel_expected_price_dialog_changes_nothing(window, monkeypatch):
+    """点取消什么都不改，也不写文件。"""
+    w = window("10000008780 | 甲 | 50\n")
+    w.LoadWatchlist(w.watchlist_path)
+    with open(w.watchlist_path, encoding="utf-8") as f:
+        before = f.read()
+    _fake_expected_dialog(monkeypatch, "80", accepted=False)
+
+    w.EditExpectedPrice(0)
+
+    assert w.rows[0]["entry"].expected_price == "50"
+    with open(w.watchlist_path, encoding="utf-8") as f:
+        assert f.read() == before
+
+
+@pytest.mark.parametrize("text", ["面议", "0", "-5", "abc"])
+def test_expected_price_rejects_unusable_input(window, monkeypatch, msgboxes, text):
+    """认不出或不是正数的输入拦下来：存进去也永远不会到价。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    _fake_expected_dialog(monkeypatch, text)
+
+    w.EditExpectedPrice(0)
+
+    assert w.rows[0]["entry"].expected_price == ""
+    assert msgboxes[-1]["kind"] == "warning"
+    assert msgboxes[-1]["text"] == app_module.EXPECTED_BAD_INPUT
+
+
+def test_expected_price_rolls_back_when_watchlist_write_fails(window, monkeypatch, msgboxes):
+    """写清单失败时回滚：不留"表格里绿着、清单里其实没写"这种对不上的状态。"""
+    w = window("10000008780 | 甲 | 50\n")
+    w.LoadWatchlist(w.watchlist_path)
+    monkeypatch.setattr(
+        links, "save_watchlist", lambda *a, **k: (_ for _ in ()).throw(OSError("磁盘满"))
+    )
+    _fake_expected_dialog(monkeypatch, "80")
+
+    w.EditExpectedPrice(0)
+
+    assert w.rows[0]["entry"].expected_price == "50"  # 退回原值
+    assert _expected_cell(w).text() == "50"
+
+
+def test_normalize_keeps_expected_price(window, monkeypatch):
+    """整理清单重写整个文件，预期价不能在这一步丢掉。"""
+    w = window("10000008780 | 甲 | 50\n10000008781 | 乙 | 88\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.OnNormalize()
+
+    assert [(e.cluster_id, e.expected_price) for e in links.load_links(w.watchlist_path)] == [
+        ("10000008780", "50"),
+        ("10000008781", "88"),
+    ]
+
+
 # ---------------- 缓存价格 / 涨跌 ----------------
 
 
