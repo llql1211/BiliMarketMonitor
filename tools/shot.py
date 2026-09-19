@@ -83,6 +83,53 @@ def use_sandbox(source, sandbox, keep):
     store.default_db_path = lambda: str(sandbox / "cache.db")
 
 
+def seed_expected_prices():
+    """往沙盒清单里塞两行预期价，好让表格场景看出这一列的三种样子。
+
+    只动沙盒副本，真实清单一个字都不改——出图用的数据必须是"看一眼就能丢"的。
+
+    价格按缓存里的现价推：一行定得比现价高（到价，绿），一行定得比现价低
+    （没到，灰），其余的行不设（占位符）。挑的是缓存里有价、且没售罄的商品
+    ——售罄行按设计不比预期价（那格的"现价"其实是原价），挑中它就看不出绿色，
+    图就白出了。按现价推而不是写死数字，是为了缓存换了也不至于整列失真。
+    """
+    import links
+    import parser
+    import store
+
+    path = links.default_watchlist_path()
+    if not os.path.exists(path):
+        return
+    entries = links.load_links(path)
+
+    db = store.Store(store.default_db_path())
+    try:
+        priced = []
+        for entry in entries:
+            record = db.get_item(entry.cluster_id) or {}
+            price = parser.price_number(record.get("price_text"))
+            if price and not record.get("sold_out"):
+                priced.append((entry, price))
+            if len(priced) == 2:
+                break
+    finally:
+        db.close()
+
+    if len(priced) < 2:
+        return  # 缓存还是空的（比如第一次跑），这次就不摆样本了
+    for (entry, price), factor in zip(priced, (1.2, 0.5)):
+        entry.expected_price = _amount(price * factor)
+
+    links.save_watchlist(
+        path, [(e.cluster_id, e.name, e.expected_price) for e in entries]
+    )
+
+
+def _amount(value) -> str:
+    """60.0 -> "60"、60.5 -> "60.5"：别在清单里留一串没用的零。"""
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
 # ---------------- 场景 ----------------
 
 
@@ -150,6 +197,32 @@ def _summary_many(dark):
     return SummaryDialog(changes, 40, 0, dark)
 
 
+# 场景里造出来、但只有 Qt 那边认得的对象得在这儿挂住：Python 这边一回收，
+# C++ 那边跟着销毁，出图时就只剩个"wrapped C/C++ object has been deleted"
+_KEEP = []
+
+
+@scene("expected-dialog")
+def _expected_dialog(dark):
+    """双击「预期价格」弹出的输入框。
+
+    单独看它一眼是因为这框里的单行输入框（QLineEdit）在 QSS 里没有专属规则，
+    暗色下只吃到 QWidget 那条通配背景——边框、选中态对不对只有出图才知道。
+    """
+    import app
+    import links
+
+    window = app.MainWindow()
+    window.ApplyTheme(dark)
+    path = links.default_watchlist_path()
+    if os.path.exists(path):
+        window.LoadWatchlist(path)
+    if not window.rows:
+        raise SystemExit("沙盒清单是空的，这个场景得有商品才弹得出输入框")
+    _KEEP.append(window)  # 输入框是它的子窗口，它一被回收图也就没了
+    return window.ExpectedPriceDialog(0)
+
+
 @scene("main", settle=1.5)
 def _main(dark):
     """真窗口：清单和缓存都来自沙盒，缩略图靠 settle 等它落上来。"""
@@ -211,6 +284,7 @@ def main(argv):
 
     out = Path(args.out) if args.out else DEFAULT_OUT
     use_sandbox(Path(args.data) if args.data else SOURCE_DATA, SANDBOX, args.keep)
+    seed_expected_prices()
     out.mkdir(parents=True, exist_ok=True)
 
     for name in sorted(wanted):
