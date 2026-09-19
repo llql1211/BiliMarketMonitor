@@ -13,27 +13,42 @@ import links
 @pytest.mark.parametrize(
     "line, expected",
     [
-        ("10000008780", ("10000008780", "")),
-        ("10000008780 | 名字", ("10000008780", "名字")),
-        ("10000008780  |  名字", ("10000008780", "名字")),
+        ("10000008780", ("10000008780", "", "")),
+        ("10000008780 | 名字", ("10000008780", "名字", "")),
+        ("10000008780  |  名字", ("10000008780", "名字", "")),
+        # 第三段是预期价；没设预期价的行维持老的两段写法
+        ("10000008780 | 名字 | 50", ("10000008780", "名字", "50")),
+        ("10000008780 | 名字 | ¥1,299.50", ("10000008780", "名字", "¥1,299.50")),
+        # 名称未知但设了预期价：中间那段留空，靠末段是价格来认
+        ("10000008780 |  | 50", ("10000008780", "", "50")),
+        # 末段不是数字就不当预期价；多余段粘回名字里，不丢东西
+        ("10000008780 | 名字 | 50 | 多余", ("10000008780", "名字 50 多余", "")),
+        ("10000008780 | 名字 | 40 | 50", ("10000008780", "名字 40", "50")),
+        # 名字带 "|" 的手工行：末段不像价格，整段按老规矩当名字
+        ("10000008780 | 甲|乙", ("10000008780", "甲 乙", "")),
+        ("10000008780 | 甲|50", ("10000008780", "甲", "50")),
         (
             "https://mall.bilibili.com/neul-next/resell/detail.html?"
             "clusterId=10000008780&share_medium=android&bbid=abc",
-            ("10000008780", ""),
+            ("10000008780", "", ""),
         ),
         (
             "https://mall.bilibili.com/detail?clusterId=10000008780&x=1 | 分享的名字",
-            ("10000008780", "分享的名字"),
+            ("10000008780", "分享的名字", ""),
         ),
-        ("# 注释行", (None, None)),
-        ("", (None, None)),
-        ("   ", (None, None)),
-        ("abc", (None, None)),
-        ("https://example.com/page?other=1", (None, None)),
+        (
+            "https://mall.bilibili.com/detail?clusterId=10000008780&x=1 | 分享的名字 | 88",
+            ("10000008780", "分享的名字", "88"),
+        ),
+        ("# 注释行", (None, None, "")),
+        ("", (None, None, "")),
+        ("   ", (None, None, "")),
+        ("abc", (None, None, "")),
+        ("https://example.com/page?other=1", (None, None, "")),
     ],
 )
 def test_parse_line_cases(line, expected):
-    """纯 ID / 带名 / 分享链接 / 注释 / 空白 / 乱码各形态的解析结果。"""
+    """纯 ID / 带名 / 带预期价 / 分享链接 / 注释 / 空白 / 乱码各形态的解析结果。"""
     assert links.parse_line(line) == expected
 
 
@@ -83,6 +98,49 @@ def test_save_watchlist_format(tmp_path):
     assert lines[3] == "1001 | 甲"
     assert lines[4] == "1002"
     assert lines[5] == ""  # 末尾换行产生的空串
+
+
+def test_save_watchlist_format_with_expected_price(tmp_path):
+    """设了预期价才写第三段：没设的行不多一个空尾巴，名称空着也留出中间那段。"""
+    path = tmp_path / "watchlist.txt"
+    links.save_watchlist(
+        str(path),
+        [("1001", "甲", "50"), ("1002", "乙"), ("1003", "", "88"), ("1004", "", "")],
+    )
+    lines = path.read_text(encoding="utf-8").split("\n")
+    assert lines[3] == "1001 | 甲 | 50"
+    assert lines[4] == "1002 | 乙"
+    assert lines[5] == "1003 |  | 88"  # 名称空着也得占住第二段，解析是按位置认的
+    assert lines[6] == "1004"
+
+
+def test_expected_price_roundtrip(tmp_path):
+    """设过的预期价写出去再读回来还在；没设的读回来是空串。"""
+    path = tmp_path / "watchlist.txt"
+    links.save_watchlist(str(path), [("1001", "甲", "50"), ("1002", "乙")])
+    entries = links.load_links(str(path))
+    assert [(e.cluster_id, e.name, e.expected_price) for e in entries] == [
+        ("1001", "甲", "50"),
+        ("1002", "乙", ""),
+    ]
+
+
+def test_load_links_old_format_without_expected_price(tmp_path):
+    """老清单（只有 ID 和名称两段）读进来预期价是空的，不用先手工改格式。"""
+    path = tmp_path / "watchlist.txt"
+    path.write_text("1001 | 甲\n1002\n", encoding="utf-8")
+    entries = links.load_links(str(path))
+    assert [(e.cluster_id, e.expected_price) for e in entries] == [
+        ("1001", ""),
+        ("1002", ""),
+    ]
+
+
+def test_save_watchlist_cleans_pipe_in_expected_price(tmp_path):
+    """预期价里的 "|" 会被清掉，免得写出一行下次读进来就散架的清单。"""
+    path = tmp_path / "watchlist.txt"
+    links.save_watchlist(str(path), [("1001", "甲", "5|0")])
+    assert [e.expected_price for e in links.load_links(str(path))] == ["5 0"]
 
 
 def test_save_watchlist_no_tmp_leftover(tmp_path):
@@ -175,8 +233,8 @@ def test_build_detail_url_unusable_returns_empty(cluster_id, template):
 
 @pytest.mark.parametrize("line", [None, 42, b"1001", ["1001"], {"id": "1"}])
 def test_parse_line_non_string(line):
-    """非字符串入参（None/数字/字节）返回 (None, None)，不抛 AttributeError。"""
-    assert links.parse_line(line) == (None, None)
+    """非字符串入参（None/数字/字节）返回 (None, None, "")，不抛 AttributeError。"""
+    assert links.parse_line(line) == (None, None, "")
 
 
 @pytest.mark.parametrize("extra_junk", ["", "1001 二\n"])
@@ -271,10 +329,10 @@ def test_save_watchlist_cleans_name_on_roundtrip(tmp_path):
 @pytest.mark.parametrize(
     "item",
     [
-        "1001",           # 字符串被当成 (id, name) 拆 → 拆不动
-        ("1001",),        # 缺名称
-        ("1001", "a", "b"),  # 多一项
-        ("abc", "名字"),   # ID 不是数字
+        "1001",                  # 字符串会被逐字拆开
+        ("1001",),               # 缺名称
+        ("1001", "a", "b", "c"),  # 多一项
+        ("abc", "名字"),          # ID 不是数字
         (None, "名字"),
         ("", "名字"),
     ],

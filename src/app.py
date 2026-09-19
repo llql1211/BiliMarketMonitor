@@ -1334,14 +1334,17 @@ class MainWindow(QMainWindow):
         for line in dialog.text().splitlines():
             if not line.strip() or line.strip().startswith("#"):
                 continue  # 空行 / 注释行
-            cluster_id, name = links.parse_line(line)
+            cluster_id, name, expected_price = links.parse_line(line)
             if cluster_id is None:
                 invalid += 1
                 continue
             if cluster_id in seen:  # 同一批里重复的只留第一条
                 continue
             seen.add(cluster_id)
-            entries.append(links.LinkEntry(cluster_id, name, line.strip()))
+            # 粘进来的行里带了第三段（预期价）就一并收下，跟清单里是同一套格式
+            entries.append(
+                links.LinkEntry(cluster_id, name, expected_price, line.strip())
+            )
 
         if not entries:
             QMessageBox.warning(

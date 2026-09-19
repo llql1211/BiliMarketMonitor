@@ -2,10 +2,17 @@
 
 清单由程序格式化维护，每行形如：
 
-    <clusterId> | <商品名>
+    <clusterId> | <商品名> | <预期价>
 
-商品名未知时只写 clusterId。为了兼容首次导入和手工编辑，
-读入时同时接受分享链接（含 share_medium、bbid 等无关参数）和纯数字 ID。
+商品名未知时只写 clusterId；预期价是用户自己设的，只有设过的行才写这一段，
+没设的行维持老样子（两段甚至一段），老清单原样读得进来。
+
+预期价放在清单里而不是缓存库里：它是抓不回来的用户意图，而缓存库按
+store 模块自己的说法是「丢了还能重新抓」的加速层，不该存不可再生的东西。
+清单还自带 .bak 备份，也能手工批量改价。
+
+为了兼容首次导入和手工编辑，读入时同时接受分享链接（含 share_medium、
+bbid 等无关参数）和纯数字 ID。
 
 清单是用户会手工编辑的文件，本模块不假设里面的内容一定规范：
 编码可能被记事本改成 GBK，行可能是随手粘的一坨，名字里可能带 "|" 或换行。
@@ -19,15 +26,20 @@ import re
 import shutil
 from dataclasses import dataclass
 
+import parser  # 借它的 price_number 判「最后一段是不是价格」，跟界面同一口径
+
 # 从链接中解析 clusterId，如 "...&clusterId=10000008780&..."
 _CLUSTER_ID_RE = re.compile(r"clusterId=(\d+)")
-# 纯数字 ID（可带 "| 名称" 后缀）
-_PLAIN_ID_RE = re.compile(r"^(\d+)\s*(?:\|\s*(.*))?$")
+# 纯数字 ID（名称和预期价已在 _split_fields 里切走了）
+_PLAIN_ID_RE = re.compile(r"^(\d+)$")
 # 商品名长度上限：清单是给人看的，超长名字只会挤爆界面
 _MAX_NAME_LEN = 100
+# 预期价长度上限（"¥1,299.50" 这种写法也够用了）
+_MAX_PRICE_LEN = 20
 
 _HEADER = (
-    "# 监视清单：每行格式 <clusterId> | <商品名>，名称未知时只写 clusterId",
+    "# 监视清单：每行格式 <clusterId> | <商品名> | <预期价>，"
+    "名称未知时只写 clusterId，没设预期价的行不写最后一段",
     "# 由程序维护，手工修改后点界面上的「刷新商品列表」同步",
 )
 
@@ -35,30 +47,34 @@ _HEADER = (
 @dataclass
 class LinkEntry:
     cluster_id: str
-    name: str = ""  # 清单里记录的商品名，可能为空（尚未抓取过）
-    raw: str = ""   # 原始行，仅用于排查问题
+    name: str = ""            # 清单里记录的商品名，可能为空（尚未抓取过）
+    expected_price: str = ""  # 用户设的预期价，空串表示没设
+    raw: str = ""             # 原始行，仅用于排查问题
 
 
 def parse_line(line: str):
-    """解析一行，返回 (clusterId, name)；无法识别返回 (None, None)。"""
+    """解析一行，返回 (clusterId, name, 预期价)；无法识别返回 (None, None, "")。
+
+    后两项拿不准时给空串而不是 None：调用方（界面、清单写回）都是按字符串
+    处理的，混进 None 只会逼着每处都判一次空。
+    """
     if not isinstance(line, str):  # 调用方可能递进来 None / 数字
-        return None, None
+        return None, None, ""
     text = line.strip()
     if not text or text.startswith("#"):  # 空行 / 注释行
-        return None, None
+        return None, None, ""
 
-    match = _CLUSTER_ID_RE.search(text)  # 分享链接
+    head, name, expected = _split_fields(text)
+
+    match = _CLUSTER_ID_RE.search(head)  # 分享链接
     if match:
-        name = ""
-        if "|" in text:
-            name = _clean_name(text.split("|", 1)[1])
-        return match.group(1), name
+        return match.group(1), _clean_name(name), _clean_price(expected)
 
-    match = _PLAIN_ID_RE.match(text)  # 纯数字 ID，可带 "| 名称"
+    match = _PLAIN_ID_RE.match(head)  # 纯数字 ID
     if match:
-        return match.group(1), _clean_name(match.group(2) or "")
+        return match.group(1), _clean_name(name), _clean_price(expected)
 
-    return None, None
+    return None, None, ""
 
 
 def load_links(path: str, notes=None):
@@ -78,7 +94,7 @@ def load_links(path: str, notes=None):
     seen = set()
     unparsed = 0
     for line in text.splitlines():
-        cluster_id, name = parse_line(line)
+        cluster_id, name, expected_price = parse_line(line)
         if cluster_id is None:
             # 空行/注释行是正常的，只有"看着有内容却认不出来"才算异常
             if line.strip() and not line.strip().startswith("#"):
@@ -87,7 +103,7 @@ def load_links(path: str, notes=None):
         if cluster_id in seen:
             continue
         seen.add(cluster_id)
-        entries.append(LinkEntry(cluster_id, name, line.strip()))
+        entries.append(LinkEntry(cluster_id, name, expected_price, line.strip()))
 
     if unparsed:
         _note(
@@ -101,20 +117,30 @@ def load_links(path: str, notes=None):
 def save_watchlist(path: str, items, notes=None) -> int:
     """按规范格式原子写回清单，返回被跳过的条目数。
 
-    items 为 [(clusterId, 商品名)]，顺序即写入顺序；名称沿用文件里已有的值。
-    条目形状不对/ID 不是纯数字的跳过不写；名字里的 "|" 和换行会被清洗掉
-    （否则会写出一行坏清单，下次读进来就全乱了）。
+    items 为 [(clusterId, 商品名[, 预期价])]，顺序即写入顺序；名称沿用文件里
+    已有的值，预期价省略等同于没设。条目形状不对/ID 不是纯数字的跳过不写；
+    名字和预期价里的 "|"、换行会被清洗掉（否则会写出一行坏清单，下次读进来
+    就全乱了）。
+
+    没设预期价时只写前两段（甚至只有 ID），免得老清单被一堆空尾巴撑开。
     写前留一份 path + ".bak" 备份（只留第一次的），并用临时文件 + 替换避免写坏。
     """
     lines = list(_HEADER) + [""]
     skipped = 0
     for item in items or []:
-        cluster_id, name = _split_item(item)
+        cluster_id, name, expected_price = _split_item(item)
         if cluster_id is None:
             skipped += 1
             continue
         name = _clean_name(name)
-        lines.append(f"{cluster_id} | {name}" if name else cluster_id)
+        expected_price = _clean_price(expected_price)
+        if not name and not expected_price:
+            lines.append(cluster_id)
+        elif not expected_price:
+            lines.append(f"{cluster_id} | {name}")
+        else:
+            # 名称空着也得留出中间那段：解析是按位置认预期价的
+            lines.append(f"{cluster_id} | {name} | {expected_price}")
 
     if skipped:
         _note(notes, f"有 {skipped} 条记录格式不对（ID 不是纯数字），已跳过不写入")
@@ -183,13 +209,44 @@ def _read_text(path: str):
         return f.read(), "watchlist 编码无法识别，已忽略非法字节读入（个别字可能显示为 ?）"
 
 
+def _split_fields(text: str):
+    """把一行切成 (ID/链接, 商品名, 预期价)，缺的段给空串。
+
+    预期价认的是「最后一段，且它真像个价格」，不是按位置取第三段：名字里带
+    "|" 的手工行本来就存在（"甲|乙" 那条路径有测试守着），按位置切会把名字
+    从竖线处剁掉一截。加一层"得是价格"的判断，至少不会冤枉 "甲|乙"。
+
+    代价是名字真以 "| 数字" 结尾时会被认成预期价。程序写回时名字里的 "|" 早
+    被 _clean_name 清掉了，只剩手工编的行有这风险；而且认错了看得见——价格列
+    上会多出一个数，不是悄悄少东西。
+
+    中间那几段粘回去当名字（不多不少正好贴着 ID 和预期价两侧），免得名字里
+    的竖线被当成两段丢掉。
+    """
+    parts = text.split("|")
+    head = parts[0].strip()
+    if len(parts) >= 3:
+        last = parts[-1].strip()
+        if parser.price_number(last) is not None:
+            return head, "|".join(parts[1:-1]).strip(), last
+    return head, "|".join(parts[1:]).strip() if len(parts) > 1 else "", ""
+
+
 def _split_item(item):
-    """拆开 (clusterId, 名称) 并校验 ID；形状不对返回 (None, "")。"""
-    try:
+    """拆开 (clusterId, 名称[, 预期价]) 并校验 ID；形状不对返回 (None, "", "")。
+
+    预期价可以省略：只关心 ID 和名称的调用方不用凑一个空字符串出来。
+    """
+    if not isinstance(item, (tuple, list)):
+        return None, "", ""  # 字符串会被逐字拆开，正好挡在门外
+    if len(item) == 2:
         cluster_id, name = item
-    except (TypeError, ValueError):
-        return None, ""
-    return _clean_id(cluster_id), name
+        expected_price = ""
+    elif len(item) == 3:
+        cluster_id, name, expected_price = item
+    else:
+        return None, "", ""
+    return _clean_id(cluster_id), name, expected_price
 
 
 def _clean_id(cluster_id):
@@ -206,6 +263,20 @@ def _clean_name(name) -> str:
         return ""
     text = " ".join(name.replace("|", " ").split())
     return text[:_MAX_NAME_LEN]
+
+
+def _clean_price(value) -> str:
+    """预期价清洗：同样只清掉会破坏清单格式的字符并限长，不校验是不是数字。
+
+    "认不认得出这是个价格"由界面层说了算（那边有 parser.price_number）：
+    这里不认识数字，认错了就会把用户手写的内容从清单里抹掉，而清单是用户
+    能直接编辑的文件。界面认不出时那格显示「—」并说明原因，文件里的原值
+    原样留着，等用户自己改。
+    """
+    if not isinstance(value, str):
+        return ""
+    text = " ".join(value.replace("|", " ").split())
+    return text[:_MAX_PRICE_LEN]
 
 
 def _note(notes, message: str):
