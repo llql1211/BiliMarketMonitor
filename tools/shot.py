@@ -241,6 +241,31 @@ def _main(dark):
 
 # ---------------- 渲染 ----------------
 
+# offscreen 平台插件在 Windows 上不带字体库（QFontDatabase().families() 是空的），
+# 字一个都画不出来：出图就成了"有框有线、没字"，正好把最该看的东西看没了。
+# 这儿手动塞几个系统字体进去；缺哪个跳哪个，找不到就还是老样子。
+FALLBACK_FONTS = (
+    "C:/Windows/Fonts/msyh.ttc",  # 微软雅黑：界面正文用的就是它
+    "C:/Windows/Fonts/simhei.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+    "/System/Library/Fonts/PingFang.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+)
+
+
+def load_fonts():
+    """没字体库时补上系统字体。有字体库的平台（开真窗口那种）一个字不动。
+
+    得在 QApplication 之后、建控件之前调——字体库是挂在 application 上的。
+    """
+    from PyQt5.QtGui import QFontDatabase
+
+    if QFontDatabase().families():
+        return  # 平台自带字体库，没我们什么事
+    for path in FALLBACK_FONTS:
+        if os.path.exists(path):
+            QFontDatabase.addApplicationFont(path)
+
 
 def render(widget, path, dark, settle):
     app = QApplication.instance()
@@ -281,6 +306,7 @@ def main(argv):
     # 这个引用必须留着：光写一句 QApplication([])，Python 立刻把它回收掉，
     # Qt 那边跟着销毁，后面建第一个 QWidget 就直接 abort（没有回溯，退 127）
     app = QApplication.instance() or QApplication([])
+    load_fonts()
 
     out = Path(args.out) if args.out else DEFAULT_OUT
     use_sandbox(Path(args.data) if args.data else SOURCE_DATA, SANDBOX, args.keep)

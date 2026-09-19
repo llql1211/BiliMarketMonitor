@@ -47,10 +47,14 @@ def _add_dialog(dark):
 改这段的时候记得和 `tests/conftest.py` 的 `data_files` fixture 对着看：两边是同一个
 出发点的两个版本，别只改一处。
 
-## 两个坑
+## 三个坑
 
 - **`QApplication` 的引用得留着**。光写一句 `QApplication([])`，Python 立刻把它回收掉，
   Qt 那边跟着销毁，后面建第一个 QWidget 直接 abort——没有回溯，退出码 127。
+- **offscreen 平台在 Windows 上不带字体库**（`QFontDatabase().families()` 是空的），字一个
+  都画不出来，出图就成了"有框有线、没字"——最该看的东西正好看没了。`load_fonts()` 手动塞
+  几个系统字体进去补这个洞，别当成多余的删掉。判断依据是字体库空不空：有字体库的平台
+  （开真窗口那种）它一个字不动。
 - **样本变动真调 `price_change()` 造，不手写 dict**。哪天真改了结构，工具先炸，
   而不是拿着一张早就对不上的图糊弄人。
 
