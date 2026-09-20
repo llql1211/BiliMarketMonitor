@@ -16,8 +16,10 @@ from PyQt5.QtGui import (
     QDragMoveEvent,
     QDropEvent,
     QFontMetrics,
+    QKeySequence,
     QPixmap,
 )
+from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -1018,6 +1020,68 @@ def test_failed_result_also_stops_being_pending(window, monkeypatch):
     assert w.table.item(0, app_module.COL_PRICE).text() == "¥138"
 
 
+# ---------------- 快捷键 ----------------
+
+
+def _record_pollers(monkeypatch):
+    """把 PollerThread 换成记账版假线程，返回建出来的实例列表。"""
+    made = []
+
+    class RecordingPoller(FakePoller):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            made.append(self)
+
+    monkeypatch.setattr(app_module, "PollerThread", RecordingPoller)
+    return made
+
+
+def _press_f5(w, qapp, on=None):
+    """真按一下 F5（走 Qt 的快捷键分发，不是直接调槽）。"""
+    w.show()
+    if on is not None:
+        on.setFocus()
+    qapp.processEvents()
+    QTest.keyClick(on or w, Qt.Key_F5)
+    qapp.processEvents()
+
+
+def test_f5_starts_a_fetch_even_when_the_table_has_focus(window, monkeypatch, qapp):
+    """F5 等价于点「开始抓取」。光标平时就在表格里，按键先到表格，
+    所以快捷键得挂在窗口上——挂在按钮上这一下根本收不到。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+    made = _record_pollers(monkeypatch)
+
+    _press_f5(w, qapp, on=w.table)
+
+    assert len(made) == 1
+    # 抓取真起来了：价格先被清成「--」，好一眼看出刷到哪一行
+    assert w.table.item(0, app_module.COL_PRICE).text() == app_module.CLEARED_TEXT
+
+
+def test_f5_does_not_start_a_second_run_while_polling(window, monkeypatch, qapp):
+    """抓取中按 F5 不该起重入的第二轮：清单管理类按钮这时是灰的，
+    快捷键照按钮的开关走，一样没反应。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+    made = _record_pollers(monkeypatch)
+
+    _press_f5(w, qapp)
+    assert len(made) == 1
+
+    _press_f5(w, qapp)  # 这一轮还在跑（假线程不会自己结束）
+    assert len(made) == 1
+
+
+def test_fetch_shortcut_matches_the_advertised_key(window):
+    """提示里写的键和真正绑上的键是同一个：两边各写一份最容易改漏一边。"""
+    w = window()
+    assert w.shortcut_fetch.key() == QKeySequence(app_module.FETCH_SHORTCUT)
+    assert w.shortcut_fetch.context() == Qt.WindowShortcut
+    assert app_module.FETCH_SHORTCUT in w.btn_fetch.toolTip()
+
+
 # ---------------- 按钮状态 ----------------
 
 
@@ -1030,11 +1094,13 @@ def test_set_busy_toggles_buttons(window):
     assert not w.btn_normalize.isEnabled()
     assert not w.btn_refresh_list.isEnabled()
     assert not w.btn_fetch.isEnabled()
+    assert not w.shortcut_fetch.isEnabled()  # F5 跟着「开始抓取」一起开关
     assert w.btn_pause.isEnabled() and w.btn_stop.isEnabled()
 
     w.btn_pause.setText(app_module.RESUME_TEXT)
     w.SetBusy(False)
     assert w.btn_add.isEnabled() and w.btn_fetch.isEnabled()
+    assert w.shortcut_fetch.isEnabled()
     assert not w.btn_pause.isEnabled() and not w.btn_stop.isEnabled()
     assert w.btn_pause.text() == app_module.PAUSE_TEXT
 

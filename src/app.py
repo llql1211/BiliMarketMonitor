@@ -3,7 +3,7 @@
 启动流程：
 1. 读取 watchlist.txt，并让缓存库严格跟随清单（缺的补、多的删）；
 2. 把能显示的数据（名称、缩略图、clusterID）摆上表格；
-3. 点「开始抓取」时逐个抓取价格，新商品连名称、缩略图一起抓；
+3. 点「开始抓取」（或按 F5，两者等价）时逐个抓取价格，新商品连名称、缩略图一起抓；
    抓取过程中可以「暂停抓取」（两条商品之间生效）或「停止抓取」（已抓到的保留）。
 
 与旧版 src/App.py 的关键区别：轮询放在 QThread 子线程里做，
@@ -26,6 +26,7 @@ from PyQt5.QtGui import (
     QDrag,
     QFontMetrics,
     QIcon,
+    QKeySequence,
     QPainter,
     QPen,
     QPixmap,
@@ -43,6 +44,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QShortcut,
     QStyle,
     QStyledItemDelegate,
     QStyleOptionViewItem,
@@ -114,6 +116,8 @@ PRICE_ALIGN = Qt.AlignLeft | Qt.AlignVCenter
 
 PAUSE_TEXT = "暂停抓取"
 RESUME_TEXT = "继续抓取"
+# 「开始抓取」的快捷键：按钮提示里的字和实际键位都从这一个常量来，改一处就够
+FETCH_SHORTCUT = "F5"
 ADD_PLACEHOLDER = "粘贴商品 ID 或分享链接，一行一个…"
 
 # 一轮抓取跑完后的总结窗口（见 SummaryDialog）
@@ -911,7 +915,8 @@ class MainWindow(QMainWindow):
             (self.btn_refresh_list, self.OnRefreshList,
              "重新读取 watchlist.txt（手工改动后点这里同步）"),
             (self.btn_fetch, self.OnFetchPrices,
-             f"逐个抓取价格，间隔 {self.config['poll_interval_seconds']:g} 秒"),
+             f"逐个抓取价格，间隔 {self.config['poll_interval_seconds']:g} 秒\n"
+             f"快捷键 {FETCH_SHORTCUT}"),
             (self.btn_pause, self.OnTogglePause,
              "暂停 / 继续本次抓取（在两条商品之间生效，不打断正在进行的请求）"),
             (self.btn_stop, self.OnStopFetch,
@@ -926,6 +931,12 @@ class MainWindow(QMainWindow):
         self.btn_fetch.clicked.connect(self.OnFetchPrices)
         self.btn_pause.clicked.connect(self.OnTogglePause)
         self.btn_stop.clicked.connect(self.OnStopFetch)
+
+        # F5 = 开始抓取。挂成窗口级快捷键，而不是给按钮 setShortcut：光标多半在
+        # 表格里，按键先到的是表格，按钮收不到。
+        self.shortcut_fetch = QShortcut(QKeySequence(FETCH_SHORTCUT), self)
+        self.shortcut_fetch.setContext(Qt.WindowShortcut)
+        self.shortcut_fetch.activated.connect(self.OnFetchPrices)
 
         btn_bar.addStretch()
         self.progress_label = QLabel("就绪")
@@ -1462,6 +1473,9 @@ class MainWindow(QMainWindow):
         for btn in (self.btn_add, self.btn_delete, self.btn_normalize,
                     self.btn_refresh_list, self.btn_fetch):
             btn.setEnabled(not busy)
+        # 快捷键跟着「开始抓取」按钮一起开关：F5 的语义就是点那个按钮，
+        # 按钮灰着的时候它也该照样没反应
+        self.shortcut_fetch.setEnabled(not busy)
         self.btn_pause.setEnabled(busy)
         self.btn_stop.setEnabled(busy)
         self.btn_pause.setText(PAUSE_TEXT)  # 每次进出都复位成「暂停抓取」
