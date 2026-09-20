@@ -87,16 +87,23 @@ SOLD_OUT_TEXT = "已售罄"  # 现价格的前缀：售罄时那一格装的不�
 
 # 「预期价格」列（用户自己设的参照价，存在 watchlist.txt 里）
 EXPECTED_DIALOG_TITLE = "设置预期价格"
-EXPECTED_DIALOG_LABEL = "现价低于它时这一格会变色；留空表示不设。"
+EXPECTED_DIALOG_LABEL = "只填数字就行，显示时前面会自动加上「￥」；\n" \
+                        "现价低于它时这一格会变色，留空表示不设。"
 EXPECTED_HEADER_TIP = (
     "自己设的目标价：现价低于它时这一格会变绿加粗\n"
     "双击任意一行的这一格即可设置或修改，留空表示不设\n"
+    "输入框里只填数字，表格里显示时会自动加上「￥」\n"
     "存在 watchlist.txt 里，跟着清单一起备份"
 )
 SET_EXPECTED_TIP = "双击设置预期价格"
 EDIT_EXPECTED_TIP = "双击修改预期价格"
-EXPECTED_BAD_INPUT = "预期价格得是大于 0 的数字，比如 50 或 ¥50。"
+EXPECTED_BAD_INPUT = "预期价格得是大于 0 的数字，比如 50。"
 EXPECTED_BAD_TITLE = "预期价格认不出来"
+
+# 展示时统一补的货币符号；清单里存的是数字本身（见 expected_number）
+EXPECTED_PREFIX = "￥"
+# 手写进清单的货币符号：展示前先脱掉，免得叠成「￥￥50」
+_CURRENCY_CHARS = "¥￥$€"
 
 DELTA_ROLE = Qt.UserRole + 1        # 「现价」格末尾那截涨跌（形如「↓ 6」）
 DELTA_COLOR_ROLE = Qt.UserRole + 2  # 上面那截的颜色（随主题走，重画时重算）
@@ -187,6 +194,27 @@ def expected_reached(expected_price, price, sold_out) -> bool:
     if target is None or current is None:
         return False
     return current < target
+
+
+def expected_number(expected_price) -> str:
+    """预期价里"算数"的那截：脱掉首尾空白和手写的货币符号。
+
+    输入框回填用：用户双击时看到的就是存进清单的那个数字，框里只有一个数，
+    不用先删掉一个「￥」再打字。
+    """
+    text = str(expected_price).strip() if expected_price else ""
+    return text.lstrip(_CURRENCY_CHARS).strip() if text else ""
+
+
+def expected_display(expected_price) -> str:
+    """「预期价格」格的展示文本：数字前统一加上「￥」；没设给空串。
+
+    清单里存的是数字，符号只在展示时补——存符号的话，输入框里就得先删掉它，
+    还得靠"符号是不是重复了"来判断有没有存错。老清单和手写行里的「¥50」也照常
+    认：先把已有的符号脱掉再加，不会叠成「￥￥50」。
+    """
+    number = expected_number(expected_price)
+    return f"{EXPECTED_PREFIX}{number}" if number else ""
 
 
 def price_change(previous, result):
@@ -1092,7 +1120,7 @@ class MainWindow(QMainWindow):
         dialog.setInputMode(QInputDialog.TextInput)
         dialog.setLabelText(f"{entry.name or entry.cluster_id} 的预期价格\n"
                             f"{EXPECTED_DIALOG_LABEL}")
-        dialog.setTextValue(entry.expected_price or "")
+        dialog.setTextValue(expected_number(entry.expected_price))
         # 按钮文字跟着项目里其他对话框走，别冒出一对英文
         dialog.setOkButtonText("确定")
         dialog.setCancelButtonText("取消")
@@ -1106,7 +1134,8 @@ class MainWindow(QMainWindow):
         if dialog.exec_() != QDialog.Accepted:
             return
 
-        text = dialog.textValue().strip()
+        # 输入框里要的是数字，但手快连着符号一起粘进来也认（price_number 会脱掉它）
+        text = expected_number(dialog.textValue())
         if text:
             value = parser.price_number(text)
             # 认不出或不是正数就拦下来：存进去也永远不会到价，不如当场说清楚
@@ -1131,7 +1160,7 @@ class MainWindow(QMainWindow):
             self.SetPriceCells(row, self.rows[row])
             return False
 
-        what = f"预期价 {text}" if text else "预期价（已清除）"
+        what = f"预期价 {expected_display(text)}" if text else "预期价（已清除）"
         self.progress_label.setText(
             f"已设置「{entry.name or entry.cluster_id}」的{what}，已写回 watchlist.txt"
             + self.last_note
@@ -1249,23 +1278,26 @@ class MainWindow(QMainWindow):
     def ExpectedCell(self, expected_price, price, sold_out):
         """「预期价格」格：到价了才变色，没到价就弱化显示。
 
-        没设 → 占位符 + 弱化色；设了没到价 → 原文 + 弱化色（它是用户设的参照值，
-        跟「原价」一样属于"有就行、别抢眼"）；到价 → 原文加粗 + 到价色，扫一眼
-        就看得见。这里不用判"值是不是个价格"：能进到 expected_price 的值要么是
-        输入框校验过的，要么是 links 解析时认过数字的（认不出的那段会被当成
-        名字的一部分，见 _split_fields）。
+        没设 → 占位符 + 弱化色；设了没到价 → 「￥数字」+ 弱化色（它是用户设的
+        参照值，跟「原价」一样属于"有就行、别抢眼"）；到价 → 同样加「￥」再加粗 +
+        到价色，扫一眼就看得见。这里不用判"值是不是个价格"：能进到 expected_price
+        的值要么是输入框校验过的，要么是 links 解析时认过数字的（认不出的那段会被
+        当成名字的一部分，见 _split_fields）。
+
+        展示统一走 expected_display：清单里存的是数字，符号只在格子里补，手写的
+        「¥50」也不会叠出两个符号来。
 
         加粗跟近期成交那个高亮同一个路子：单靠颜色，色觉障碍的人看不出差别，
         截图里也容易糊成一片。
         """
-        text = str(expected_price) if expected_price else ""
+        text = expected_display(expected_price)
         if not text:
             return self.MakeCell(
                 NO_DATA_TEXT, tooltip=SET_EXPECTED_TIP,
                 color=theme.muted_color(self.dark),
             )
 
-        reached = expected_reached(text, price, sold_out)
+        reached = expected_reached(expected_price, price, sold_out)  # 比的是存着的值，不是展示文本
         cell = self.MakeCell(
             text,
             tooltip=_tips(

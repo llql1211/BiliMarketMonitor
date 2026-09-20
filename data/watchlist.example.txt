@@ -5,6 +5,7 @@
 #   10000004212 | Vsinger 洛天依拍立得相框 规格：D款 | 60
 #   10000008780
 # 预期价也可以双击表格里的「预期价格」那一格来设，两种改法等价
+# 预期价只写数字即可，表格里显示时会自动加上「￥」（这一行写「¥60」也认）
 # 也可以直接粘贴分享链接（share_medium、bbid 等参数会被忽略）：
 #   https://mall.bilibili.com/neul-next/resell/detail.html?clusterId=10000004212&noTitleBar=1&share_medium=android&bbid=XU8FF57870E1B13BBF6891E69F6F952B320E5
 

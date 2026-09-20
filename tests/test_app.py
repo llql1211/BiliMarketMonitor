@@ -448,6 +448,23 @@ def test_expected_reached(expected, price, sold_out, reached):
     assert app_module.expected_reached(expected, price, sold_out) is reached
 
 
+@pytest.mark.parametrize(
+    "value, shown, in_box",
+    [
+        ("50", "￥50", "50"),                    # 常规：清单里存的就是数字
+        ("¥50", "￥50", "50"),                   # 手写的旧符号：脱掉再补，不叠成「￥￥50」
+        (" ￥ 1,299.50 ", "￥1,299.50", "1,299.50"),
+        ("50 左右", "￥50 左右", "50 左右"),      # 数字之外的字照旧留着
+        ("", "", ""),
+        (None, "", ""),
+    ],
+)
+def test_expected_text_helpers(value, shown, in_box):
+    """展示文本补「￥」，输入框回填的只有数字——两处都从存着的值算出来。"""
+    assert app_module.expected_display(value) == shown
+    assert app_module.expected_number(value) == in_box
+
+
 def _expected_cell(w, row=0):
     return w.table.item(row, app_module.COL_EXPECT)
 
@@ -460,13 +477,13 @@ def test_expected_cell_states(window):
     w.OnResultReady(1, result_ok(price="¥66"))  # 66 > 60 → 没到
 
     reached = _expected_cell(w, 0)
-    assert reached.text() == "50"
+    assert reached.text() == "￥50"
     assert reached.font().bold()
     assert reached.foreground().color().name() == theme.expected_reached_color(w.dark).name()
     assert "已低于预期价" in reached.toolTip()
 
     waiting = _expected_cell(w, 1)
-    assert waiting.text() == "60"
+    assert waiting.text() == "￥60"
     assert not waiting.font().bold()  # 只有到价才加粗
     assert waiting.foreground().color().name() == theme.muted_color(w.dark).name()
 
@@ -522,7 +539,7 @@ def test_expected_cell_survives_price_clearing(window):
 
     w.ClearPrices()
 
-    assert _expected_cell(w).text() == "50"  # 还在
+    assert _expected_cell(w).text() == "￥50"  # 还在
     assert not _expected_cell(w).font().bold()  # 现价没了，按没到价摆着
     assert w.table.item(0, app_module.COL_PRICE).text() == app_module.CLEARED_TEXT
 
@@ -569,12 +586,36 @@ def test_set_expected_price_writes_watchlist(window, monkeypatch):
     w.EditExpectedPrice(0)
 
     assert w.rows[0]["entry"].expected_price == "50"
-    assert "预期价 50" in w.progress_label.text()
+    assert "预期价 ￥50" in w.progress_label.text()
     reloaded = links.load_links(w.watchlist_path)
     assert [(e.cluster_id, e.expected_price) for e in reloaded] == [("10000008780", "50")]
     # 落盘了就该按新价重画：现价 44 低于 50，这一格得绿起来
     w.OnResultReady(0, result_ok(price="¥44"))
     assert _expected_cell(w).font().bold()
+
+
+def test_expected_price_dialog_prefills_the_number_only(window):
+    """双击打开的输入框里只有数字：不用先删掉一个「￥」再打字（表格里再补符号）。"""
+    w = window("10000008780 | 甲 | ¥50\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    dialog = w.ExpectedPriceDialog(0)
+
+    assert dialog.textValue() == "50"
+    assert _expected_cell(w).text() == "￥50"
+
+
+def test_expected_price_with_symbol_is_stored_as_a_number(window, monkeypatch):
+    """手快连着符号一起粘进来也收：清单里存的还是数字，符号只在展示时补。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    _fake_expected_dialog(monkeypatch, "  ¥50 ")
+
+    w.EditExpectedPrice(0)
+
+    assert w.rows[0]["entry"].expected_price == "50"
+    assert _expected_cell(w).text() == "￥50"
+    assert [e.expected_price for e in links.load_links(w.watchlist_path)] == ["50"]
 
 
 def test_clear_expected_price(window, monkeypatch):
@@ -632,7 +673,7 @@ def test_expected_price_rolls_back_when_watchlist_write_fails(window, monkeypatc
     w.EditExpectedPrice(0)
 
     assert w.rows[0]["entry"].expected_price == "50"  # 退回原值
-    assert _expected_cell(w).text() == "50"
+    assert _expected_cell(w).text() == "￥50"
 
 
 def test_normalize_keeps_expected_price(window, monkeypatch):
