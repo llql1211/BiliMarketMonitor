@@ -164,12 +164,27 @@ def window(qapp, data_files):
 
     yield _make
 
+    from PyQt5.QtCore import QCoreApplication, QEvent
+
     for win in made:
         if win.poller is not None and win.poller.isRunning():
             win.poller.stop()
             win.poller.wait(2000)
         win.close()
         win.deleteLater()
+    # 收尾必须在这里做完，也就是 data_files 的 monkeypatch 还没撤的时候：
+    # 下面两步都会让「排队中的活儿」当场兑现，而它们是要写盘的。
+    #
+    # 1) processEvents 把 stop() 之后队列里的 finished_all 送出去——PollerThread
+    #    最后一句就是 emit，主线程的 OnPollFinished 收到后会写回 watchlist.txt；
+    #    拖到 monkeypatch 撤了再送，写的就是用户真实的 data/ 了。
+    # 2) sendPostedEvents(DeferredDelete)：Qt 的 deleteLater 只由事件循环兑现，
+    #    processEvents 不管，光调它窗口一个都不会析构。攒上几百个之后，
+    #    每次 apply_theme 的 setStyleSheet 都要重新 polish 全部控件（几百毫秒），
+    #    整个套件会从十几秒拖到两分钟以上。顺序是先送信号再析构：析构也不该
+    #    发生在 monkeypatch 撤了之后（closeEvent 里有 store.close()）。
+    qapp.processEvents()
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
     qapp.processEvents()
 
 
