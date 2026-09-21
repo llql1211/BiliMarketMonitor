@@ -159,11 +159,31 @@ def _sample_changes():
     ]
 
 
+def _sample_deals():
+    """新增成交那一块：一件商品一条新成交，另一件一次冒出两条。"""
+    return [
+        {"name": "乙烯基唱片收纳箱",
+         "deals": [{"price": "¥44", "time": "2小时前"}]},
+        {"name": "复古铁皮玩具车 <限定色>",
+         "deals": [{"price": "¥130", "time": "9小时前"},
+                   {"price": "¥135", "time": "1天前"}]},
+    ]
+
+
+def _sample_targets():
+    """低于预期价那两块：现价该是到价色，预期价带「￥」。"""
+    return [
+        {"name": "木质拼图相框", "price": "¥18", "expected_price": "20"},
+        {"name": "帆布单肩包", "price": "¥35", "expected_price": "¥39"},
+    ]
+
+
 @scene("summary")
 def _summary(dark):
+    """三块明细各来几条：顺便看它们之间的空行和顺序。"""
     from app import SummaryDialog
 
-    return SummaryDialog(_sample_changes(), 12, 0, dark)
+    return SummaryDialog(_sample_changes(), _sample_deals(), _sample_targets(), 12, 0, dark)
 
 
 @scene("summary-empty")
@@ -171,7 +191,7 @@ def _summary_empty(dark):
     """一条变动都没有的样子：没有明细表，窗口该收窄。"""
     from app import SummaryDialog
 
-    return SummaryDialog([], 12, 0, dark)
+    return SummaryDialog([], [], [], 12, 0, dark)
 
 
 @scene("summary-failures")
@@ -179,7 +199,15 @@ def _summary_failures(dark):
     """有商品没抓到：副标题得把这件事说出来。"""
     from app import SummaryDialog
 
-    return SummaryDialog(_sample_changes()[:2], 12, 3, dark)
+    return SummaryDialog(_sample_changes()[:2], [], [], 12, 3, dark)
+
+
+@scene("summary-deals-only")
+def _summary_deals_only(dark):
+    """只有新成交：价格没动、也没设预期价的那一轮长什么样。"""
+    from app import SummaryDialog
+
+    return SummaryDialog([], _sample_deals(), [], 12, 0, dark)
 
 
 @scene("summary-many")
@@ -194,7 +222,7 @@ def _summary_many(dark):
                                f"降价款 {i + 1}"))
         changes.append(_change(base, {"price": str(100 + i + 6), "sold_out": False},
                                f"涨价款 {i + 1}"))
-    return SummaryDialog(changes, 40, 0, dark)
+    return SummaryDialog(changes, [], [], 40, 0, dark)
 
 
 # 场景里造出来、但只有 Qt 那边认得的对象得在这儿挂住：Python 这边一回收，

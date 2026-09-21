@@ -1230,13 +1230,65 @@ def test_full_run_pops_a_summary_of_the_changes(window, monkeypatch, wait_until)
     dialog = w.summary_dialog
     assert dialog is not None and dialog.isVisible()
     assert dialog.windowTitle() == app_module.SUMMARY_TITLE
-    assert dialog.headline.text() == "共 2 条变动：降价 1 · 涨价 1"
+    assert dialog.headline.text() == "本次 2 项：降价 1 · 涨价 1"
     assert dialog.subtitle.text() == "本次共抓取 2 件商品"
     # 明细按清单顺序：甲在前、乙在后，各自的涨跌对得上
     detail = dialog.detail.toPlainText()
     assert detail.index("甲") < detail.index("乙")
     assert "¥50 → ¥44" in detail and "↓ 6" in detail
     assert "¥44 → ¥50" in detail and "↑ 6" in detail
+
+
+def test_summary_reports_new_deals(window, monkeypatch, wait_until):
+    """上一轮那三条里没出现过的成交才算新增：新挤进来的报，旧的照旧不报。
+
+    样品的三条成交价格一样、只有时间不同，所以第一轮抓完后各条的时间得能
+    对得上号——不然"认不认得出来是同一条"这件事就没验到。
+    """
+    w = window("10000008780 | 甲\n")
+    _seed_cache(w, price="¥44")  # 先把价缓存上，首轮才不是"第一次抓到"
+    w.LoadWatchlist(w.watchlist_path)
+    # 首轮三条都是「8天前」，次轮最前面挤进一条 2 小时前的（旧的往后退一格）
+    first = raw_ok(name="甲", price="¥44")
+    second = raw_ok(name="甲", price="¥44", deal_times=["2小时前", "8天前", "8天前"])
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
+
+    monkeypatch.setattr(client, "fetch_cluster", _fetch_by_id({"10000008780": first}))
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+    # 本次运行头一回抓到这件商品，没有基准可比，三条都不报（缓存里没有成交记录）
+    assert "新增成交" not in w.summary_dialog.headline.text()
+
+    monkeypatch.setattr(client, "fetch_cluster", _fetch_by_id({"10000008780": second}))
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+
+    assert w.summary_dialog.headline.text() == "本次 1 项：新增成交 1"
+    detail = w.summary_dialog.detail.toPlainText()
+    assert "¥205 · 2小时前" in detail
+    assert "8天前" not in detail  # 上一轮就有的那两条不算新增
+
+
+def test_summary_reports_prices_below_the_expected_price(window, monkeypatch, wait_until):
+    """到价每轮都报：设了预期价的商品，现价一旦低于它就列出来。"""
+    w = window("10000008780 | 甲\n")
+    _seed_cache(w, price="¥50")
+    w.LoadWatchlist(w.watchlist_path)
+    for item in w.rows:
+        if item["entry"].cluster_id == "10000008780":
+            item["entry"].expected_price = "45"  # 现价 44 低于它
+    monkeypatch.setattr(
+        client, "fetch_cluster", _fetch_by_id({"10000008780": raw_ok(name="甲", price="¥44")})
+    )
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
+
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+
+    assert w.summary_dialog.headline.text() == "本次 2 项：降价 1 · 低于预期价格 1"
+    detail = w.summary_dialog.detail.toPlainText()
+    assert app_module.TARGET_HEADING in detail
+    assert "¥44" in detail and "￥45" in detail  # 现价和预期价都在，好知道差多少
 
 
 def test_summary_still_pops_when_nothing_changed(window, monkeypatch, wait_until):
@@ -1288,7 +1340,7 @@ def test_sold_out_transition_reaches_the_summary(window, monkeypatch, wait_until
     w.OnFetchPrices()
     assert _wait_run(w, wait_until)
 
-    assert w.summary_dialog.headline.text() == "共 1 条变动：新售罄 1"
+    assert w.summary_dialog.headline.text() == "本次 1 项：新售罄 1"
     detail = w.summary_dialog.detail.toPlainText()
     assert "已售罄" in detail
     assert "¥44" in detail  # 此前现价留着，好知道它是从多少涨到售罄的
@@ -1316,9 +1368,9 @@ def test_summary_mentions_failed_queries(window, monkeypatch, wait_until):
     w.OnFetchPrices()
     assert _wait_run(w, wait_until)
 
-    assert w.summary_dialog.headline.text() == "共 1 条变动：降价 1"
+    assert w.summary_dialog.headline.text() == "本次 1 项：降价 1"
     assert w.summary_dialog.subtitle.text() == (
-        "本次共抓取 2 件商品，其中 1 件查询失败（这几件看不出变动）"
+        "本次共抓取 2 件商品，其中 1 件查询失败（这几件看不出变化）"
     )
 
 
@@ -2524,31 +2576,122 @@ def test_price_change_up_and_down_carry_the_number():
     assert down["change"] == -6
 
 
-def test_change_headline_counts_first_then_breaks_down():
-    """头一句话先说共几条，再分门别类报数；顺序固定为跌、涨、售罄、恢复。"""
+def test_summary_headline_counts_first_then_breaks_down():
+    """头一句话先说共几项，再分门别类报数；顺序固定为跌、涨、售罄、恢复，然后是成交和到价。"""
     changes = [
         {"kind": "up"},
         {"kind": "down"},
         {"kind": "down"},
         {"kind": "sold_out"},
     ]
-    assert app_module.change_headline(changes) == (
-        "共 4 条变动：降价 2 · 涨价 1 · 新售罄 1"
+    deals = [{"name": "丙", "deals": [{"price": "¥44"}]}]
+    targets = [{"name": "丁", "price": "¥18", "expected_price": "20"}]
+
+    assert app_module.summary_headline(changes, None, None) == (
+        "本次 4 项：降价 2 · 涨价 1 · 新售罄 1"
+    )
+    assert app_module.summary_headline(changes, deals, targets) == (
+        "本次 6 项：降价 2 · 涨价 1 · 新售罄 1 · 新增成交 1 · 低于预期价格 1"
     )
 
 
-@pytest.mark.parametrize("changes", [[], None, ["乱写的一条"]])
-def test_change_headline_without_changes(changes):
-    """一条变动都没有时直说没有，别报「共 0 条」。"""
-    assert app_module.change_headline(changes) == app_module.NO_CHANGE_TEXT
+@pytest.mark.parametrize(
+    "changes, deals, targets",
+    [
+        ([], [], []),
+        (None, None, None),
+        (["乱写的一条"], ["乱写的一条"], ["乱写的一条"]),
+    ],
+)
+def test_summary_headline_without_changes(changes, deals, targets):
+    """三块都空时直说没有变化，别报「本次 0 项」。"""
+    assert app_module.summary_headline(changes, deals, targets) == app_module.NO_CHANGE_TEXT
 
 
-def test_change_subtitle_mentions_failures():
-    """查失败的几件要交代：它们这次看不出变动，不说就像"一切正常"。"""
-    assert app_module.change_subtitle(12, 0) == "本次共抓取 12 件商品"
-    assert app_module.change_subtitle(12, 2) == (
-        "本次共抓取 12 件商品，其中 2 件查询失败（这几件看不出变动）"
+def test_summary_headline_counts_items_not_deals():
+    """成交那块的数按商品件数算：一件商品冒出两条新成交，明细里也只占一行。"""
+    deals = [{"name": "甲", "deals": [{"price": "¥44"}, {"price": "¥42"}]}]
+
+    assert app_module.summary_headline([], deals, []) == "本次 1 项：新增成交 1"
+
+
+def test_summary_subtitle_mentions_failures():
+    """查失败的几件要交代：它们这次看不出变化，不说就像"一切正常"。"""
+    assert app_module.summary_subtitle(12, 0) == "本次共抓取 12 件商品"
+    assert app_module.summary_subtitle(12, 2) == (
+        "本次共抓取 12 件商品，其中 2 件查询失败（这几件看不出变化）"
     )
+
+
+def test_new_deals_keeps_only_the_fresh_ones():
+    """上一轮那三条要认出来剔掉，新挤进来的才算新增。"""
+    old = [{"price": "¥48", "time": "3天前"}, {"price": "¥50", "time": "5天前"}]
+    now = [{"price": "¥45", "time": "2小时前"}] + old
+
+    assert app_module.new_deals(now, old) == [{"price": "¥45", "time": "2小时前"}]
+
+
+@pytest.mark.parametrize("previous", [None, [], ["乱写的一条"]])
+def test_new_deals_reports_everything_without_a_baseline(previous):
+    """没有上一次的清单时（首次抓到）都算新的——要不要报由调用方按"有没有基准"挡。"""
+    now = [{"price": "¥45", "time": "2小时前"}]
+
+    assert app_module.new_deals(now, previous) == now
+
+
+def test_new_deals_matches_on_price_when_time_is_missing():
+    """成交时间认不出来（空串）时按价格认：同一条不重复报，新的照报。"""
+    old = [{"price": "¥48", "time": ""}]
+
+    assert app_module.new_deals([{"price": "¥48", "time": ""}], old) == []
+    assert app_module.new_deals([{"price": "¥45", "time": ""}], old) == [
+        {"price": "¥45", "time": ""}
+    ]
+
+
+def test_summary_sections_renders_every_block_with_content():
+    """三块各带小标题、按价格变动 → 新增成交 → 低于预期价的顺序排。"""
+    changes = [{"kind": "down", "name": "甲", "old_price": "¥50", "new_price": "¥44",
+                "delta": "↓ 6", "change": -6}]
+    deals = [{"name": "乙", "deals": [{"price": "¥44", "time": "2小时前"}]}]
+    targets = [{"name": "丙", "price": "¥18", "expected_price": "20"}]
+
+    markup = app_module.summary_sections(changes, deals, targets, dark=False)
+
+    assert markup.index(app_module.CHANGES_HEADING) < markup.index(app_module.DEALS_HEADING)
+    assert markup.index(app_module.DEALS_HEADING) < markup.index(app_module.TARGET_HEADING)
+    assert "¥44 · 2小时前" in markup  # 成交那格：价格和时间拼成一条
+
+
+@pytest.mark.parametrize(
+    "changes, deals, targets",
+    [
+        ([], [], []),
+        ([{"kind": "down", "name": "甲", "old_price": "¥50", "new_price": "¥44",
+           "delta": "↓ 6", "change": -6}], [], []),
+    ],
+)
+def test_summary_sections_drops_empty_blocks(changes, deals, targets):
+    """没内容的那块整块省掉——留个孤零零的小标题最难看。"""
+    markup = app_module.summary_sections(changes, deals, targets, dark=False)
+
+    assert (app_module.DEALS_HEADING in markup) is bool(deals)
+    assert (app_module.TARGET_HEADING in markup) is bool(targets)
+    assert (app_module.CHANGES_HEADING in markup) is bool(changes)  # 变动那块也有标题
+    assert bool(markup) is bool(changes or deals or targets)
+
+
+def test_targets_html_colors_the_price_by_theme():
+    """到价那几件的现价上到价色，扫一眼就知道是这几件跌到位了。"""
+    targets = [{"name": "甲", "price": "¥18", "expected_price": "20"}]
+
+    light = app_module.targets_html(targets, dark=False)
+    dark = app_module.targets_html(targets, dark=True)
+
+    # 到价色跟跌色是同一个色（见 theme.expected_reached_color），这里不另立一份断言
+    assert theme.PRICE_DOWN_COLOR_LIGHT in light
+    assert theme.PRICE_DOWN_COLOR_DARK in dark
+    assert "￥20" in light  # 预期价照旧带「￥」，跟表格里的展示一致
 
 
 def test_changes_html_escapes_the_name():
