@@ -19,7 +19,7 @@ import webbrowser
 from datetime import datetime
 
 import requests
-from PyQt5.QtCore import QObject, QPoint, QRect, QSize, Qt, QThread, pyqtSignal
+from PyQt5.QtCore import QEvent, QObject, QPoint, QRect, QSize, Qt, QThread, pyqtSignal
 from PyQt5.QtGui import (
     QBrush,
     QCursor,
@@ -758,17 +758,102 @@ class PriceDeltaDelegate(QStyledItemDelegate):
 
 
 class PreviewArea(QScrollArea):
-    """看大图用的滚动区：滚轮在这儿改缩放，不让滚动条把它吃了。
+    """看大图用的滚动区：滚轮在这儿改缩放，按住左键还能拖着挪画面。
 
     别的滚动区滚轮是滚内容，可看图的当口「往下滚一屏」没什么用——放大才是。
-    放大到超出窗口之后要靠滚动条挪着看，所以滚动条留着不关。
+    放大到超出窗口之后，滚动条能一根一根拨，但按住图直接拖更顺手，所以拖动和
+    滚动条走的是同一套滚动位置，滚动条照旧留着。
+
+    鼠标事件接在塞进来的控件上，不接在自己身上：真机上鼠标点的是那个控件，
+    它不认鼠标事件往外冒的时候中间还隔着 viewport，接在源头最稳，省得赌 Qt
+    把后续的 move 送回谁手上。
     """
 
     wheeled = pyqtSignal(int)  # 滚轮这一格的垂直步长（往上为正）
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._drag_from = None  # 按下时的屏幕坐标，None 表示没在拖
+        self._drag_bar = (0, 0)  # 按下时两根滚动条的位置
+
+    def setWidget(self, widget):
+        """接住塞进来的控件，顺手把它的鼠标事件也接过来。"""
+        old = self.widget()
+        if old is not None:
+            old.removeEventFilter(self)
+        super().setWidget(widget)
+        if widget is not None:
+            widget.installEventFilter(self)
+
     def wheelEvent(self, event):
         self.wheeled.emit(event.angleDelta().y())
         event.accept()
+
+    def eventFilter(self, obj, event):
+        """拖动挪画面。按下的那一刻定基准，之后都按屏幕位移算，别看控件坐标。
+
+        控件自己在滚动里挪位置，拿控件坐标算位移会跟着滚动一起漂，一拖就飞。
+        """
+        kind = event.type()
+        if kind == QEvent.MouseButtonPress:
+            return self._Press(event)
+        if kind == QEvent.MouseMove and self._drag_from is not None:
+            return self._Drag(event)
+        if kind == QEvent.MouseButtonRelease and self._drag_from is not None:
+            return self._Release(event)
+        return super().eventFilter(obj, event)
+
+    def _Press(self, event):
+        if event.button() != Qt.LeftButton or not self._Pannable():
+            return False  # 没超出可视区就没什么可挪的，别白拦事件
+        self._drag_from = event.globalPos()
+        self._drag_bar = (
+            self.horizontalScrollBar().value(),
+            self.verticalScrollBar().value(),
+        )
+        self.RefreshCursor()
+        event.accept()
+        return True
+
+    def _Drag(self, event):
+        delta = event.globalPos() - self._drag_from
+        # 画面跟着手走：往右拖，图也该往右挪，所以滚动条要往回退
+        self.horizontalScrollBar().setValue(self._drag_bar[0] - delta.x())
+        self.verticalScrollBar().setValue(self._drag_bar[1] - delta.y())
+        event.accept()
+        return True
+
+    def _Release(self, event):
+        if event.button() != Qt.LeftButton:
+            return False
+        self._drag_from = None
+        self.RefreshCursor()
+        event.accept()
+        return True
+
+    def RefreshCursor(self):
+        """超出可视区时给个张开的手，明示这儿能拖；拖起来就把手攥上。"""
+        if self._drag_from is not None:
+            self.viewport().setCursor(Qt.ClosedHandCursor)
+        elif self._Pannable():
+            self.viewport().setCursor(Qt.OpenHandCursor)
+        else:
+            self.viewport().unsetCursor()  # 没得拖就还回箭头，别给假希望
+
+    def _Pannable(self):
+        """图比可视区大才有的拖——这时候才有内容可挪，也才该给抓手。
+
+        比的是控件的 minimumSize 而不是滚动条的 range：range 要等滚动区排完版
+        才是新值，刚放大那一档问它还是旧的，会正好漏掉第一档。
+        """
+        widget = self.widget()
+        if widget is None:
+            return False
+        viewport = self.viewport().size()
+        return (
+            widget.minimumWidth() > viewport.width()
+            or widget.minimumHeight() > viewport.height()
+        )
 
 
 class ImagePreviewDialog(QDialog):
@@ -780,7 +865,7 @@ class ImagePreviewDialog(QDialog):
 
     窗口尺寸不写死：默认就开得比较大，还能接着往大拖，图始终铺满可视区。
     在这之上滚轮继续放大（以「铺满」为 1 倍，最多 ZOOM_MAX 倍），放过头了
-    滚动条自己会出来，挪着看边缘。
+    滚动条自己会出来，按住图拖着挪或者拨滚动条都行。
     """
 
     def __init__(self, title="", parent=None):
@@ -871,6 +956,8 @@ class ImagePreviewDialog(QDialog):
         # 转一圈事件循环。
         for bar in (self.area.horizontalScrollBar(), self.area.verticalScrollBar()):
             bar.setValue(bar.maximum() // 2)
+        # 能不能拖跟着尺寸走：刚放大到超出可视区就该换上抓手
+        self.area.RefreshCursor()
 
 
 class AddDialog(QDialog):

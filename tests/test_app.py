@@ -9,7 +9,16 @@ from datetime import datetime
 
 import pytest
 import requests
-from PyQt5.QtCore import QMimeData, QModelIndex, QObject, QPoint, QRect, Qt, pyqtSignal
+from PyQt5.QtCore import (
+    QEvent,
+    QMimeData,
+    QModelIndex,
+    QObject,
+    QPoint,
+    QRect,
+    Qt,
+    pyqtSignal,
+)
 from PyQt5.QtGui import (
     QDrag,
     QDragEnterEvent,
@@ -18,6 +27,7 @@ from PyQt5.QtGui import (
     QDropEvent,
     QFontMetrics,
     QKeySequence,
+    QMouseEvent,
     QPixmap,
 )
 from PyQt5.QtTest import QTest
@@ -2454,6 +2464,127 @@ def test_wheel_over_the_image_is_turned_into_zoom(window):
     area.wheelEvent(_Wheel())
 
     assert got == [120]
+
+
+def _mouse(kind, local, screen, button=Qt.LeftButton, pressed=Qt.NoButton):
+    """造个鼠标事件：local 是控件内坐标，screen 是屏幕坐标。
+
+    真机上这两个数常常对不上：拖动会把控件从光标底下挪走，控件内坐标跟着滚，
+    屏幕坐标不动。正因如此，拖着挪画面只认屏幕坐标。
+    """
+    return QMouseEvent(kind, local, screen, button, pressed, Qt.NoModifier)
+
+
+def _zoom_in(dialog, notches=3):
+    """滚到图明确超出可视区，好让它有的可拖。"""
+    for _ in range(notches):
+        dialog.OnWheel(120)
+
+
+def test_dragging_the_image_moves_the_view(preview, qapp):
+    """按住左键拖：画面跟着手走，往右下拖，滚动条就该往回退。"""
+    dialog = preview()
+    _zoom_in(dialog)
+    hbar = dialog.area.horizontalScrollBar()
+    vbar = dialog.area.verticalScrollBar()
+    start = (hbar.value(), vbar.value())
+    assert hbar.maximum() > 40  # 留得出拖的余量，别撞到两头
+
+    at = QPoint(500, 500)
+    qapp.sendEvent(dialog.label, _mouse(QEvent.MouseButtonPress, QPoint(100, 100), at))
+    qapp.sendEvent(
+        dialog.label,
+        _mouse(QEvent.MouseMove, QPoint(100, 100), at + QPoint(40, 30), Qt.NoButton, Qt.LeftButton),
+    )
+
+    assert (start[0] - hbar.value(), start[1] - vbar.value()) == (40, 30)
+
+
+def test_dragging_follows_the_screen_not_the_widget(preview, qapp):
+    """拖的是屏幕位移，不是控件内坐标。
+
+    滚动的时候控件就在光标底下挪，拿控件内坐标算位移会自己咬自己——挪一格
+    又喂回下一格的基准，一拖就飞。所以控件内坐标怎么变都不该算数。
+    """
+    dialog = preview()
+    _zoom_in(dialog)
+    hbar = dialog.area.horizontalScrollBar()
+    at = QPoint(500, 500)
+
+    qapp.sendEvent(dialog.label, _mouse(QEvent.MouseButtonPress, QPoint(100, 100), at))
+    before = hbar.value()
+    # 光标没动，控件自己在底下挪了 40 像素
+    qapp.sendEvent(
+        dialog.label,
+        _mouse(QEvent.MouseMove, QPoint(60, 70), at, Qt.NoButton, Qt.LeftButton),
+    )
+
+    assert hbar.value() == before  # 控件内坐标变了也当没看见
+
+    # 光标真动了 40 像素，这回才算数
+    qapp.sendEvent(
+        dialog.label,
+        _mouse(QEvent.MouseMove, QPoint(20, 10), at + QPoint(40, 0), Qt.NoButton, Qt.LeftButton),
+    )
+
+    assert before - hbar.value() == 40
+
+
+def test_dragging_is_off_while_the_image_still_fits(preview, qapp):
+    """铺满那一档没内容可挪：按下就别拦事件，光标也别给抓手。"""
+    dialog = preview()
+    hbar = dialog.area.horizontalScrollBar()
+
+    press = _mouse(QEvent.MouseButtonPress, QPoint(100, 100), QPoint(500, 500))
+    qapp.sendEvent(dialog.label, press)
+
+    assert not press.isAccepted()
+    assert hbar.value() == 0
+
+
+def test_moving_without_pressing_does_not_pan(preview, qapp):
+    """松手之后接着晃鼠标不该还在挪——不然拖完一松手，画面自己跟着走。"""
+    dialog = preview()
+    _zoom_in(dialog)
+    hbar = dialog.area.horizontalScrollBar()
+    at = QPoint(500, 500)
+
+    qapp.sendEvent(dialog.label, _mouse(QEvent.MouseButtonPress, QPoint(100, 100), at))
+    qapp.sendEvent(
+        dialog.label,
+        _mouse(QEvent.MouseMove, QPoint(100, 100), at + QPoint(40, 0), Qt.NoButton, Qt.LeftButton),
+    )
+    qapp.sendEvent(dialog.label, _mouse(QEvent.MouseButtonRelease, QPoint(100, 100), at))
+    after_release = hbar.value()
+
+    qapp.sendEvent(
+        dialog.label,
+        _mouse(QEvent.MouseMove, QPoint(100, 100), at + QPoint(200, 0), Qt.NoButton, Qt.LeftButton),
+    )
+
+    assert hbar.value() == after_release
+
+
+def test_cursor_says_whether_the_image_can_be_dragged(preview, qapp):
+    """光标说实话：铺满时是箭头，放大后张开手明示能拖，拖起来攥上，松手再张开。"""
+    dialog = preview()
+    viewport = dialog.area.viewport()
+    at = QPoint(500, 500)
+
+    assert viewport.cursor().shape() == Qt.ArrowCursor  # 还没超出可视区，拖不动
+
+    _zoom_in(dialog)
+    assert viewport.cursor().shape() == Qt.OpenHandCursor
+
+    qapp.sendEvent(dialog.label, _mouse(QEvent.MouseButtonPress, QPoint(100, 100), at))
+    assert viewport.cursor().shape() == Qt.ClosedHandCursor
+
+    qapp.sendEvent(dialog.label, _mouse(QEvent.MouseButtonRelease, QPoint(100, 100), at))
+    assert viewport.cursor().shape() == Qt.OpenHandCursor
+
+    for _ in range(5):
+        dialog.OnWheel(-120)
+    assert viewport.cursor().shape() == Qt.ArrowCursor  # 缩回铺满，抓手收回去
 
 
 # ---------------- 轮询线程 ----------------
