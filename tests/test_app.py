@@ -2306,6 +2306,156 @@ def test_preview_without_a_thumbnail_tells_the_user(window):
     assert w.previews == {}
 
 
+# ---------------- 预览窗口的放大 ----------------
+#
+# 这几条得让窗口真 show 出来：可视区尺寸和滚动条 range 都是滚动区排版时才算的，
+# 光 _Update 一遍量到的全是旧值，铺满和居中都验不了。窗口尺寸只给个大概值，真正
+# 铺多大由布局和滚动条决定，所以断言都拿量到的可视区来推，不写死像素。
+
+
+@pytest.fixture
+def preview(qapp):
+    """造预览窗口的工厂：按真机那样开出来，用完收干净。
+
+    with_image=False 时只开窗不贴图，给「图还没回来」那几条用。
+    """
+    made = []
+
+    def _make(window=(700, 760), with_image=True):
+        dialog = app_module.ImagePreviewDialog("甲")
+        dialog.resize(*window)
+        dialog.show()
+        qapp.processEvents()
+        if with_image:
+            pixmap = QPixmap(app_module.PREVIEW_SIZE, app_module.PREVIEW_SIZE)
+            pixmap.fill(Qt.blue)
+            dialog.SetImage(pixmap)
+            qapp.processEvents()
+        made.append(dialog)
+        return dialog
+
+    yield _make
+
+    for dialog in made:
+        dialog.close()
+        dialog.deleteLater()
+
+
+def _fit_side(dialog):
+    """铺满时图该有多大：方图铺满可视区的短边。"""
+    viewport = dialog.area.viewport().size()
+    return min(viewport.width(), viewport.height())
+
+
+def test_preview_window_is_not_a_fixed_size(preview):
+    """窗口不再写死尺寸：默认开得比一下能看全的尺寸大，也还能接着往大拖。"""
+    dialog = preview(with_image=False)
+
+    assert dialog.maximumSize().width() > 100000  # 没被 setFixedSize 钉死
+    assert dialog.minimumSize().width() == app_module.PREVIEW_MIN_SIDE
+    assert dialog.size().width() > app_module.PREVIEW_MIN_SIDE  # 默认比下限大
+
+
+def test_image_fills_the_viewport_by_default(preview):
+    """默认那一档是铺满：图整个摊在可视区里，不是缩在一角。"""
+    dialog = preview()
+
+    shown = dialog.label.pixmap().size()
+    assert shown.width() == _fit_side(dialog)
+    assert shown.height() == shown.width()
+
+
+def test_a_bigger_window_shows_a_bigger_image(preview, qapp):
+    """窗口拖大，图跟着一起大——「放大」不只有滚轮一条路。"""
+    dialog = preview()
+    before = dialog.label.pixmap().width()
+
+    dialog.resize(1100, 1160)
+    qapp.processEvents()
+
+    assert dialog.label.pixmap().width() > before
+    assert dialog.label.pixmap().width() == _fit_side(dialog)  # 大完还是铺满
+
+
+def test_wheel_up_zooms_in(preview):
+    """往上滚放大：放完比铺满还大，大出来的部分交给滚动条。"""
+    dialog = preview()
+    before = dialog.label.pixmap().width()
+
+    dialog.OnWheel(120)
+
+    assert dialog.zoom > 1.0
+    assert dialog.label.pixmap().width() > before
+
+
+def test_zooming_keeps_the_middle_in_view(preview):
+    """放大后视图落在正中：不然每滚一格都从左上角看起，中间那块得自己拖回去。"""
+    dialog = preview()
+
+    for _ in range(3):
+        dialog.OnWheel(120)
+
+    for bar in (dialog.area.horizontalScrollBar(), dialog.area.verticalScrollBar()):
+        assert bar.maximum() > 0  # 图确实超出可视区了
+        # 容一点误差：图刚撑出滚动条那一档，可视区会窄掉一条滚动条，而 range 要等
+        # 排完版才是最终值，居中会差那么几像素；再往后几档就是准的
+        assert abs(bar.value() - bar.maximum() // 2) <= 16
+
+
+def test_wheel_down_stops_at_fit(preview):
+    """往下滚最多缩回铺满：再缩就是图在窗口里越缩越小，看图时没有意义。"""
+    dialog = preview()
+
+    dialog.OnWheel(-120)
+    dialog.OnWheel(-120)
+
+    assert dialog.zoom == 1.0
+    assert dialog.label.pixmap().width() == _fit_side(dialog)
+
+
+def test_zoom_stops_at_the_top(preview):
+    """放大有顶：720 的图撑到 4 倍往上就只剩马赛克了。"""
+    dialog = preview()
+
+    for _ in range(40):
+        dialog.OnWheel(120)
+
+    assert dialog.zoom == app_module.ZOOM_MAX
+
+
+def test_wheel_before_the_image_arrives_is_ignored(preview, qapp):
+    """图还没到就滚滚轮：不该炸，也不该把缩放记下来去影响后面贴上的图。"""
+    dialog = preview(with_image=False)
+
+    dialog.OnWheel(120)  # 不抛异常即通过
+
+    assert dialog.zoom == 1.0
+    pixmap = QPixmap(app_module.PREVIEW_SIZE, app_module.PREVIEW_SIZE)
+    pixmap.fill(Qt.blue)
+    dialog.SetImage(pixmap)
+    qapp.processEvents()
+
+    assert dialog.label.pixmap().width() == _fit_side(dialog)  # 贴上来还是铺满那一档
+
+
+def test_wheel_over_the_image_is_turned_into_zoom(window):
+    """滚轮得从滚动区手里抢过来做缩放，而不是让它滚滚动条。"""
+    area = app_module.PreviewArea()
+    got = []
+    area.wheeled.connect(got.append)
+
+    class _Wheel:
+        def angleDelta(self):
+            return QPoint(0, 120)
+
+        def accept(self):
+            pass
+
+    area.wheelEvent(_Wheel())
+
+    assert got == [120]
+
+
 # ---------------- 轮询线程 ----------------
 
 

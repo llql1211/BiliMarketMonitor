@@ -44,6 +44,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QShortcut,
     QStyle,
     QStyledItemDelegate,
@@ -66,12 +67,21 @@ import theme
 IMAGE_SIZE = 96  # 缩略图边长（配合 CDN 裁剪后缀减小流量）
 IMAGE_SUFFIX = f"@{IMAGE_SIZE}w_{IMAGE_SIZE}h_85q.webp"
 
-# 双击缩略图看的大图：原图是 1280x1280、动辄 1MB 出头，480w 有 30 多 KB 就够看清了
-PREVIEW_SIZE = 480
+# 双击缩略图看的大图：原图是 1280x1280、动辄 1MB 出头，720w 有 60 多 KB，
+# 铺满默认大小的预览窗口（约 860）正合适，再往上放大才见糊
+PREVIEW_SIZE = 720
 PREVIEW_SUFFIX = f"@{PREVIEW_SIZE}w_{PREVIEW_SIZE}h_85q.webp"
 PREVIEW_LOADING_TEXT = "正在加载大图…"
 PREVIEW_FAILED_TEXT = "大图没下下来，稍后再双击试试"
 NO_THUMBNAIL_TEXT = "这一行还没有缩略图，先抓取一次再双击查看"
+
+# 预览窗口默认开多大：尽量摊开看，但不超出屏幕，也不小于一个能看的尺寸
+PREVIEW_DEFAULT_SIDE = 860
+PREVIEW_MIN_SIDE = 320
+PREVIEW_BUTTON_ROW = 40  # 底下「关闭」那一行占的高度，从边长里留给它
+
+ZOOM_STEP = 1.25  # 滚轮每滚一格的放大倍数
+ZOOM_MAX = 4.0    # 最多放到铺满的 4 倍；720 的图再往上就是马赛克了
 
 ROW_NUMBER_PADDING = 16  # 序号槽左右留白，免得数字贴着分隔线
 
@@ -747,42 +757,120 @@ class PriceDeltaDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+class PreviewArea(QScrollArea):
+    """看大图用的滚动区：滚轮在这儿改缩放，不让滚动条把它吃了。
+
+    别的滚动区滚轮是滚内容，可看图的当口「往下滚一屏」没什么用——放大才是。
+    放大到超出窗口之后要靠滚动条挪着看，所以滚动条留着不关。
+    """
+
+    wheeled = pyqtSignal(int)  # 滚轮这一格的垂直步长（往上为正）
+
+    def wheelEvent(self, event):
+        self.wheeled.emit(event.angleDelta().y())
+        event.accept()
+
+
 class ImagePreviewDialog(QDialog):
     """双击缩略图弹出的大图。
 
     开窗不等图：大图比缩略图大几百倍，下载要一会儿，所以先把窗口摆出来，
     里面写着「正在加载大图…」，图回来了再换上（见 MainWindow.OnPreviewFetched）。
     窗口不开模态——看图的当口还想顺手点点表格，是很自然的事。
+
+    窗口尺寸不写死：默认就开得比较大，还能接着往大拖，图始终铺满可视区。
+    在这之上滚轮继续放大（以「铺满」为 1 倍，最多 ZOOM_MAX 倍），放过头了
+    滚动条自己会出来，挪着看边缘。
     """
 
     def __init__(self, title="", parent=None):
         super().__init__(parent)
         self.setWindowTitle(title or "商品图")
-        # 固定成图那么大：换成图时不至于整窗跳一下，也省得被长文案撑变形
-        self.setFixedSize(PREVIEW_SIZE + 48, PREVIEW_SIZE + 80)
+        self.pixmap = None
+        self.zoom = 1.0  # 相对「铺满」的倍数，滚轮调的就是这个
+
+        self.label = QLabel(PREVIEW_LOADING_TEXT)
+        self.label.setAlignment(Qt.AlignCenter)  # 图比可视区小的时候居中，文字也是
+
+        self.area = PreviewArea()
+        self.area.setWidget(self.label)
+        # 控件跟着可视区长大：图小的时候由 label 的居中把留白摊匀，
+        # 图大的时候靠 label 的 minimumSize 把滚动条撑出来
+        self.area.setWidgetResizable(True)
+        self.area.setAlignment(Qt.AlignCenter)
+        self.area.wheeled.connect(self.OnWheel)
 
         layout = QVBoxLayout(self)
-        self.label = QLabel(PREVIEW_LOADING_TEXT)
-        self.label.setAlignment(Qt.AlignCenter)
-        self.label.setFixedSize(PREVIEW_SIZE, PREVIEW_SIZE)
-        layout.addWidget(self.label, alignment=Qt.AlignCenter)
+        layout.addWidget(self.area)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.button(QDialogButtonBox.Close).setText("关闭")
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+        self._ApplyDefaultSize()
+
+    def _ApplyDefaultSize(self):
+        """开窗尺寸：尽量摊开，但别把标题栏和关闭按钮顶到屏幕外去。"""
+        side = PREVIEW_DEFAULT_SIDE
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            side = min(side, avail.width() - 80, avail.height() - 160)
+        side = max(side, PREVIEW_MIN_SIDE)
+        self.setMinimumSize(PREVIEW_MIN_SIDE, PREVIEW_MIN_SIDE)
+        self.resize(side, side + PREVIEW_BUTTON_ROW)
+
     def SetImage(self, pixmap):
-        """贴上大图。缩放兜个底：CDN 裁剪理论上给的就是 480，万一不是也别撑破窗口。"""
+        """贴上大图。缩放兜个底：CDN 裁剪理论上给的就是 PREVIEW_SIZE，万一不是也别撑破窗口。"""
+        self.pixmap = pixmap
         self.label.setText("")
-        self.label.setPixmap(
-            pixmap.scaled(
-                PREVIEW_SIZE, PREVIEW_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-        )
+        self._Update()
 
     def SetFailed(self):
         self.label.setText(PREVIEW_FAILED_TEXT)
+
+    def OnWheel(self, delta):
+        """滚轮缩放：往上滚放大，往下滚最多缩回铺满，到顶就不再涨。"""
+        if self.pixmap is None or not delta:
+            return
+        self.zoom = min(ZOOM_MAX, max(1.0, self.zoom * ZOOM_STEP ** (delta / 120)))
+        self._Update()
+
+    def resizeEvent(self, event):
+        """窗口一变大变小就把图重排一遍——铺满的基准跟着可视区走。"""
+        super().resizeEvent(event)
+        self._Update()
+
+    def _Update(self):
+        """按当前缩放把图摆好：1 倍正好铺满可视区，再乘上滚轮给的倍数。
+
+        尺寸取整往下走（int 而不是 round）：铺满那一档要是反过来把图撑出可视区
+        一个像素，滚动条就会自己冒出来，看着像没铺满。
+        """
+        if self.pixmap is None:
+            return
+        viewport = self.area.viewport().size()
+        fit = min(
+            viewport.width() / self.pixmap.width(),
+            viewport.height() / self.pixmap.height(),
+        )
+        size = QSize(
+            max(1, int(self.pixmap.width() * fit * self.zoom)),
+            max(1, int(self.pixmap.height() * fit * self.zoom)),
+        )
+        self.label.setMinimumSize(size)
+        self.label.setPixmap(
+            self.pixmap.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        )
+        # 拉到正中：放大后要看的多半是中间那块，不这么做每滚一格都从左上角看起，
+        # 想往中间看还得自己拖回去。图没超出可视区时 range 是 0，这一步等于没做。
+        #
+        # 这里读到的 maximum 有时候还是上一档的（滚动条的 range 要等滚动区排完版
+        # 才是最终值），居中会差几个像素；下一档就准了，看着不碍事，不值得为它去
+        # 转一圈事件循环。
+        for bar in (self.area.horizontalScrollBar(), self.area.verticalScrollBar()):
+            bar.setValue(bar.maximum() // 2)
 
 
 class AddDialog(QDialog):
