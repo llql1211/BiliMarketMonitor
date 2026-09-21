@@ -2665,8 +2665,13 @@ def test_summary_subtitle_mentions_failures():
     )
 
 
-# 用例一律用「N秒前」写时间：它是 1 秒宽的窄格子，老记录变老多少秒可以精确算出来。
-# 换成「8天前」这种宽格子，改一个字就可能跨格，算错的是用例而不是实现。
+# 这一组用例用「N秒前」写时间：它是 1 秒宽的窄格子，老记录变老多少秒可以精确算出来，
+# 换个「8天前」就得手算跨没跨格，算错的是用例而不是实现。
+#
+# 但窄格子是**躲开了**真实数据里最常见的一种情况：宽格子里原文压根不动。真实数据
+# 长「5小时前」「5天前」这样（一小时、一天宽的格子），隔几分钟再抓一次，同一条成交
+# 的原文一个字都不变。只写窄格子的话，实现里「原文不动时算不算同一条」这条路径一次
+# 都走不到——曾经就是这么放过了一个 bug（见 _aged_from）。宽格子的用例另写一组。
 _AGING = 21600  # 两轮之间的间隔：老记录会整整变老这么多
 
 
@@ -2783,6 +2788,76 @@ def test_new_deals_uses_the_boundary_it_was_given():
     assert app_module.new_deals(
         [{"price": "¥205", "time": "1000200秒前"}], old, elapsed=0
     ) == [{"price": "¥205", "time": "1000200秒前"}]
+
+
+# ---- 宽格子：真实数据的样子。原文常常一个字都不变（上面的窄格子用例走不到）----
+
+
+def test_new_deals_takes_an_unmoved_wide_bucket_for_the_same_deal():
+    """「5小时前」是一小时宽的格子：隔十分钟再抓，原文一个字没变，还是同一条。
+
+    这就是线上误报的主因：只消几分钟，宽格子的原文就不会动，而"老记录变老之后
+    该处的区间"整段往右挪了那几分钟，拿"下界落没落进去"一判，老成交就成了新的。
+    """
+    old = [{"price": "¥87", "time": "5小时前"}]
+
+    for elapsed in (60, 600, 3599):
+        assert app_module.new_deals(
+            [{"price": "¥87", "time": "5小时前"}], old, elapsed=elapsed
+        ) == [], f"隔了 {elapsed} 秒就报成新增了"
+
+
+def test_new_deals_takes_a_wide_bucket_that_did_move():
+    """跨到下一格时同样认得出：「5小时前」过一小时该是「6小时前」。"""
+    old = [{"price": "¥87", "time": "5小时前"}]
+
+    assert app_module.new_deals(
+        [{"price": "¥87", "time": "6小时前"}], old, elapsed=3600
+    ) == []
+
+
+def test_new_deals_on_a_realistic_round():
+    """照真实缓存里那样来一轮：三条宽格子成交原文不动，只多了一条真新的。
+
+    新增那条跟老成交同价（同一件东西连着卖出去的价往往一样），只能靠年龄把它挑出来。
+    """
+    old = [
+        {"price": "¥87", "time": "5小时前"},
+        {"price": "¥87", "time": "23小时前"},
+        {"price": "¥89.99", "time": "5天前"},
+    ]
+    now = [
+        {"price": "¥87", "time": "刚刚"},          # 新的：老的那几条都没这么年轻
+        {"price": "¥87", "time": "5小时前"},
+        {"price": "¥87", "time": "23小时前"},
+    ]
+
+    assert app_module.new_deals(now, old, elapsed=600) == [
+        {"price": "¥87", "time": "刚刚"}
+    ]
+
+
+def test_new_deals_prefers_the_old_reading_inside_a_wide_bucket():
+    """宽格子里同价位真分不清的时候按"老的"处理，代价是漏报，换的是不误报。
+
+    老记录「2小时前」，隔十分钟它可能还在「2小时前」，也可能已跨进「3小时前」，
+    两者都说得通——那就当它是老的。放宽判据保住"原文不动不误报"，代价记在这儿。
+    """
+    old = [{"price": "¥87", "time": "2小时前"}]
+
+    assert app_module.new_deals(
+        [{"price": "¥87", "time": "3小时前"}], old, elapsed=600
+    ) == []
+
+
+def test_new_deals_still_rejects_a_younger_deal_with_the_same_price():
+    """放宽重叠判据不等于什么都说成老的：比上轮还年轻、又远在区间外的照报。"""
+    old = [{"price": "¥87", "time": "5小时前"}]
+
+    for younger in ("4小时前", "1小时前", "刚刚"):
+        assert app_module.new_deals(
+            [{"price": "¥87", "time": younger}], old, elapsed=600
+        ) == [{"price": "¥87", "time": younger}]
 
 
 def test_summary_sections_renders_every_block_with_content():

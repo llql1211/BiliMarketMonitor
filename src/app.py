@@ -345,8 +345,8 @@ def new_deals(deals, previous, elapsed, grace=DEALS_MATCH_GRACE_SECONDS) -> list
 
     比的是「价格 + 年龄」，不比时间原文：原文是人话（「9小时前」），只给到
     精度有限的区间，同一条成交下一轮就渲染成「10小时前」了，拿它对字符串会把
-    老成交一次次报成新的。所以判据是——价格完全相同，且这条现在的年龄，落在
-    「老记录搁了 elapsed 秒」该处的那段年龄区间里（见 _aged_from）。
+    老成交一次次报成新的。所以判据是——价格完全相同，且这条现在所在的年龄格子，
+    跟「老记录搁了 elapsed 秒之后该处的年龄区间」有重叠（见 _aged_from）。
 
     两轮的间隔由调用方按各自记录的抓取时刻算好递进来（见 OnResultReady）：
     缓存里的成交带着抓取时刻，重启后也能接着比。
@@ -390,11 +390,17 @@ def _aged_from(old_deals, deal, elapsed, claimed, grace):
             if str(candidate.get("time") or "") == str(deal.get("time") or ""):
                 return index
             continue
-        # 老记录当时是「lo～hi 秒前」，过去 elapsed 秒之后该变成「lo+elapsed～hi+elapsed
-        # 秒前」。这条现在的年龄落在这个范围里（两端再各留一点容限）就是同一条。
+        # 老记录当时在「lo～hi 秒前」这格里，过去 elapsed 秒之后该在「lo+elapsed～
+        # hi+elapsed」这段里；这条现在所在的是「lo'～hi'」这格。两段有重叠才可能是
+        # 同一条（两端再各留一点容限）。
+        #
+        # 判「这条的下界落没落在移位后的区间里」是不行的：真实数据里格子很宽
+        # （「5小时前」整整一小时宽），隔几分钟再抓一次，原文一个字都不会变，而它的
+        # 下界"该"往右挪了那几分钟，一判就判成新的——一条老成交会被一轮轮报上来。
+        # 重叠才是必要条件：这条当时的真实年龄既在该处的区间里，也在现在这格里。
         lower = old_bounds[0] + elapsed - grace
         upper = old_bounds[1] + elapsed + grace
-        if lower <= bounds[0] <= upper:
+        if lower <= bounds[1] and bounds[0] <= upper:
             return index
     return None
 
