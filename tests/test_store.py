@@ -488,3 +488,80 @@ def test_context_manager_closes(db):
         st.upsert_item("1001", "甲", None)
         assert st.get_item("1001")["name"] == "甲"
     assert st.conn is None
+
+
+# ---------------- 成交快照 ----------------
+
+
+def test_upsert_item_saves_the_deal_snapshot(db):
+    """抓到的成交连同 deals_updated_at 一起写进去，读回来能按它判新增。"""
+    st = store.Store(db)
+    deals = [{"price": "¥205", "time": "2小时前"}, {"price": "¥48", "time": "8天前"}]
+    st.upsert_item("1001", "甲", None, price_text="¥44", deals=deals)
+
+    got, anchor = st.cached_deals("1001")
+    assert got == deals
+    assert anchor == st.get_item("1001")["deals_updated_at"]
+
+
+def test_upsert_without_deals_keeps_the_old_ones(db):
+    """deals=None 表示这次没抓到成交：上一轮那组原样留着当基准。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", None, price_text="¥44", deals=[{"price": "¥205", "time": "刚刚"}])
+    st.upsert_item("1001", "甲", None, price_text="¥45")
+
+    assert st.cached_deals("1001")[0] == [{"price": "¥205", "time": "刚刚"}]
+
+
+def test_upsert_with_an_empty_deal_list_overwrites(db):
+    """空列表是"抓到了、确实一条都没有"（比如售罄），跟没抓到不是一回事。
+
+    上一轮那组要被真的顶掉：留着就会把昨天的成交当成今天的基准。
+    """
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", None, price_text="¥44", deals=[{"price": "¥205", "time": "刚刚"}])
+    st.upsert_item("1001", "甲", None, price_text="¥138", sold_out=True, deals=[])
+
+    assert st.cached_deals("1001") == ([], None)  # 空得不剩东西，等于没有基准
+
+
+def test_cached_deals_without_a_record_is_empty(db):
+    """没这条商品时给个空基准，不抛异常。"""
+    assert store.Store(db).cached_deals("404") == ([], None)
+
+
+@pytest.mark.parametrize("junk", ["{不是 JSON", '"字符串"', "123", "[1, 2, 3]"])
+def test_cached_deals_survives_a_broken_json_column(db, junk):
+    """缓存里那格被写坏了只当"没有基准"——一条坏记录不该让整轮抓取崩掉。
+
+    时刻也要一起丢掉：留着它就成了"有个抓取时刻、却没有成交"的错配基准。
+    """
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", None, price_text="¥44")
+    with st.conn:
+        st.conn.execute("UPDATE items SET deals_json = ? WHERE cluster_id = '1001'", (junk,))
+
+    assert st.cached_deals("1001") == ([], None)
+
+
+def test_old_db_without_deal_columns_is_upgraded(db):
+    """老库（没有成交两列）打开时自动补上，读到的是"还没有基准"。"""
+    conn = sqlite3.connect(db)
+    with conn:
+        conn.execute(
+            """CREATE TABLE items (
+                   cluster_id TEXT PRIMARY KEY,
+                   name       TEXT,
+                   image_url  TEXT,
+                   updated_at TEXT
+               )"""
+        )
+        conn.execute("INSERT INTO items VALUES ('1001', '甲', 'img', '2024-01-01T00:00:00')")
+    conn.close()
+
+    st = store.Store(db)
+
+    assert st.cached_deals("1001") == ([], None)
+    st.upsert_item("1001", "甲", None, price_text="¥44", deals=[{"price": "¥205", "time": "刚刚"}])
+    assert st.cached_deals("1001")[0] == [{"price": "¥205", "time": "刚刚"}]
+    assert st.notes == []

@@ -5,6 +5,7 @@
 """
 
 import time
+from datetime import datetime
 
 import pytest
 import requests
@@ -699,19 +700,29 @@ CACHED_AT = "2026-09-16T10:30:00"
 
 def _seed_cache(
     w, price="¥50", reference=None, avg=None, sold_out=False, when=CACHED_AT,
-    cluster_id="10000008780",
+    cluster_id="10000008780", deals=None, deals_when=None,
 ):
     """往缓存里塞一条「上次抓取」的价格（默认第一行那件商品）。
 
     时间是写回去的（upsert 自己记的是当前时间），这样提示语可以断言；
-    when=None 模拟老库补列后留下的空时间戳。
+    when=None 模拟老库补列后留下的空时间戳。deals 给成交（判新增时的基准），
+    deals_when 给它的抓取时刻——两个都省掉就是"还没抓到过成交"。
     """
     w.store.upsert_item(
         cluster_id, "甲", None,
         price_text=price, reference_price=reference, avg_text=avg, sold_out=sold_out,
+        deals=deals,
     )
     with w.store.conn:
-        w.store.conn.execute("UPDATE items SET price_updated_at = ?", (when,))
+        w.store.conn.execute(
+            "UPDATE items SET price_updated_at = ? WHERE cluster_id = ?",
+            (when, cluster_id),
+        )
+        if deals is not None:
+            w.store.conn.execute(
+                "UPDATE items SET deals_updated_at = ? WHERE cluster_id = ?",
+                (deals_when or when, cluster_id),
+            )
 
 
 def _delta(w, row=0):
@@ -1267,6 +1278,37 @@ def test_summary_reports_new_deals(window, monkeypatch, wait_until):
     detail = w.summary_dialog.detail.toPlainText()
     assert "¥205 · 2小时前" in detail
     assert "8天前" not in detail  # 上一轮就有的那两条不算新增
+
+
+def test_new_deals_survive_a_restart(window, monkeypatch, wait_until):
+    """成交基准存在缓存里，隔一次重启也还在，不会把上次那几条又报一遍。"""
+    # 用「N秒前」写：格子只有 1 秒宽，抓取时刻又刚好是刚刚，判起来不差分毫
+    cached = [{"price": "¥205", "time": "1000000秒前"}, {"price": "¥205", "time": "1000001秒前"}]
+    w = window("10000008780 | 甲\n")
+    _seed_cache(w, price="¥44", deals=cached,
+                deals_when=datetime.now().isoformat(timespec="seconds"))
+    w.close()  # 关掉这一轮，重新开的窗口只能从缓存里认人
+
+    # 和缓存那两条一模一样：重启后不该再报一次
+    seen = raw_ok(name="甲", price="¥44", deal_times=["1000000秒前", "1000001秒前"])
+    # 挤进来一条新的（1000000-21600），老的那条跟着退到第二位
+    fresh = raw_ok(name="甲", price="¥44", deal_times=["978400秒前", "1000000秒前"])
+
+    # 换个窗口：内存里什么都没有，基准只可能来自缓存
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
+    monkeypatch.setattr(client, "fetch_cluster", _fetch_by_id({"10000008780": seen}))
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+    assert "新增成交" not in w.summary_dialog.headline.text()  # 缓存里那两条都认得出
+
+    monkeypatch.setattr(client, "fetch_cluster", _fetch_by_id({"10000008780": fresh}))
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+
+    assert w.summary_dialog.headline.text() == "本次 1 项：新增成交 1"
+    assert "978400秒前" in w.summary_dialog.detail.toPlainText()
 
 
 def test_summary_reports_prices_below_the_expected_price(window, monkeypatch, wait_until):
@@ -2623,30 +2665,124 @@ def test_summary_subtitle_mentions_failures():
     )
 
 
-def test_new_deals_keeps_only_the_fresh_ones():
-    """上一轮那三条要认出来剔掉，新挤进来的才算新增。"""
-    old = [{"price": "¥48", "time": "3天前"}, {"price": "¥50", "time": "5天前"}]
-    now = [{"price": "¥45", "time": "2小时前"}] + old
+# 用例一律用「N秒前」写时间：它是 1 秒宽的窄格子，老记录变老多少秒可以精确算出来。
+# 换成「8天前」这种宽格子，改一个字就可能跨格，算错的是用例而不是实现。
+_AGING = 21600  # 两轮之间的间隔：老记录会整整变老这么多
 
-    assert app_module.new_deals(now, old) == [{"price": "¥45", "time": "2小时前"}]
+
+def test_new_deals_keeps_only_the_fresh_ones():
+    """上一轮那几条要认出来剔掉，新挤进来的才算新增。"""
+    old = [{"price": "¥205", "time": "1000000秒前"}, {"price": "¥50", "time": "2000000秒前"}]
+    now = [
+        {"price": "¥45", "time": "5000秒前"},        # 新成交：上一轮还没有
+        {"price": "¥205", "time": "1021600秒前"},    # 老的，正好变老 21600 秒
+        {"price": "¥50", "time": "2021600秒前"},     # 老的，同上
+    ]
+
+    assert app_module.new_deals(now, old, elapsed=_AGING) == [
+        {"price": "¥45", "time": "5000秒前"}
+    ]
+
+
+def test_new_deals_recognizes_a_deal_that_merely_grew_older():
+    """老成交只是变老了，仍然是同一条——比时间字符串的话这里就误报了。"""
+    old = [{"price": "¥205", "time": "1000000秒前"}]
+    now = [{"price": "¥205", "time": "1021600秒前"}]
+
+    assert app_module.new_deals(now, old, elapsed=_AGING) == []
+
+
+def test_new_deals_rejects_time_traveling_backwards():
+    """同一价格却比上一轮还"新"，那就不是老记录变老，是新的一条。"""
+    old = [{"price": "¥205", "time": "1000000秒前"}]
+
+    assert app_module.new_deals(
+        [{"price": "¥205", "time": "999999秒前"}], old, elapsed=_AGING
+    ) == [{"price": "¥205", "time": "999999秒前"}]
+
+
+def test_new_deals_is_not_fooled_by_position():
+    """位置会随新成交往下挤，认的是「找不找得到」而不是「排第几」。"""
+    old = [{"price": "¥205", "time": "1000000秒前"}]
+    now = [
+        {"price": "¥204", "time": "5000秒前"},      # 新的，挤到最前
+        {"price": "¥205", "time": "1021600秒前"},   # 老的那条，退到第二位
+    ]
+
+    assert app_module.new_deals(now, old, elapsed=_AGING) == [
+        {"price": "¥204", "time": "5000秒前"}
+    ]
+
+
+def test_new_deals_will_not_read_a_same_price_deal_as_new_forever():
+    """同价位的成交没有旁的线索时按"老的"处理，宁可漏报也不一轮轮地误报。"""
+    old = [{"price": "¥205", "time": "1000000秒前"}]
+
+    assert app_module.new_deals(
+        [{"price": "¥205", "time": "1021600秒前"}], old, elapsed=_AGING
+    ) == []
 
 
 @pytest.mark.parametrize("previous", [None, [], ["乱写的一条"]])
-def test_new_deals_reports_everything_without_a_baseline(previous):
-    """没有上一次的清单时（首次抓到）都算新的——要不要报由调用方按"有没有基准"挡。"""
+def test_new_deals_without_a_baseline_reports_nothing(previous):
+    """没有基准（首次抓到）时一条都不报：全说成「新增」是假的。"""
     now = [{"price": "¥45", "time": "2小时前"}]
 
-    assert app_module.new_deals(now, previous) == now
+    assert app_module.new_deals(now, previous, elapsed=3600) == []
 
 
 def test_new_deals_matches_on_price_when_time_is_missing():
-    """成交时间认不出来（空串）时按价格认：同一条不重复报，新的照报。"""
+    """成交时间认不出来（空串）时按原文相等认：同一条不重复报，新的照报。"""
     old = [{"price": "¥48", "time": ""}]
 
-    assert app_module.new_deals([{"price": "¥48", "time": ""}], old) == []
-    assert app_module.new_deals([{"price": "¥45", "time": ""}], old) == [
+    assert app_module.new_deals([{"price": "¥48", "time": ""}], old, elapsed=3600) == []
+    assert app_module.new_deals([{"price": "¥45", "time": ""}], old, elapsed=3600) == [
         {"price": "¥45", "time": ""}
     ]
+
+
+def test_new_deals_falls_back_to_the_text_when_ages_are_unreadable():
+    """两边都读不出年龄（「昨天」这种）时退回原文比对。"""
+    old = [{"price": "¥48", "time": "昨天"}]
+
+    assert app_module.new_deals([{"price": "¥48", "time": "昨天"}], old, elapsed=3600) == []
+    assert app_module.new_deals([{"price": "¥48", "time": "前天"}], old, elapsed=3600) == [
+        {"price": "¥48", "time": "前天"}
+    ]
+
+
+def test_new_deals_gives_the_interval_a_little_slack():
+    """差在容限内（时钟抖动）不算新的，超出一个容限就算。
+
+    老记录「3小时前」的格子是 [10800, 14399]，过 7200 秒之后该是
+    [18000, 21599]，两端各留 60 秒容限 → [17940, 21659] 都还认得出。
+    """
+    old = [{"price": "¥205", "time": "3小时前"}]
+
+    for inside in ("18000秒前", "21659秒前"):
+        assert app_module.new_deals(
+            [{"price": "¥205", "time": inside}], old, elapsed=7200
+        ) == []
+    for outside in ("17939秒前", "21660秒前"):
+        assert app_module.new_deals(
+            [{"price": "¥205", "time": outside}], old, elapsed=7200
+        ) == [{"price": "¥205", "time": outside}]
+
+
+def test_new_deals_uses_the_boundary_it_was_given():
+    """elapsed=0（两轮之间没隔时间/认不出抓取时刻）：只有同一格才算同一条。
+
+    「1000000秒前」的格子是 [1000000, 1000060)，容限 60——1000060 恰在边界上，
+    再老一秒就出了容限，认不出来。
+    """
+    old = [{"price": "¥205", "time": "1000000秒前"}]
+
+    assert app_module.new_deals(
+        [{"price": "¥205", "time": "1000060秒前"}], old, elapsed=0
+    ) == []
+    assert app_module.new_deals(
+        [{"price": "¥205", "time": "1000200秒前"}], old, elapsed=0
+    ) == [{"price": "¥205", "time": "1000200秒前"}]
 
 
 def test_summary_sections_renders_every_block_with_content():

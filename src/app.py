@@ -141,6 +141,10 @@ TARGET_HEADING = "低于预期价格"
 SECTION_SEPARATOR = "<br><br>"  # 块与块之间的空行：QTextEdit 的 CSS 边距靠不住
 TARGET_PRICE_TIP = "已低于预期价"
 
+# 判「同一条成交」时给年龄区间留的容限（秒）：挡两轮之间的时钟抖动，
+# 以及「区间边界上差一秒」这种取整噪声（见 new_deals）
+DEALS_MATCH_GRACE_SECONDS = 60
+
 
 def _skipped_note(duplicated: int, invalid: int) -> str:
     """「添加」结果里的补充说明：有几条已存在、几行没认出来。"""
@@ -294,14 +298,22 @@ def delta_rect(metrics, text_rect, prefix, delta):
     return QRect(left, text_rect.top(), text_rect.right() + 1 - left, text_rect.height())
 
 
+def _parse_stamp(value):
+    """缓存里的 ISO 时间串 → datetime；认不出来返回 None。"""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
 def _display_time(value) -> str:
     """缓存里的 ISO 时间串 →「2026-09-16 10:30:00」；认不出来就原样返回。"""
     if not isinstance(value, str) or not value.strip():
         return ""
-    try:
-        return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        return value
+    stamp = _parse_stamp(value)
+    return stamp.strftime("%Y-%m-%d %H:%M:%S") if stamp else value
 
 
 def _cached_note(updated_at) -> str:
@@ -328,29 +340,63 @@ def _dicts(items) -> list:
     return [item for item in items or [] if isinstance(item, dict)]
 
 
-def new_deals(deals, previous) -> list:
+def new_deals(deals, previous, elapsed, grace=DEALS_MATCH_GRACE_SECONDS) -> list:
     """本次抓到的成交里，上一次没出现过的那几条（见 SummaryDialog）。
 
-    previous 是抓取前表格里那三条的原始 dict 列表，可能为空（第一次抓商品）。
-    按「价格 + 时间」认是不是同一条：接口每次回的都是最近几条，位置会随着
-    新成交往里挤，但同一条记录的两个字段不会变。只有价格没时间的那种，
-    两次抓到的文本一样就当同一条，认不出来的一律不算新增——宁可漏报一条，
-    也不要把旧成交说成新的。
+    比的是「价格 + 年龄」，不比时间原文：原文是人话（「9小时前」），只给到
+    精度有限的区间，同一条成交下一轮就渲染成「10小时前」了，拿它对字符串会把
+    老成交一次次报成新的。所以判据是——价格完全相同，且这条现在的年龄，落在
+    「老记录搁了 elapsed 秒」该处的那段年龄区间里（见 _aged_from）。
 
-    previous 为 None 表示"本轮之前还没抓到过这件商品"，此时没有基准可比，
-    照实全报——要不要报由调用方决定（界面那边的口径是"本次运行没抓到过就
-    不报"，见 OnResultReady）。
+    两轮的间隔由调用方按各自记录的抓取时刻算好递进来（见 OnResultReady）：
+    缓存里的成交带着抓取时刻，重启后也能接着比。
+
+    没有基准可比时（还没抓到过这件商品、或缓存里没存成交）一条都不报——
+    把三条全说成「新增」是假的。宁可漏报也不误报：粗粒度下确实有分不清的时候
+    （老记录「10分钟前」、两轮只隔 1 分钟，而新记录是「5分钟前」），这种按老的处理。
     """
+    old = _dicts(previous)
+    if not old:
+        return []  # 没有基准就一条都不报，由这里挡住，别指望调用方记得判
     fresh = []
+    claimed = set()  # 已经被认领走的老记录不再参与后面的比对
     for deal in _dicts(deals):
-        key = (str(deal.get("price") or ""), str(deal.get("time") or ""))
-        if any(
-            (str(old.get("price") or ""), str(old.get("time") or "")) == key
-            for old in _dicts(previous)
-        ):
-            continue
-        fresh.append(deal)
+        index = _aged_from(old, deal, elapsed, claimed, grace)
+        if index is None:
+            fresh.append(deal)
+        else:
+            claimed.add(index)
     return fresh
+
+
+def _aged_from(old_deals, deal, elapsed, claimed, grace):
+    """在还没被认领的老记录里，找 deal 是「变老 elapsed 秒」的那一条，返回下标。
+
+    新成交一定把老记录往下挤（列表按时间倒序、只留几条），所以「这条是老的」
+    等价于「在没被认领过的老记录里找得到它」，与它现在排第几无关。
+
+    找不到返回 None，调用方按新增成交处理。
+    """
+    price = str(deal.get("price") or "")
+    bounds = parser.age_bounds(deal.get("time"))
+    for index, candidate in enumerate(old_deals):
+        if index in claimed:
+            continue
+        if str(candidate.get("price") or "") != price:
+            continue  # 价格是精确值，对不上就不是同一条
+        old_bounds = parser.age_bounds(candidate.get("time"))
+        if bounds is None or old_bounds is None:
+            # 时间认不出年龄（「刚刚」、绝对日期、错别字），退回原文相等比对
+            if str(candidate.get("time") or "") == str(deal.get("time") or ""):
+                return index
+            continue
+        # 老记录当时是「lo～hi 秒前」，过去 elapsed 秒之后该变成「lo+elapsed～hi+elapsed
+        # 秒前」。这条现在的年龄落在这个范围里（两端再各留一点容限）就是同一条。
+        lower = old_bounds[0] + elapsed - grace
+        upper = old_bounds[1] + elapsed + grace
+        if lower <= bounds[0] <= upper:
+            return index
+    return None
 
 
 def summary_headline(changes, new_deals_by_item, targets) -> str:
@@ -1822,6 +1868,18 @@ class MainWindow(QMainWindow):
     def OnProgress(self, current, total):
         self.progress_label.setText(f"查询中 {current}/{total}")
 
+    @staticmethod
+    def DealsElapsed(anchor) -> float:
+        """缓存里那组成交抓到之后过了多少秒（判「有没有新成交」要用，见 new_deals）。
+
+        认不出这个时刻（老缓存没这列、文本坏了）就按 0 算：判定退化成"年龄区间
+        一格没挪"，认得出同一条的照样认得出，只是更容易把老的算成新的。
+        """
+        stamp = _parse_stamp(anchor)
+        if stamp is None:
+            return 0.0
+        return max(0.0, (datetime.now() - stamp).total_seconds())
+
     def OnResultReady(self, row, result):
         if row >= self.table.rowCount():
             return
@@ -1844,13 +1902,13 @@ class MainWindow(QMainWindow):
             if change is not None:
                 change["name"] = name
                 self.run_changes.append(change)
-            # 成交同样要拿"这次抓取之前"那三条来比，所以在覆盖 item["values"] 之前挑。
-            # 缓存里只有价格快照、没有成交，所以基准只能来自上一轮的抓取结果：
-            # 本次运行还没抓到过这件商品（values 是 None）就没有基准可比，
-            # 此时把三条都报成"新增"是假的——刚启动的那一轮正是这种情况。
-            seen = item["values"] or {}
-            if seen.get("deals") is not None:
-                fresh = new_deals(result["deals"], seen["deals"])
+            # 成交的基准取自缓存里上一轮那组（带着它的抓取时刻），重启也还在；
+            # 同样要在 upsert 之前取，不然拿到的是刚写进去的这一轮
+            seen_deals, seen_anchor = self.store.cached_deals(cluster_id)
+            if seen_deals:
+                fresh = new_deals(
+                    result["deals"], seen_deals, self.DealsElapsed(seen_anchor)
+                )
                 if fresh:
                     self.run_deals.append({"name": name, "deals": fresh})
             # 到价每轮都报：漏看一轮也不会错过（口径见 expected_reached）。
@@ -1874,6 +1932,7 @@ class MainWindow(QMainWindow):
                 reference_price=result["reference_price"],
                 avg_text=result["avg_price"],
                 sold_out=result["sold_out"],
+                deals=result["deals"],
             )
             item["record"] = self.store.get_item(cluster_id)
             if result["name"] and result["name"] != item["entry"].name:

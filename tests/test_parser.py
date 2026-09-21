@@ -529,3 +529,45 @@ def test_price_number(text, expected):
 def test_price_number_unknown(text):
     """认不出来的价格一律 None——界面据此不显示涨跌。"""
     assert parser.price_number(text) is None
+
+
+# ---------------- 年龄区间（判两条成交是不是同一条要用） ----------------
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("5秒前", (5, 5)),                # 「秒」是最细的一格，区间就一个点
+        ("30分钟前", (1800, 1859)),
+        ("9小时前", (32400, 35999)),
+        ("1天前", (86400, 172799)),
+        ("1周前", (604800, 1209599)),
+        ("刚刚", (0, 60)),                # 没给数字，按一分钟算
+        (" 9小时前 ", (32400, 35999)),    # 两端空白先剥掉
+        ("1.5小时前", (5400, 8999)),
+    ],
+)
+def test_age_bounds(text, expected):
+    """区间是闭的：界面显示「9小时前」当且仅当真实年龄落在这个范围里。"""
+    assert parser.age_bounds(text) == expected
+
+
+def test_age_bounds_lower_edge_matches_parse_relative_time():
+    """下界和 parse_relative_time 是同一个数——两处口径不能走岔。"""
+    for text in ("5秒前", "30分钟前", "9小时前", "3天前", "刚刚"):
+        assert parser.age_bounds(text)[0] == parser.parse_relative_time(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [None, "", "   ", 42, {"a": 1}, "很久以前", "9个钟头前", "3天", "2026-08-01"],
+)
+def test_age_bounds_unknown_format(text):
+    """认不出年龄一律 None：调用方据此退回原文比对，而不是瞎猜一个数。"""
+    assert parser.age_bounds(text) is None
+
+
+def test_age_bounds_covers_a_whole_bucket():
+    """上界必须盖满整格，差一秒就会把同一条成交判成新的。"""
+    lower, upper = parser.age_bounds("9小时前")
+    assert upper - lower == 3600 - 1  # 小时这一格整整 3600 秒，闭区间少 1

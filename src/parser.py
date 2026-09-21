@@ -30,18 +30,28 @@ _RELATIVE_UNITS = {
 # 已经「刚刚发生」的说法：等价于 0 秒前
 _JUST_NOW_WORDS = ("刚刚", "刚才", "现在", "此刻")
 
+# 「刚刚」没给数字，凑不出来一分钟以外的上界，按一分钟算
+_JUST_NOW_BOUNDS = (0, 60)
+
 _RELATIVE_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*(.*?)前$")
 
 # 价格文本里认数字：只取第一个数，千分位逗号在匹配前先抹掉
 _PRICE_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
 
-def parse_relative_time(text) -> int | None:
-    """把「9小时前」这类相对时间解析成秒数；认不出来返回 None。
+def age_bounds(text):
+    """「9小时前」这类相对时间对应的年龄区间「下界, 上界」（闭区间，秒）；认不出返回 None。
 
-    dealTime 是接口给的人话，不是时间戳（见 dev_notes/initial_plan.md），
-    只够粗判新旧：界面拿它决定要不要高亮。绝对日期、错别字、空值等一律
-    返回 None——调用方据此「不上色」，照旧把原文显示出来，不影响展示。
+    dealTime 是接口给的人话，不是时间戳（见 dev_notes/initial_plan.md），它说的是
+    「9 个多小时、还不到 10 小时」——给的是个区间，不是个点。这个区间是判断
+    「两次抓到的成交是不是同一条」的依据（见 app.new_deals）：同一时刻取上下界
+    都算不出来，就说明两条记录对不上。
+
+    闭区间是为了好算：界面显示「9小时前」当且仅当真实年龄落在 [9小时, 10小时] 里，
+    拿上界当"最老可能是多少"直接比就行了，不用在调用处记得处理开闭。
+
+    绝对日期、错别字、空值、「9个钟头前」这种没收录的单位一律返回 None——
+    调用方据此认定「这条认不出年龄」，退回原文比对而不是瞎猜一个数。
     """
     if not isinstance(text, str):
         return None
@@ -49,14 +59,25 @@ def parse_relative_time(text) -> int | None:
     if not text:
         return None
     if text in _JUST_NOW_WORDS:
-        return 0
+        return _JUST_NOW_BOUNDS
     match = _RELATIVE_RE.match(text)
     if match is None:
         return None
     unit = _RELATIVE_UNITS.get(match.group(2).strip())  # "9个钟头前"这种就认不出来了
     if unit is None:
         return None
-    return int(float(match.group(1)) * unit)
+    lower = float(match.group(1)) * unit
+    return int(lower), int(lower + unit) - 1
+
+
+def parse_relative_time(text) -> int | None:
+    """把「9小时前」这类相对时间解析成秒数（取下界）；认不出来返回 None。
+
+    只够粗判新旧：界面拿它决定要不要高亮「近期成交」。要判两条成交是不是同一条
+    得用 age_bounds() 的区间，取个下界当点用会把「9小时前」当成正好 9 小时。
+    """
+    bounds = age_bounds(text)
+    return bounds[0] if bounds else None
 
 
 def price_number(text) -> float | None:

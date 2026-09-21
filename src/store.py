@@ -1,4 +1,4 @@
-"""SQLite 缓存：保存商品的 clusterID、名称、缩略图、上次抓到的价格。
+"""SQLite 缓存：保存商品的 clusterID、名称、缩略图、上次抓到的价格和成交。
 
 watchlist.txt 是唯一的跟踪标准——每次同步都以它为准：
 清单里有、缓存里没有的补上；缓存里有、清单里没有的删掉。
@@ -8,6 +8,7 @@ watchlist.txt 是唯一的跟踪标准——每次同步都以它为准：
 （重建空库 / 自己建目录 / 跳过该条）并记进 notes，绝不抛给调用方。
 """
 
+import json
 import os
 import sqlite3
 from datetime import datetime
@@ -27,6 +28,8 @@ ITEM_COLUMNS = (
     ("avg_text", "TEXT"),           # 上次抓到的近 30 天均价
     ("sold_out", "INTEGER"),        # 上次抓到的是不是售罄（0/1）
     ("price_updated_at", "TEXT"),   # 上面三个价格字段是什么时候抓的
+    ("deals_json", "TEXT"),         # 上次抓到的近 N 条成交（JSON 数组）
+    ("deals_updated_at", "TEXT"),   # 上面那组成交是什么时候抓的
 )
 
 
@@ -145,6 +148,34 @@ class Store:
         ).fetchone()
         return dict(row) if row else None
 
+    def cached_deals(self, cluster_id: str):
+        """上次抓到的成交记录，返回 (成交列表, 抓取时刻)；没有基准时是 ([], None)。
+
+        抓取时刻是判定「这轮有没有新成交」的锚点：只有它跟这组成交是同一批抓回来的，
+        算出来的时间差才作数（见 app.new_deals）。
+
+        这条路上任何不对的地方都降级成「没有基准」——JSON 坏了、形状不是列表、
+        老库还没补出这两列，都只该让这一件商品少一次新增成交的提示，不该让整轮
+        抓取崩在这儿。缓存库的原则就是「能起来就行」。
+        """
+        record = self.get_item(cluster_id)
+        if not record:
+            return [], None
+        raw = record.get("deals_json")
+        if not isinstance(raw, str) or not raw:
+            return [], None
+        try:
+            deals = json.loads(raw)
+        except ValueError:
+            return [], None
+        if not isinstance(deals, list):
+            return [], None
+        deals = _dicts(deals)
+        if not deals:
+            return [], None  # 解析出来是空的（"[]"、[1,2,3] 这类）也算没有基准
+        anchor = record.get("deals_updated_at")
+        return deals, anchor if isinstance(anchor, str) and anchor else None
+
     def get_all(self):
         """返回全部缓存记录（新抓取的在前）。"""
         self._begin()
@@ -216,6 +247,7 @@ class Store:
         reference_price=None,
         avg_text=None,
         sold_out=False,
+        deals=None,
     ):
         """保存抓取结果；新值为空时保留旧值。
 
@@ -227,8 +259,11 @@ class Store:
         写着刚刚"这种对不上的缓存。反之 price_text 有值时整组都按这次的结果写，
         没抓到的字段就存空——上次的参考价跟这次的新现价摆在一起只会算错折扣。
 
-        空串按"没抓到"处理：SQLite 里空串不是 NULL，COALESCE 挡不住它，
-        会把已经缓存好的名字/缩略图冲掉。
+        成交（deals）是另一份快照，判据也另算：它跟着 deals_updated_at 走而不是
+        price_updated_at。两者会错开——售罄的商品可能一直抓不到价格、成交却每次
+        都在变——而那个时刻是算「隔了多久」的锚点，用错一个就会把老成交算成新的。
+        deals=None 表示这次没抓到成交（整组保留），空列表表示抓到了、确实一条都没有，
+        照实覆盖。
         """
         self._begin()
         cluster_id = _clean_id(cluster_id)
@@ -240,8 +275,9 @@ class Store:
             self.conn.execute(
                 """INSERT INTO items (cluster_id, name, image_url, updated_at,
                                       price_text, reference_price, avg_text,
-                                      sold_out, price_updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      sold_out, price_updated_at,
+                                      deals_json, deals_updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(cluster_id) DO UPDATE SET
                        name       = COALESCE(excluded.name, name),
                        image_url  = COALESCE(excluded.image_url, image_url),
@@ -258,7 +294,11 @@ class Store:
                                                ELSE excluded.sold_out END,
                        price_updated_at = CASE WHEN excluded.price_text IS NULL
                                                THEN price_updated_at
-                                               ELSE excluded.price_updated_at END""",
+                                               ELSE excluded.price_updated_at END,
+                       deals_json       = COALESCE(excluded.deals_json, deals_json),
+                       deals_updated_at = CASE WHEN excluded.deals_json IS NULL
+                                               THEN deals_updated_at
+                                               ELSE excluded.deals_updated_at END""",
                 (
                     cluster_id,
                     _clean_name(name),
@@ -268,6 +308,8 @@ class Store:
                     _clean_cached_text(reference_price),
                     _clean_cached_text(avg_text),
                     int(bool(sold_out)),
+                    now,
+                    _deals_json(deals),
                     now,
                 ),
             )
@@ -336,6 +378,29 @@ def _clean_name(name):
         return None
     text = " ".join(name.split())
     return text or None
+
+
+def _deals_json(deals):
+    """成交列表存成 JSON 文本；None 表示"这次没抓到"（存 NULL，保留上次的）。
+
+    只留认得出的字段：多出来的键存进去也能读回来，但那些字段判「是不是同一条」
+    时用不上，白白让缓存变大。空列表照实存成 "[]"——它跟 None 是两回事。
+    """
+    if deals is None:
+        return None
+    if not isinstance(deals, list):
+        return None
+    rows = [
+        {"price": str(deal["price"]), "time": str(deal.get("time") or "")}
+        for deal in deals
+        if isinstance(deal, dict) and deal.get("price")
+    ]
+    return json.dumps(rows, ensure_ascii=False)
+
+
+def _dicts(items):
+    """从缓存里读回来的东西中挑出成形的 dict（JSON 是外部输入，什么都可能在里面）。"""
+    return [item for item in items or [] if isinstance(item, dict)]
 
 
 def _clean_cached_text(value):
