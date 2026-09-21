@@ -78,8 +78,8 @@ ROW_NUMBER_PADDING = 16  # 序号槽左右留白，免得数字贴着分隔线
 COL_IMG, COL_NAME, COL_CID, COL_PRICE, COL_EXPECT, COL_REF, COL_AVG = 0, 1, 2, 3, 4, 5, 6
 COL_DEAL_BASE = 7  # 成交① 占 7/8/9 三列
 COL_LINK = 10
-HEADERS = ["缩略图", "商品名", "clusterID", "现价", "预期价格", "原价", "近30天均价",
-           "成交①", "成交②", "成交③", "链接（点击打开）"]
+HEADERS = ["图片", "商品名", "ID", "现价", "预期价", "原价", "近30天均价",
+           "成交1", "成交2", "成交3", "链接"]
 
 PENDING_TEXT = "…"      # 等待抓取
 NO_DATA_TEXT = "—"      # 无数据
