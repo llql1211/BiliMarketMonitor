@@ -251,6 +251,62 @@ def _expected_dialog(dark):
     return window.ExpectedPriceDialog(0)
 
 
+def _sample_preview_pixmap(size):
+    """在程序里画一张假商品图：出图不联网，也省得等真图下回来。
+
+    特意画了边框和居中的图形：图比窗口小的时候，留白摊得匀不匀一眼就看得出来。
+    """
+    from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap
+
+    pixmap = QPixmap(size, size)
+    pixmap.fill(QColor("#cfdcea"))
+    painter = QPainter(pixmap)
+    pen = QPen(QColor("#41618a"))
+    pen.setWidth(max(2, size // 30))
+    painter.setPen(pen)
+    margin = size // 12
+    painter.drawRect(margin, margin, size - 2 * margin, size - 2 * margin)
+    painter.setBrush(QColor("#7fa86b"))
+    painter.drawEllipse(size // 4, size // 4, size // 2, size // 2)
+    painter.end()
+    return pixmap
+
+
+def _preview_dialog():
+    """摆一个贴好图的预览窗口，尺寸按真机来。
+
+    offscreen 那块虚拟屏只有 800x600，_ApplyDefaultSize 会老老实实把窗口缩到
+    放得下为止（440），出图就看不到真机上那个大小了。这里显式撑到常见屏幕上
+    的尺寸：要看的是图怎么铺、留白匀不匀，不是小屏上的降级样子。
+
+    先 show 出来再贴图：铺满的基准是可视区，而可视区要排完版才定得下来，不先
+    摆出来的话量到的是排版前的旧值，出的图会差一圈。
+    """
+    import app
+
+    dialog = app.ImagePreviewDialog("乙烯基唱片收纳箱")
+    dialog.resize(app.PREVIEW_DEFAULT_SIDE, app.PREVIEW_DEFAULT_SIDE + app.PREVIEW_BUTTON_ROW)
+    dialog.show()
+    QApplication.processEvents()
+    dialog.SetImage(_sample_preview_pixmap(app.PREVIEW_SIZE))
+    QApplication.processEvents()
+    return dialog
+
+
+@scene("preview")
+def _preview(dark):
+    """双击缩略图看的大图，默认那一档：图铺满窗口，四周不该有奇怪的留白。"""
+    return _preview_dialog()
+
+
+@scene("preview-zoom")
+def _preview_zoom(dark):
+    """滚轮放大之后：图比窗口大了，该看到滚动条，也该看得出放的是局部。"""
+    dialog = _preview_dialog()
+    dialog.OnWheel(120 * 4)  # 往上滚四格
+    return dialog
+
+
 @scene("main", settle=1.5)
 def _main(dark):
     """真窗口：清单和缓存都来自沙盒，缩略图靠 settle 等它落上来。"""
