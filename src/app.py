@@ -451,7 +451,7 @@ def summary_subtitle(total, failures) -> str:
 
 
 def new_deals_html(items, dark) -> str:
-    """新增成交的明细表：序号 / 商品 / 成交记录。
+    """新增成交的明细表：商品 / 成交记录。
 
     商品名和成交文本一律转义（都是接口给的）。同一件商品这次冒出好几条新成交
     就在一格里面排开——一件商品占一行，跟头一句话里的件数对得上。
@@ -461,11 +461,11 @@ def new_deals_html(items, dark) -> str:
         (_esc(item.get("name")), _esc(_join(*(_deal_text(d) for d in _dicts(item.get("deals"))))))
         for item in _dicts(items)
     ]
-    return _section_html(DEALS_HEADING, ("#", "商品", "成交记录"), rows, muted)
+    return _section_html(DEALS_HEADING, ("商品", "成交记录"), rows, muted)
 
 
 def targets_html(items, dark) -> str:
-    """低于预期价那几件商品的明细表：序号 / 商品 / 现价 / 预期价。
+    """低于预期价那几件商品的明细表：商品 / 现价 / 预期价。
 
     现价上到价色（跟表格里「预期价格」格变色用的是同一个色），一眼看出是哪几件
     跌到了用户设的价下面；预期价照旧带「￥」，跟表格里的展示一致。
@@ -478,7 +478,7 @@ def targets_html(items, dark) -> str:
         rows.append(
             (_esc(item.get("name")), price, _esc(expected_display(item.get("expected_price"))))
         )
-    return _section_html(TARGET_HEADING, ("#", "商品", "现价", "预期价"), rows, muted)
+    return _section_html(TARGET_HEADING, ("商品", "现价", "预期价"), rows, muted)
 
 
 def summary_sections(changes, deals, targets, dark) -> str:
@@ -499,7 +499,7 @@ def summary_sections(changes, deals, targets, dark) -> str:
 
 
 def _section_html(heading, titles, rows, muted) -> str:
-    """一块明细：加粗的小标题 + 一张表（序号 + 各列）；没有内容就回空串。
+    """一块明细：加粗的小标题 + 一张表（几列由 titles 定）；没有内容就回空串。
 
     只用 QTextEdit 确定认得的标签（table / td / span）：这是给总结窗口渲染的，
     不是网页。表头用弱化色，跟下面的正文拉开层次——小标题不跟着弱化，
@@ -520,15 +520,13 @@ def _section_html(heading, titles, rows, muted) -> str:
         )
         + "</tr>"
     )
-    for i, row in enumerate(rows, 1):
-        cells.append(
-            f"<tr><td>{i}</td>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>"
-        )
+    for row in rows:
+        cells.append("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>")
     return f'<table cellspacing="0" cellpadding="6" width="100%">{"".join(cells)}</table>'
 
 
 def changes_html(changes, dark) -> str:
-    """变动明细的表格：序号 / 商品 / 价格 / 变动，涨跌那格上色（见 _section_html）。
+    """变动明细的表格：商品 / 价格 / 变动，涨跌那格上色（见 _section_html）。
 
     表格样式走公用的 _section_html，这里只管每一格写什么。转义在这一层做完：
     商品名是接口给的，名字里出现尖括号也不能把表格拆了。
@@ -552,7 +550,7 @@ def changes_html(changes, dark) -> str:
                 f'<span style="color:{color}">{detail}</span>',
             )
         )
-    return _section_html(CHANGES_HEADING, ("#", "商品", "价格", "变动"), rows, muted)
+    return _section_html(CHANGES_HEADING, ("商品", "价格", "变动"), rows, muted)
 
 
 def _join(*parts) -> str:

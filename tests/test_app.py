@@ -2892,6 +2892,22 @@ def test_summary_sections_drops_empty_blocks(changes, deals, targets):
     assert bool(markup) is bool(changes or deals or targets)
 
 
+def test_summary_tables_have_no_row_number_column():
+    """三张明细表都不带序号列：表头没有「#」，行首也不摆一个数字。
+
+    商品名摆第一列，扫一眼就是"哪件"；序号只是个位置，占了最显眼的地方又不说明什么。
+    """
+    changes = [{"kind": "down", "name": "甲", "old_price": "¥50", "new_price": "¥44",
+                "delta": "↓ 6", "change": -6}]
+    deals = [{"name": "乙", "deals": [{"price": "¥44", "time": "2小时前"}]}]
+    targets = [{"name": "丙", "price": "¥18", "expected_price": "20"}]
+
+    markup = app_module.summary_sections(changes, deals, targets, dark=False)
+
+    assert "<td>#</td>" not in markup
+    assert "<tr><td>1</td>" not in markup
+
+
 def test_targets_html_colors_the_price_by_theme():
     """到价那几件的现价上到价色，扫一眼就知道是这几件跌到位了。"""
     targets = [{"name": "甲", "price": "¥18", "expected_price": "20"}]
