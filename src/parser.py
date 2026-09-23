@@ -16,6 +16,10 @@ RECENT_DEALS_COUNT = 3  # 近 N 次成交，可调（网页一次返回多条，
 
 SOLD_OUT_STATE = 2  # clusterPurchaseButton.buttonState：2 就是「已售罄」
 
+# 购买按钮文案里的剩余件数（形如「最低价仅1件」）。同一处还会出现「当前最低价」
+# 和「已售罄」两种没带数字的文案，那两种都当"没有件数可报"。
+_STOCK_COUNT_RE = re.compile(r"仅\s*(\d+)\s*件")
+
 # 「9小时前」里的单位换算成秒；接口给的是相对时间，只够粗判新旧
 _RELATIVE_UNITS = {
     "秒": 1,
@@ -113,6 +117,7 @@ def parse_cluster(resp: dict) -> dict:
       当前价格 data.clusterPriceFloorVO.priceTag.firstPrice
       原价     data.clusterPriceFloorVO.priceTag.price（+ priceSymbol）
       售罄     data.clusterPurchaseButton.buttonState == 2
+      剩余件数 data.clusterPurchaseButton.buttonText（形如「最低价仅1件」）
       近期均价 data.clusterRecentBuyFloorVO.avgPrice（统计口径待确认）
       成交记录 data.clusterRecentBuyFloorVO.recentDeals[]
       缩略图   data.clusterHeaderFloorVO.clusterImgList[0]
@@ -127,6 +132,7 @@ def parse_cluster(resp: dict) -> dict:
         "deals": [],
         "image_url": None,
         "sold_out": False,
+        "stock_count": None,
     }
 
     # 调用方传进来的不一定是 dict（None/列表/数字），直接按"查询失败"处理
@@ -152,7 +158,9 @@ def parse_cluster(resp: dict) -> dict:
         result["price"] = _fmt_price(price_tag.get("firstPrice"))
         result["reference_price"] = _fmt_reference_price(price_tag)
 
-    result["sold_out"] = _is_sold_out(_dig(data, "clusterPurchaseButton"))
+    button = _dig(data, "clusterPurchaseButton")
+    result["sold_out"] = _is_sold_out(button)
+    result["stock_count"] = _stock_count(button)
 
     # 成交相关：字段可能整体不存在
     recent = _dig(data, "clusterRecentBuyFloorVO")
@@ -278,6 +286,31 @@ def _is_sold_out(button) -> bool:
     return state == SOLD_OUT_STATE
 
 
+def _stock_count(button) -> int | None:
+    """购买按钮文案里的「当前价格还剩几件」，没有数字时返回 None。
+
+    接口只在货少时才把件数写进文案（实测「最低价仅1件」这种，1~3 件），货还够时
+    写「当前最低价」、卖完了写「已售罄」，都没带数字。这两种一律返回 None——界面
+    据此不显示件数，宁可少显示一处，也不要凭空编个件数出来。
+    """
+    if not isinstance(button, dict):
+        return None
+    match = _STOCK_COUNT_RE.search(_clean_text(button.get("buttonText")) or "")
+    if match is None:
+        return None
+    return _positive_int(int(match.group(1)))
+
+
+def _positive_int(value) -> int | None:
+    """归一成正整数或 None；bool、字符串、0、负数都当"没有"。
+
+    0 件和"没报件数"对界面是同一件事（都不显示），归到一起省得调用处再判一遍。
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
 def _normalize_result(result: dict) -> dict:
     """出口兜底：固定各级的键与类型，界面层可以放心直接用，不必再判空。"""
     ok = bool(result.get("ok"))
@@ -309,4 +342,5 @@ def _normalize_result(result: dict) -> dict:
         "deals": deals,
         "image_url": _clean_text(result.get("image_url")),
         "sold_out": bool(result.get("sold_out")),
+        "stock_count": _positive_int(result.get("stock_count")),
     }

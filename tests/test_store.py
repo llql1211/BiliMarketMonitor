@@ -142,6 +142,23 @@ def test_upsert_item_saves_sold_out_flag(db):
     assert st.get_item("1002")["sold_out"] == 0
 
 
+def test_upsert_item_saves_stock_count(db):
+    """剩余件数按整数存；没报件数时是 NULL，不是 0。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", None, price_text="¥44", stock_count=2)
+    st.upsert_item("1002", "乙", None, price_text="¥44", stock_count=None)
+    assert st.get_item("1001")["stock_count"] == 2
+    assert st.get_item("1002")["stock_count"] is None
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "2", 2.0])
+def test_upsert_stock_count_only_takes_positive_ints(db, value):
+    """0 / 负数 / 非整数一律按「没抓到」存 NULL——「仅剩 0 件」不是个能显示的东西。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", None, price_text="¥44", stock_count=value)
+    assert st.get_item("1001")["stock_count"] is None
+
+
 def test_upsert_without_price_keeps_the_whole_snapshot(db, monkeypatch):
     """没抓到价格时整组原样保留，连 price_updated_at 都不动。"""
     stamps = iter(["2024-01-01T10:00:00", "2024-01-02T10:00:00"])
@@ -155,6 +172,7 @@ def test_upsert_without_price_keeps_the_whole_snapshot(db, monkeypatch):
         reference_price="¥99",
         avg_text="¥40",
         sold_out=True,
+        stock_count=2,
     )
 
     st.upsert_item("1001", "甲", None)  # 这次没抓到价格
@@ -164,6 +182,7 @@ def test_upsert_without_price_keeps_the_whole_snapshot(db, monkeypatch):
     assert row["reference_price"] == "¥99"
     assert row["avg_text"] == "¥40"
     assert row["sold_out"] == 1
+    assert row["stock_count"] == 2  # 件数也在这一组里，跟着原样保留
     assert row["price_updated_at"] == "2024-01-01T10:00:00"
     assert row["updated_at"] == "2024-01-02T10:00:00"  # 名称那组照常更新
 
@@ -182,6 +201,7 @@ def test_upsert_with_price_replaces_the_whole_snapshot(db):
         reference_price="¥99",
         avg_text="¥40",
         sold_out=True,
+        stock_count=2,
     )
 
     st.upsert_item("1001", "甲", None, price_text="¥38")
@@ -191,6 +211,7 @@ def test_upsert_with_price_replaces_the_whole_snapshot(db):
     assert row["reference_price"] is None
     assert row["avg_text"] is None
     assert row["sold_out"] == 0
+    assert row["stock_count"] is None  # 上次说「还剩 2 件」，这次没报，就得跟着清掉
 
 
 @pytest.mark.parametrize("blank", ["", "   ", None, 44])

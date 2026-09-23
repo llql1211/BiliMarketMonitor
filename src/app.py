@@ -121,7 +121,11 @@ DELTA_ROLE = Qt.UserRole + 1        # 「现价」格末尾那截涨跌（形如
 DELTA_COLOR_ROLE = Qt.UserRole + 2  # 上面那截的颜色（随主题走，重画时重算）
 DELTA_GAP = " "                     # 现价与涨跌之间空一格
 
-# 「现价」列一律左对齐：涨跌那截的落点是从文本区左边算起的（见 delta_rect）
+STOCK_ROLE = Qt.UserRole + 3        # 涨跌后面那截剩余件数（形如「仅剩 2 件」）
+STOCK_COLOR_ROLE = Qt.UserRole + 4  # 上面那截的颜色（弱化色，随主题走）
+STOCK_GAP = " "                     # 涨跌与剩余件数之间空一格
+
+# 「现价」列一律左对齐：涨跌和剩余件数两截的落点都是从文本区左边算起的（见 segment_rect）
 PRICE_ALIGN = Qt.AlignLeft | Qt.AlignVCenter
 
 PAUSE_TEXT = "暂停抓取"
@@ -283,29 +287,55 @@ def price_change(previous, result):
     }
 
 
-def split_price_text(text, delta):
-    """把「¥44 ↓ 6」拆成现价和涨跌两截（前半截连分隔的空格一起留下）。
+def split_price_text(text, delta, stock=""):
+    """把「¥44 ↓ 6 仅剩 2 件」拆成现价 / 涨跌 / 剩余件数三截（现价那截留着分隔的空格）。
 
-    涨跌段永远拼在末尾，按长度切比找分隔符稳——价格前面还顶着「已售罄」，
-    里面也没准带空格。
+    涨跌和剩余件数永远照这个顺序拼在末尾，从右往左按长度切比找分隔符稳——价格
+    前面还顶着「已售罄」，里面也没准带空格。
+
+    先切剩余件数再切涨跌：切完件数后，它前面那个分隔空格还挂在末尾，直接比会
+    对不上，所以比涨跌前先 rstrip 一下（那本来就是要一起拿走的间距）。中间那段
+    空格留在现价那截里，量出来的间距才跟拼文本时一致。
+
+    两截各认各的：对不上就返回空串，那段文本照旧留在现价那截里。宁可让它在现价
+    的位置按现价的颜色原样显示出来，也不要当成另一截、挪到别处去画。
     """
-    if not delta or not text.endswith(delta):
-        return text, ""
-    return text[: len(text) - len(delta)], delta
+    if stock and text.endswith(stock):
+        text = text[: len(text) - len(stock)]
+    else:
+        stock = ""
+    if delta:
+        trimmed = text.rstrip()
+        if trimmed.endswith(delta):
+            text = trimmed[: len(trimmed) - len(delta)]
+        else:
+            delta = ""
+    else:
+        delta = ""
+    return text, delta, stock
 
 
-def delta_rect(metrics, text_rect, prefix, delta):
-    """涨跌那截该画在哪儿：紧接在现价右边缘，跟现价同一行；挤不下就返回 None。
+def segment_rect(metrics, text_rect, left, text):
+    """补画的那截该画在哪儿：从 left 起、跟前面几截同一行；挤不下就返回 None。
 
-    位置按「基类给文字留的矩形 + 现价量出来的宽度」算——基类画现价时用的也是
-    同一块矩形，所以两截能接上。prefix 带着分隔的空格，量出来的间距就跟
+    位置按「基类给文字留的矩形 + 前面几截量出来的宽度」算——基类画现价时用的也是
+    同一块矩形，所以几截能接上。left 里已经含着分隔的空格，量出来的间距就跟
     单元格文本里的一致。
     """
-    left = text_rect.left() + metrics.horizontalAdvance(prefix)
     # QRect.right() 是闭区间，算宽度时要补回这 1 像素，不然右边会缺一条
-    if left + metrics.horizontalAdvance(delta) > text_rect.right() + 1:
+    if left + metrics.horizontalAdvance(text) > text_rect.right() + 1:
         return None
     return QRect(left, text_rect.top(), text_rect.right() + 1 - left, text_rect.height())
+
+
+def stock_text(count) -> str:
+    """「现价」格末尾那截剩余件数（形如「仅剩 2 件」）；没有件数就给空串。
+
+    件数由解析层归一（见 parser._stock_count）：接口只在货少时才把件数写进按钮
+    文案，货还够（「当前最低价」）和已售罄（「已售罄」）都没数字可报，到这里就是
+    None——格子末尾也就不多这一截。
+    """
+    return f"仅剩 {count} 件" if count else ""
 
 
 def _parse_stamp(value):
@@ -715,29 +745,34 @@ class ImageFetcher(QObject):
 
 
 class PriceDeltaDelegate(QStyledItemDelegate):
-    """「现价」列的绘制：现价照常画，末尾那截涨跌单独上色。
+    """「现价」列的绘制：现价照常画，后面那截涨跌和剩余件数各自上色。
 
-    一个 QTableWidgetItem 只有一种前景色，而「¥44 ↓ 6」要两截颜色，所以这一列
-    自己画：先让基类按平常的样子画（背景、隔行色、选中态、对齐都一样），只是
-    交给它的文本先收窄成现价那半截，再按同一个文本矩形接着往后补上涨跌。
+    一个 QTableWidgetItem 只有一种前景色，而「¥44 ↓ 6 仅剩 2 件」要三截颜色，所以
+    这一列自己画：先让基类按平常的样子画（背景、隔行色、选中态、对齐都一样），只是
+    交给它的文本先收窄成现价那半截，再按同一个文本矩形接着往后补上另两截。
 
     文本位置由基类说了算，这里不自己摆——列宽不够时基类会加省略号，位置对不上
-    的话两截会叠在一起。
+    的话几截会叠在一起。
     """
 
     def initStyleOption(self, option, index):
         super().initStyleOption(option, index)
-        option.text, _ = split_price_text(option.text, index.data(DELTA_ROLE))
+        option.text, _, _ = split_price_text(
+            option.text, index.data(DELTA_ROLE), index.data(STOCK_ROLE)
+        )
 
     def paint(self, painter, option, index):
-        delta = index.data(DELTA_ROLE)
-        if not delta:
+        if not index.data(DELTA_ROLE) and not index.data(STOCK_ROLE):
             super().paint(painter, option, index)
             return
 
         super().paint(painter, option, index)  # 现价那半截（已由上面收窄）
 
-        prefix, delta = split_price_text(index.data(Qt.DisplayRole) or "", delta)
+        prefix, delta, stock = split_price_text(
+            index.data(Qt.DisplayRole) or "",
+            index.data(DELTA_ROLE),
+            index.data(STOCK_ROLE),
+        )
         style_option = QStyleOptionViewItem(option)
         self.initStyleOption(style_option, index)
         style = option.widget.style() if option.widget else QApplication.style()
@@ -745,15 +780,23 @@ class PriceDeltaDelegate(QStyledItemDelegate):
         text_rect = style.subElementRect(
             QStyle.SE_ItemViewItemText, style_option, option.widget
         )
-
-        rect = delta_rect(QFontMetrics(style_option.font), text_rect, prefix, delta)
-        if rect is None:
-            return  # 挤不下就只留现价，完整的「¥44 ↓ 6」还在悬停提示里
+        metrics = QFontMetrics(style_option.font)
+        left = text_rect.left() + metrics.horizontalAdvance(prefix)
 
         painter.save()
         painter.setFont(style_option.font)
-        painter.setPen(index.data(DELTA_COLOR_ROLE) or style_option.palette.text().color())
-        painter.drawText(rect, Qt.AlignLeft | Qt.AlignVCenter, delta)
+        for text, color in (
+            (delta, index.data(DELTA_COLOR_ROLE)),
+            (stock, index.data(STOCK_COLOR_ROLE)),
+        ):
+            if not text:
+                continue  # 这一截这次没有（比如价格没变就只剩件数那截）
+            rect = segment_rect(metrics, text_rect, left, text)
+            if rect is None:
+                break  # 挤不下就收掉这截和它右边那截：叠着画比少显示一处更糟
+            painter.setPen(color or style_option.palette.text().color())
+            painter.drawText(rect, Qt.AlignLeft | Qt.AlignVCenter, text)
+            left += metrics.horizontalAdvance(text)
         painter.restore()
 
 
@@ -1324,12 +1367,18 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(QHeaderView.Interactive)
         self.table.setIconSize(QSize(IMAGE_SIZE, IMAGE_SIZE))
         header.resizeSection(COL_IMG, IMAGE_SIZE + 8)
-        header.resizeSection(COL_PRICE, 120)  # 要放得下「¥90.50 ↓ 12.30」这种
+        # 要放得下「¥6.56 ↓ 0.73 仅剩 1 件」这种：现价、涨跌、剩余件数三截并排。
+        # 便宜的东西才容易报件数，而便宜的东西价格变动常带小数（↓ 0.73），所以 190 是
+        # 照着这种「便宜 + 有小数」量的（173），不是照着最短的那种。再长的（¥127.99 又
+        # 赶上变动，203）就只画到涨跌为止（见 PriceDeltaDelegate），件数退到悬停提示里。
+        header.resizeSection(COL_PRICE, 190)
         header.resizeSection(COL_EXPECT, 90)
         header.resizeSection(COL_REF, 90)
         header.resizeSection(COL_AVG, 100)
+        # 成交三列只放个位数到五位数的成交量，100 就够；腾出来的 30 给「现价」列，
+        # 免得去挤商品名——那列是 Stretch，加宽「现价」只会从它身上抠。
         for col in (COL_DEAL_BASE, COL_DEAL_BASE + 1, COL_DEAL_BASE + 2):
-            header.resizeSection(col, 120)
+            header.resizeSection(col, 110)
         header.resizeSection(COL_CID, 100)
         header.resizeSection(COL_LINK, 60)
         # 商品名占剩余全部横向空间
@@ -1613,6 +1662,10 @@ class MainWindow(QMainWindow):
         """售罄行的现价格要解释一句：那个数不是市集现价。"""
         return "该商品已售罄，这里的价格是原价而非市集现价" if sold_out else ""
 
+    def StockTooltip(self, stock):
+        """剩余件数那句完整的话：格子窄到画不下这一截时，还能从提示里看到。"""
+        return f"当前价格{stock}" if stock else ""
+
     def ReferenceCell(self, reference_price):
         """「原价」格：弱化色显示，跟现价拉开层次。"""
         return self.MakeCell(
@@ -1624,25 +1677,36 @@ class MainWindow(QMainWindow):
         """待抓取中的占位格：一个「--」，不挂提示（提示里只有「--」等于没说）。"""
         return self.MakeCell(CLEARED_TEXT, tooltip="")
 
-    def PriceCell(self, price, sold_out, note="", delta=None):
-        """「现价」格：现价（售罄时带前缀）+ 涨跌，涨跌单独上色。
+    def PriceCell(self, price, sold_out, note="", delta=None, stock=""):
+        """「现价」格：现价（售罄时带前缀）+ 涨跌 + 剩余件数，后两截各自上色。
 
-        对齐固定成 PRICE_ALIGN：涨跌那截的落点是按"现价从文本区左边起"算的
-        （见 delta_rect），居中或右对齐就会两截叠在一起。
+        对齐固定成 PRICE_ALIGN：涨跌和剩余件数两截的落点都是按"现价从文本区
+        左边起"算的（见 segment_rect），居中或右对齐就会几截叠在一起。
+
+        delta 是 (文本, 涨跌数值)，stock 是 stock_text() 拼好的件数文本。
+        两者都排在末尾，顺序定了就别改——拆几截是靠从右往左按长度切的
+        （见 split_price_text）。
 
         note 是「这价格是什么时候抓的」那类补充说明，有它就不再退回"提示即全文"。
         """
         text = self.PriceText(price, sold_out)
         if delta:
             text += DELTA_GAP + delta[0]
+        if stock:
+            text += STOCK_GAP + stock
         cell = self.MakeCell(
             text,
-            tooltip=_tips(self.PriceTooltip(sold_out), note) or None,
+            tooltip=_tips(
+                self.PriceTooltip(sold_out), self.StockTooltip(stock), note
+            ) or None,
             align=PRICE_ALIGN,
         )
         if delta:
             cell.setData(DELTA_ROLE, delta[0])
             cell.setData(DELTA_COLOR_ROLE, theme.price_delta_color(delta[1], self.dark))
+        if stock:
+            cell.setData(STOCK_ROLE, stock)
+            cell.setData(STOCK_COLOR_ROLE, theme.muted_color(self.dark))
         return cell
 
     def ExpectedCell(self, expected_price, price, sold_out):
@@ -1702,17 +1766,19 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, COL_AVG, self.ClearedCell())
             # 预期价不跟着清：它不是抓来的，没有"还没轮到"这回事，
             # 只是暂时没得比，按没到价的样子摆着
-            price, sold_out = None, None
+            price, sold_out, stock = None, None, ""
         else:
             values = item["values"] or {}
             record = item["record"] or {}
             if values.get("ok"):
                 price, sold_out = values.get("price"), values.get("sold_out")
                 reference, avg = values.get("reference_price"), values.get("avg_price")
+                stock = stock_text(values.get("stock_count"))
                 note = ""
             else:
                 price, sold_out = record.get("price_text"), record.get("sold_out")
                 reference, avg = record.get("reference_price"), record.get("avg_text")
+                stock = stock_text(record.get("stock_count"))
                 note = _cached_note(record.get("price_updated_at"))
 
             if sold_out and not reference:
@@ -1722,7 +1788,8 @@ class MainWindow(QMainWindow):
                 reference = price
 
             self.table.setItem(
-                row, COL_PRICE, self.PriceCell(price, sold_out, note, item.get("delta"))
+                row, COL_PRICE,
+                self.PriceCell(price, sold_out, note, item.get("delta"), stock),
             )
             self.table.setItem(row, COL_REF, self.ReferenceCell(reference))
             self.table.setItem(
@@ -2111,6 +2178,7 @@ class MainWindow(QMainWindow):
                 reference_price=result["reference_price"],
                 avg_text=result["avg_price"],
                 sold_out=result["sold_out"],
+                stock_count=result["stock_count"],
                 deals=result["deals"],
             )
             item["record"] = self.store.get_item(cluster_id)

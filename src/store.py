@@ -27,7 +27,8 @@ ITEM_COLUMNS = (
     ("reference_price", "TEXT"),    # 上次抓到的原价（划线价）
     ("avg_text", "TEXT"),           # 上次抓到的近 30 天均价
     ("sold_out", "INTEGER"),        # 上次抓到的是不是售罄（0/1）
-    ("price_updated_at", "TEXT"),   # 上面三个价格字段是什么时候抓的
+    ("stock_count", "INTEGER"),     # 上次抓到的「当前价格还剩几件」（没报就是 NULL）
+    ("price_updated_at", "TEXT"),   # 上面几个价格字段是什么时候抓的
     ("deals_json", "TEXT"),         # 上次抓到的近 N 条成交（JSON 数组）
     ("deals_updated_at", "TEXT"),   # 上面那组成交是什么时候抓的
 )
@@ -247,6 +248,7 @@ class Store:
         reference_price=None,
         avg_text=None,
         sold_out=False,
+        stock_count=None,
         deals=None,
     ):
         """保存抓取结果；新值为空时保留旧值。
@@ -255,9 +257,9 @@ class Store:
         会把已经缓存好的名字/缩略图冲掉。
 
         价格那几列是一份快照，一起写、一起留：price_text 为 None 表示这次没抓到
-        价格，整组（含时间戳和售罄标记）原样保留，免得出现"价格是上次的、时间却
-        写着刚刚"这种对不上的缓存。反之 price_text 有值时整组都按这次的结果写，
-        没抓到的字段就存空——上次的参考价跟这次的新现价摆在一起只会算错折扣。
+        价格，整组（含时间戳、售罄标记和剩余件数）原样保留，免得出现"价格是上次的、
+        时间却写着刚刚"这种对不上的缓存。反之 price_text 有值时整组都按这次的结果
+        写，没抓到的字段就存空——上次的参考价跟这次的新现价摆在一起只会算错折扣。
 
         成交（deals）是另一份快照，判据也另算：它跟着 deals_updated_at 走而不是
         price_updated_at。两者会错开——售罄的商品可能一直抓不到价格、成交却每次
@@ -275,9 +277,9 @@ class Store:
             self.conn.execute(
                 """INSERT INTO items (cluster_id, name, image_url, updated_at,
                                       price_text, reference_price, avg_text,
-                                      sold_out, price_updated_at,
+                                      sold_out, stock_count, price_updated_at,
                                       deals_json, deals_updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(cluster_id) DO UPDATE SET
                        name       = COALESCE(excluded.name, name),
                        image_url  = COALESCE(excluded.image_url, image_url),
@@ -292,6 +294,9 @@ class Store:
                        sold_out         = CASE WHEN excluded.price_text IS NULL
                                                THEN sold_out
                                                ELSE excluded.sold_out END,
+                       stock_count      = CASE WHEN excluded.price_text IS NULL
+                                               THEN stock_count
+                                               ELSE excluded.stock_count END,
                        price_updated_at = CASE WHEN excluded.price_text IS NULL
                                                THEN price_updated_at
                                                ELSE excluded.price_updated_at END,
@@ -308,6 +313,7 @@ class Store:
                     _clean_cached_text(reference_price),
                     _clean_cached_text(avg_text),
                     int(bool(sold_out)),
+                    _clean_count(stock_count),
                     now,
                     _deals_json(deals),
                     now,
@@ -378,6 +384,17 @@ def _clean_name(name):
         return None
     text = " ".join(name.split())
     return text or None
+
+
+def _clean_count(value):
+    """剩余件数归一：只认正整数，其余按"这次没抓到"处理（存 NULL，保留上次的值）。
+
+    "还剩 0 件"和"接口没报件数"对界面是同一件事（都不显示），归到一起，
+    省得 0 被当成一个真件数存进来、下次显示成「仅剩 0 件」。
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
 
 
 def _deals_json(deals):

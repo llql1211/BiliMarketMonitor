@@ -41,6 +41,7 @@ def test_parse_error_structure():
         "deals": [],
         "image_url": None,
         "sold_out": False,
+        "stock_count": None,
     }
 
 
@@ -206,6 +207,38 @@ def test_sold_out_response_holds_the_reference_price_as_first_price():
     assert result["sold_out"] is True
 
 
+# ---------------- 剩余件数 ----------------
+
+
+@pytest.mark.parametrize(
+    "button, expected",
+    [
+        # 实测就这几种文案，件数只在货少时才报
+        ({"buttonState": 1, "buttonText": "最低价仅1件"}, 1),
+        ({"buttonState": 1, "buttonText": "最低价仅2件"}, 2),
+        ({"buttonState": 1, "buttonText": "最低价仅3件"}, 3),
+        ({"buttonState": 1, "buttonText": "当前最低价"}, None),
+        ({"buttonState": 2, "buttonText": "已售罄"}, None),
+        # 认不出来的形状一律当"没有件数"：不编数字，也不抛异常
+        ({"buttonState": 1}, None),
+        ({"buttonState": 1, "buttonText": ""}, None),
+        ({"buttonState": 1, "buttonText": None}, None),
+        ({"buttonState": 1, "buttonText": 123}, None),
+        ({"buttonState": 1, "buttonText": "仅剩 0 件"}, None),
+        (None, None),
+        ("not-a-dict", None),
+    ],
+)
+def test_stock_count_follows_button_text(button, expected):
+    """剩余件数只从按钮文案里认「仅N件」；另外两种文案都没有数字可报。"""
+    resp = _base_response()
+    if button is None:
+        resp["data"].pop("clusterPurchaseButton", None)
+    else:
+        resp["data"]["clusterPurchaseButton"] = button
+    assert parser.parse_cluster(resp)["stock_count"] == expected
+
+
 # ---------------- 缺成交字段 ----------------
 
 
@@ -317,14 +350,20 @@ def test_non_dict_response_is_a_failure_not_a_crash(resp):
     ],
 )
 def test_result_structure_is_always_the_same(resp):
-    """不管喂进去什么，出口都是固定 7 个键 + 固定类型，界面层不用再判空。"""
+    """不管喂进去什么，出口都是固定那几个键 + 固定类型，界面层不用再判空。"""
     result = parser.parse_cluster(resp)
     assert set(result) == {
         "ok", "error", "name", "price", "reference_price", "avg_price",
-        "deals", "image_url", "sold_out",
+        "deals", "image_url", "sold_out", "stock_count",
     }
     assert isinstance(result["ok"], bool)
     assert isinstance(result["sold_out"], bool)
+    # 剩余件数要么没有，要么是个正整数
+    assert result["stock_count"] is None or (
+        isinstance(result["stock_count"], int)
+        and not isinstance(result["stock_count"], bool)
+        and result["stock_count"] > 0
+    )
     for key in ("error", "name", "price", "reference_price", "avg_price", "image_url"):
         assert result[key] is None or isinstance(result[key], str)
     assert isinstance(result["deals"], list)

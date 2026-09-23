@@ -51,7 +51,7 @@ import theme
 
 def _raw_response(
     name="测试商品", price="¥44", avg=205, deals=3, img="//i0.hdslb.com/bfs/x.jpg",
-    deal_times=None, reference=None, sold_out=False,
+    deal_times=None, reference=None, sold_out=False, stock=None,
 ):
     """构造一份 cluster_info 原始响应（走真实 parser，避免手搓结果 dict）。
 
@@ -59,6 +59,7 @@ def _raw_response(
     8 天在默认 24 小时阈值之外，不会被误判成「近期成交」。
     reference 给划线原价；sold_out=True 时带上「已售罄」的购买按钮（真实形状：
     售罄响应里 priceTag 没有 price，firstPrice 装的是原价）。
+    stock 给剩余件数，按实测的按钮文案拼成「最低价仅N件」。
     """
     price_tag = {"firstPrice": price}
     if reference is not None:
@@ -70,6 +71,10 @@ def _raw_response(
     }
     if sold_out:
         data["clusterPurchaseButton"] = {"buttonState": 2, "buttonText": "已售罄"}
+    elif stock is not None:
+        data["clusterPurchaseButton"] = {
+            "buttonState": 1, "buttonText": f"最低价仅{stock}件",
+        }
     if avg is not None:
         times = ["8天前"] * deals if deal_times is None else list(deal_times)
         data["clusterRecentBuyFloorVO"] = {
@@ -710,18 +715,19 @@ CACHED_AT = "2026-09-16T10:30:00"
 
 def _seed_cache(
     w, price="¥50", reference=None, avg=None, sold_out=False, when=CACHED_AT,
-    cluster_id="10000008780", deals=None, deals_when=None,
+    cluster_id="10000008780", deals=None, deals_when=None, stock=None,
 ):
     """往缓存里塞一条「上次抓取」的价格（默认第一行那件商品）。
 
     时间是写回去的（upsert 自己记的是当前时间），这样提示语可以断言；
     when=None 模拟老库补列后留下的空时间戳。deals 给成交（判新增时的基准），
     deals_when 给它的抓取时刻——两个都省掉就是"还没抓到过成交"。
+    stock 给上次抓到的剩余件数。
     """
     w.store.upsert_item(
         cluster_id, "甲", None,
         price_text=price, reference_price=reference, avg_text=avg, sold_out=sold_out,
-        deals=deals,
+        stock_count=stock, deals=deals,
     )
     with w.store.conn:
         w.store.conn.execute(
@@ -738,6 +744,11 @@ def _seed_cache(
 def _delta(w, row=0):
     """「现价」格末尾那截涨跌的文本（没有就是 None）。"""
     return w.table.item(row, app_module.COL_PRICE).data(app_module.DELTA_ROLE)
+
+
+def _stock(w, row=0):
+    """「现价」格末尾那截剩余件数的文本（没有就是 None）。"""
+    return w.table.item(row, app_module.COL_PRICE).data(app_module.STOCK_ROLE)
 
 
 def test_cached_price_shows_on_startup_with_its_timestamp(window):
@@ -875,6 +886,84 @@ def test_delta_survives_a_table_rebuild(window):
     assert _delta(w) == "↓ 6"
 
 
+def test_stock_count_shows_after_the_price(window):
+    """抓到「最低价仅1件」就在现价后面补一截「仅剩 1 件」，用弱化色。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.OnResultReady(0, result_ok(price="¥44", stock=1))
+
+    cell = w.table.item(0, app_module.COL_PRICE)
+    assert cell.text() == "¥44 仅剩 1 件"
+    assert _stock(w) == "仅剩 1 件"
+    assert cell.data(app_module.STOCK_COLOR_ROLE).name() == (
+        theme.muted_color(w.dark).name()
+    )
+    assert cell.toolTip() == "当前价格仅剩 1 件"  # 列窄到画不下时还能从提示里看到
+
+
+def test_stock_count_sits_after_the_delta(window):
+    """价格同时变了就三截并排，顺序是现价 / 涨跌 / 剩余件数（拆的时候是从右往左切的）。"""
+    w = window("10000008780\n")
+    _seed_cache(w, price="¥50")
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.OnResultReady(0, result_ok(price="¥44", stock=2))
+
+    cell = w.table.item(0, app_module.COL_PRICE)
+    assert cell.text() == "¥44 ↓ 6 仅剩 2 件"
+    assert _delta(w) == "↓ 6"
+    assert _stock(w) == "仅剩 2 件"
+
+
+def test_stock_count_survives_a_table_rebuild(window):
+    """重画表格（换主题、拖拽排序）时走的是缓存那条路，件数不能丢。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, result_ok(price="¥44", stock=3))
+
+    w.RebuildRows()
+
+    assert w.table.item(0, app_module.COL_PRICE).text() == "¥44 仅剩 3 件"
+    assert _stock(w) == "仅剩 3 件"
+
+
+def test_failed_fetch_falls_back_to_the_cached_stock_count(window):
+    """抓失败退回缓存时件数跟着一起退，不能只剩个价格。"""
+    w = window("10000008780\n")
+    _seed_cache(w, price="¥44", stock=2)
+    w.LoadWatchlist(w.watchlist_path)
+    assert _stock(w) == "仅剩 2 件"
+
+    w.OnResultReady(0, result_fail("读取超时"))
+
+    assert w.table.item(0, app_module.COL_PRICE).text() == "¥44 仅剩 2 件"
+
+
+def test_no_stock_count_leaves_the_price_cell_alone(window):
+    """接口没报件数（「当前最低价」那种）就照旧只显示价格，不凭空补一截。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.OnResultReady(0, result_ok(price="¥44"))
+
+    cell = w.table.item(0, app_module.COL_PRICE)
+    assert cell.text() == "¥44"
+    assert _stock(w) is None
+
+
+def test_sold_out_has_no_stock_count(window):
+    """售罄的按钮文案是「已售罄」，没有件数可报。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.OnResultReady(0, result_ok(price="¥138", sold_out=True))
+
+    cell = w.table.item(0, app_module.COL_PRICE)
+    assert cell.text() == f"{app_module.SOLD_OUT_TEXT} ¥138"
+    assert _stock(w) is None
+
+
 def test_failed_fetch_falls_back_to_the_cached_price(window):
     """抓失败不清空价格：还显示上次抓到的那个数，说清时间，涨跌撤掉。"""
     w = window("10000008780\n")
@@ -918,11 +1007,12 @@ def test_price_delegate_hands_only_the_price_to_the_base_style(window):
     assert option.text == "¥44 "  # 分隔的空格留着，基类按它把现价摆在该在的地方
 
 
-def test_delta_rect_sits_right_after_the_price(qapp):
+def test_segment_rect_sits_right_after_the_price(qapp):
     """涨跌的落点紧接在现价右边，且跟现价同一行——位置对不上两截就会叠住。"""
     metrics = QFontMetrics(qapp.font())
     text_rect = QRect(0, 0, 120, 20)
-    rect = app_module.delta_rect(metrics, text_rect, "¥44 ", "↓ 6")
+    left = text_rect.left() + metrics.horizontalAdvance("¥44 ")
+    rect = app_module.segment_rect(metrics, text_rect, left, "↓ 6")
 
     assert rect.left() == metrics.horizontalAdvance("¥44 ")
     assert rect.top() == text_rect.top()
@@ -930,10 +1020,11 @@ def test_delta_rect_sits_right_after_the_price(qapp):
     assert rect.right() == text_rect.right()
 
 
-def test_delta_rect_gives_up_when_it_does_not_fit(qapp):
-    """格子窄到放不下就干脆不画：宁可不显示涨跌，也不要糊成一团。"""
+def test_segment_rect_gives_up_when_it_does_not_fit(qapp):
+    """格子窄到放不下就干脆不画：宁可不显示这一截，也不要糊成一团。"""
     metrics = QFontMetrics(qapp.font())
-    assert app_module.delta_rect(metrics, QRect(0, 0, 8, 20), "¥44 ", "↓ 6") is None
+    left = metrics.horizontalAdvance("¥44 ")
+    assert app_module.segment_rect(metrics, QRect(0, 0, 8, 20), left, "↓ 6") is None
 
 
 def test_painting_a_price_cell_with_a_delta_does_not_blow_up(window, qapp):
@@ -3240,11 +3331,26 @@ def test_changes_html_colors_the_delta_by_theme():
 
 
 def test_split_price_text():
-    """拆现价与涨跌：涨跌段永远在末尾，按长度切；对不上就原样返回。"""
-    assert app_module.split_price_text("¥44 ↓ 6", "↓ 6") == ("¥44 ", "↓ 6")
-    assert app_module.split_price_text("已售罄 ¥138", None) == ("已售罄 ¥138", "")
-    assert app_module.split_price_text("¥44", "↓ 6") == ("¥44", "")
-    assert app_module.split_price_text("", "↓ 6") == ("", "")
+    """拆现价 / 涨跌 / 剩余件数：后两截永远照这个顺序在末尾，按长度切；对不上就原样返回。"""
+    assert app_module.split_price_text("¥44 ↓ 6 仅剩 2 件", "↓ 6", "仅剩 2 件") == (
+        "¥44 ", "↓ 6", "仅剩 2 件",
+    )
+    # 价格没变、只有件数：现价那截留着分隔的空格，件数照样接得上
+    assert app_module.split_price_text("¥44 仅剩 2 件", None, "仅剩 2 件") == (
+        "¥44 ", "", "仅剩 2 件",
+    )
+    assert app_module.split_price_text("已售罄 ¥138", None, "") == ("已售罄 ¥138", "", "")
+    assert app_module.split_price_text("¥44", "↓ 6", "") == ("¥44", "", "")
+    assert app_module.split_price_text("", "↓ 6", "") == ("", "", "")
+    # 传进来的那一截跟文本对不上（比如缓存里的写法变了）：不认它，整句都留在现价那截里
+    assert app_module.split_price_text("¥44 ↑ 3", "↓ 6", "仅剩 2 件") == ("¥44 ↑ 3", "", "")
+
+
+def test_stock_text():
+    """剩余件数的展示文本；没有件数（解析层归一成 None）就不多这一截。"""
+    assert app_module.stock_text(2) == "仅剩 2 件"
+    assert app_module.stock_text(None) == ""
+    assert app_module.stock_text(0) == ""
 
 
 @pytest.mark.parametrize(

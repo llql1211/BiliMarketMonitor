@@ -130,6 +130,62 @@ def _amount(value) -> str:
     return f"{value:.2f}".rstrip("0").rstrip(".")
 
 
+def _sample_result(name, price, stock=None, sold_out=False):
+    """造一份抓取结果：走真 parser，形状跟线上一模一样。
+
+    手写结果 dict 也能让图出来，但那样样本跟实现就各说各话了（见 _change 里
+    同样的理由）——比如件数是哪来的、售罄时按钮长什么样，都得跟真响应一致。
+    """
+    import parser
+
+    button = {"buttonState": 2, "buttonText": "已售罄"} if sold_out else {
+        "buttonState": 1, "buttonText": f"最低价仅{stock}件",
+    }
+    return parser.parse_cluster(
+        {
+            "success": True,
+            "data": {
+                "clusterBasicInfoFloorVO": {"clusterName": name},
+                "clusterPriceFloorVO": {"priceTag": {"firstPrice": price}},
+                "clusterPurchaseButton": button,
+            },
+        }
+    )
+
+
+def seed_sample_fetches(window):
+    """给头三个「算得出涨跌」的行照「刚抓完一轮」的样子回填结果。
+
+    图上要看的那两截——涨跌和剩余件数——都得抓过才有：涨跌要跟上一轮比，
+    件数是接口这次报的。只靠缓存渲染的画面里两截都是空的，这个改动就看不出
+    效果了。三行分别凑出「涨跌 + 件数」「涨跌 + 件数」「只有件数」三种并排。
+    挑行时跳过售罄的：它们本来就比不了价，白占一个样本位（清单前几行恰好
+    是售罄的，早先按行号取，三个样本最后只画出来一个）。
+
+    走真 OnResultReady（抓取线程回填用的就是这个入口），价格按缓存里的现价
+    推：降一点就有涨跌，不动就没有。名字沿用清单里的那个，免得表格被改名。
+    """
+    import parser
+
+    samples = ((0.9, 1), (0.95, 2), (1.0, 3))
+    used = 0
+    for row in range(len(window.rows)):
+        if used >= len(samples):
+            return
+        record = window.rows[row]["record"] or {}
+        price = parser.price_number(record.get("price_text"))
+        if not price or record.get("sold_out"):
+            continue  # 没有价格可比的（或售罄的）行喂进去，涨跌算不出来
+        factor, stock = samples[used]
+        used += 1
+        window.OnResultReady(
+            row,
+            _sample_result(
+                window.rows[row]["entry"].name, _amount(price * factor), stock
+            ),
+        )
+
+
 # ---------------- 场景 ----------------
 
 
@@ -309,7 +365,10 @@ def _preview_zoom(dark):
 
 @scene("main", settle=1.5)
 def _main(dark):
-    """真窗口：清单和缓存都来自沙盒，缩略图靠 settle 等它落上来。"""
+    """真窗口：清单和缓存都来自沙盒，缩略图靠 settle 等它落上来。
+
+    再回填几行抓取结果，好看清「现价 + 涨跌 + 剩余件数」三截并排的样子。
+    """
     import app
     import links
 
@@ -319,6 +378,7 @@ def _main(dark):
     path = links.default_watchlist_path()
     if os.path.exists(path):
         window.LoadWatchlist(path)
+    seed_sample_fetches(window)
     window.ReportStartupNotes()
     return window
 
