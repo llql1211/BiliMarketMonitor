@@ -1294,7 +1294,7 @@ class MainWindow(QMainWindow):
     def InitUI(self):
         template = self.config["detail_url_template"]
         self.setWindowTitle("市集商品价格监视器")
-        self.resize(1200, 620)
+        self.resize(1500, 900)
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -1372,10 +1372,10 @@ class MainWindow(QMainWindow):
         # 190 是照更长的旧写法量的（那时最长的两种量到 173 和 203）；现在的写法去掉
         # 了箭头后的空格和件数前的「余」，每格都短了一截，所以眼下有富余。真放不下
         # 时（见 PriceDeltaDelegate）件数那截退到悬停提示里，不跟涨跌叠着画。
-        header.resizeSection(COL_PRICE, 190)
-        header.resizeSection(COL_EXPECT, 90)
-        header.resizeSection(COL_REF, 90)
-        header.resizeSection(COL_AVG, 100)
+        header.resizeSection(COL_PRICE, 140)
+        header.resizeSection(COL_EXPECT, 80)
+        header.resizeSection(COL_REF, 80)
+        header.resizeSection(COL_AVG, 90)
         # 成交三列只放个位数到五位数的成交量，100 就够；腾出来的 30 给「现价」列，
         # 免得去挤商品名——那列是 Stretch，加宽「现价」只会从它身上抠。
         for col in (COL_DEAL_BASE, COL_DEAL_BASE + 1, COL_DEAL_BASE + 2):
