@@ -153,7 +153,7 @@ def test_upsert_item_saves_stock_count(db):
 
 @pytest.mark.parametrize("value", [0, -1, True, "2", 2.0])
 def test_upsert_stock_count_only_takes_positive_ints(db, value):
-    """0 / 负数 / 非整数一律按「没抓到」存 NULL——「仅剩 0 件」不是个能显示的东西。"""
+    """0 / 负数 / 非整数一律按「没抓到」存 NULL——「 · 0件」不是个能显示的东西。"""
     st = store.Store(db)
     st.upsert_item("1001", "甲", None, price_text="¥44", stock_count=value)
     assert st.get_item("1001")["stock_count"] is None

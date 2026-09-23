@@ -390,7 +390,7 @@ def _clean_count(value):
     """剩余件数归一：只认正整数，其余按"这次没抓到"处理（存 NULL，保留上次的值）。
 
     "还剩 0 件"和"接口没报件数"对界面是同一件事（都不显示），归到一起，
-    省得 0 被当成一个真件数存进来、下次显示成「仅剩 0 件」。
+    省得 0 被当成一个真件数存进来、下次显示成「 · 0件」。
     """
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         return None

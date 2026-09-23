@@ -117,13 +117,12 @@ EXPECTED_PREFIX = "￥"
 # 手写进清单的货币符号：展示前先脱掉，免得叠成「￥￥50」
 _CURRENCY_CHARS = "¥￥$€"
 
-DELTA_ROLE = Qt.UserRole + 1        # 「现价」格末尾那截涨跌（形如「↓ 6」）
+DELTA_ROLE = Qt.UserRole + 1        # 「现价」格末尾那截涨跌（形如「↓6」）
 DELTA_COLOR_ROLE = Qt.UserRole + 2  # 上面那截的颜色（随主题走，重画时重算）
 DELTA_GAP = " "                     # 现价与涨跌之间空一格
 
-STOCK_ROLE = Qt.UserRole + 3        # 涨跌后面那截剩余件数（形如「仅剩 2 件」）
+STOCK_ROLE = Qt.UserRole + 3        # 涨跌后面那截剩余件数（形如「 · 3件」，间隔号带在它身上）
 STOCK_COLOR_ROLE = Qt.UserRole + 4  # 上面那截的颜色（弱化色，随主题走）
-STOCK_GAP = " "                     # 涨跌与剩余件数之间空一格
 
 # 「现价」列一律左对齐：涨跌和剩余件数两截的落点都是从文本区左边算起的（见 segment_rect）
 PRICE_ALIGN = Qt.AlignLeft | Qt.AlignVCenter
@@ -202,9 +201,9 @@ def price_delta(previous_price, previous_sold_out, current_price, current_sold_o
         return None
     change = round(new - old, 2)
     if change > 0:
-        return f"↑ {_amount(change)}", change
+        return f"↑{_amount(change)}", change
     if change < 0:
-        return f"↓ {_amount(change)}", change
+        return f"↓{_amount(change)}", change
     return None
 
 
@@ -255,7 +254,7 @@ def price_change(previous, result):
       old_price  上一次的现价原文
       new_price  这一次的现价原文
       change     涨跌数字（只有 up/down 有，其余为 None）
-      delta      形如「↓ 6」的显示文本（同上）
+      delta      形如「↓6」的显示文本（同上）
 
     判"没得比"的口径与 price_delta 一致：之前没抓到过价格就没有比较的基准
     （首次抓到不算变动）。售罄前后同样不比价格——那两个数不是一回事
@@ -288,14 +287,14 @@ def price_change(previous, result):
 
 
 def split_price_text(text, delta, stock=""):
-    """把「¥44 ↓ 6 仅剩 2 件」拆成现价 / 涨跌 / 剩余件数三截（现价那截留着分隔的空格）。
+    """把「¥44 ↓6 · 2件」拆成现价 / 涨跌 / 剩余件数三截（现价那截留着分隔的空格）。
 
     涨跌和剩余件数永远照这个顺序拼在末尾，从右往左按长度切比找分隔符稳——价格
-    前面还顶着「已售罄」，里面也没准带空格。
+    前面还顶着「已售罄」，里面也没准带空格。件数那截自带「 · 」，切掉它不会在末尾
+    留下孤儿空格，所以比涨跌时不必再 trim 一道。
 
-    先切剩余件数再切涨跌：切完件数后，它前面那个分隔空格还挂在末尾，直接比会
-    对不上，所以比涨跌前先 rstrip 一下（那本来就是要一起拿走的间距）。中间那段
-    空格留在现价那截里，量出来的间距才跟拼文本时一致。
+    留在现价那截末尾的空格是「现价与涨跌之间」的那一个：它得留着，量出来的间距
+    才跟拼文本时一致（见 segment_rect）。
 
     两截各认各的：对不上就返回空串，那段文本照旧留在现价那截里。宁可让它在现价
     的位置按现价的颜色原样显示出来，也不要当成另一截、挪到别处去画。
@@ -304,12 +303,8 @@ def split_price_text(text, delta, stock=""):
         text = text[: len(text) - len(stock)]
     else:
         stock = ""
-    if delta:
-        trimmed = text.rstrip()
-        if trimmed.endswith(delta):
-            text = trimmed[: len(trimmed) - len(delta)]
-        else:
-            delta = ""
+    if delta and text.endswith(delta):
+        text = text[: len(text) - len(delta)]
     else:
         delta = ""
     return text, delta, stock
@@ -329,13 +324,19 @@ def segment_rect(metrics, text_rect, left, text):
 
 
 def stock_text(count) -> str:
-    """「现价」格末尾那截剩余件数（形如「仅剩 2 件」）；没有件数就给空串。
+    """「现价」格末尾那截剩余件数（形如「 · 3件」）；没有件数就给空串。
+
+    间隔号和它两边的空格都长在这一截里，是因为这几截是各画各的（见
+    PriceDeltaDelegate）：夹在涨跌和件数中间的那段空隙没人画，把它写成一截之外的
+    分隔符就等于没画。间隔号用「 · 」，跟成交列（见 deal_text）同一个写法。
+
+    完整的说法留在悬停提示里（见 StockTooltip）。
 
     件数由解析层归一（见 parser._stock_count）：接口只在货少时才把件数写进按钮
     文案，货还够（「当前最低价」）和已售罄（「已售罄」）都没数字可报，到这里就是
     None——格子末尾也就不多这一截。
     """
-    return f"仅剩 {count} 件" if count else ""
+    return f" · {count}件" if count else ""
 
 
 def _parse_stamp(value):
@@ -747,7 +748,7 @@ class ImageFetcher(QObject):
 class PriceDeltaDelegate(QStyledItemDelegate):
     """「现价」列的绘制：现价照常画，后面那截涨跌和剩余件数各自上色。
 
-    一个 QTableWidgetItem 只有一种前景色，而「¥44 ↓ 6 仅剩 2 件」要三截颜色，所以
+    一个 QTableWidgetItem 只有一种前景色，而「¥44 ↓6 · 2件」要三截颜色，所以
     这一列自己画：先让基类按平常的样子画（背景、隔行色、选中态、对齐都一样），只是
     交给它的文本先收窄成现价那半截，再按同一个文本矩形接着往后补上另两截。
 
@@ -1367,10 +1368,10 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(QHeaderView.Interactive)
         self.table.setIconSize(QSize(IMAGE_SIZE, IMAGE_SIZE))
         header.resizeSection(COL_IMG, IMAGE_SIZE + 8)
-        # 要放得下「¥6.56 ↓ 0.73 仅剩 1 件」这种：现价、涨跌、剩余件数三截并排。
-        # 便宜的东西才容易报件数，而便宜的东西价格变动常带小数（↓ 0.73），所以 190 是
-        # 照着这种「便宜 + 有小数」量的（173），不是照着最短的那种。再长的（¥127.99 又
-        # 赶上变动，203）就只画到涨跌为止（见 PriceDeltaDelegate），件数退到悬停提示里。
+        # 要放得下「¥6.56 ↓0.73 · 1件」这种：现价、涨跌、剩余件数三截并排。
+        # 190 是照更长的旧写法量的（那时最长的两种量到 173 和 203）；现在的写法去掉
+        # 了箭头后的空格和件数前的「余」，每格都短了一截，所以眼下有富余。真放不下
+        # 时（见 PriceDeltaDelegate）件数那截退到悬停提示里，不跟涨跌叠着画。
         header.resizeSection(COL_PRICE, 190)
         header.resizeSection(COL_EXPECT, 90)
         header.resizeSection(COL_REF, 90)
@@ -1663,8 +1664,12 @@ class MainWindow(QMainWindow):
         return "该商品已售罄，这里的价格是原价而非市集现价" if sold_out else ""
 
     def StockTooltip(self, stock):
-        """剩余件数那句完整的话：格子窄到画不下这一截时，还能从提示里看到。"""
-        return f"当前价格{stock}" if stock else ""
+        """剩余件数那句完整的话：格子窄到画不下这一截时，还能从提示里看到。
+
+        格子里那截是「 · 3件」（间隔号是排版用的，见 stock_text），提示里把它脱掉
+        再补成一句话：「当前价格还3件」。
+        """
+        return f"当前价格还{stock.lstrip(' ·')}" if stock else ""
 
     def ReferenceCell(self, reference_price):
         """「原价」格：弱化色显示，跟现价拉开层次。"""
@@ -1683,9 +1688,9 @@ class MainWindow(QMainWindow):
         对齐固定成 PRICE_ALIGN：涨跌和剩余件数两截的落点都是按"现价从文本区
         左边起"算的（见 segment_rect），居中或右对齐就会几截叠在一起。
 
-        delta 是 (文本, 涨跌数值)，stock 是 stock_text() 拼好的件数文本。
-        两者都排在末尾，顺序定了就别改——拆几截是靠从右往左按长度切的
-        （见 split_price_text）。
+        delta 是 (文本, 涨跌数值)，stock 是 stock_text() 拼好的件数文本（自带
+        「 · 」间隔号，所以中间不再插分隔）。两者都排在末尾，顺序定了就别改——
+        拆几截是靠从右往左按长度切的（见 split_price_text）。
 
         note 是「这价格是什么时候抓的」那类补充说明，有它就不再退回"提示即全文"。
         """
@@ -1693,7 +1698,7 @@ class MainWindow(QMainWindow):
         if delta:
             text += DELTA_GAP + delta[0]
         if stock:
-            text += STOCK_GAP + stock
+            text += stock
         cell = self.MakeCell(
             text,
             tooltip=_tips(

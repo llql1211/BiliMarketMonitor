@@ -353,7 +353,7 @@ def test_rebuild_rows_keeps_or_drops_values(window):
     w.OnResultReady(0, result_ok(price="¥99"))
 
     w.RebuildRows()
-    assert w.table.item(0, app_module.COL_PRICE).text() == "¥99 ↑ 49"
+    assert w.table.item(0, app_module.COL_PRICE).text() == "¥99 ↑49"
 
     w.RebuildRows(keep_values=False)
 
@@ -803,8 +803,8 @@ def test_no_cache_still_renders_placeholders(window):
 @pytest.mark.parametrize(
     "cached, fetched, expected",
     [
-        ("¥50", "¥44", "¥44 ↓ 6"),
-        ("¥44", "¥50", "¥50 ↑ 6"),
+        ("¥50", "¥44", "¥44 ↓6"),
+        ("¥44", "¥50", "¥50 ↑6"),
         ("¥44", "¥44", "¥44"),  # 没变就不尾随「-」，格子里就一个价格
     ],
 )
@@ -882,24 +882,24 @@ def test_delta_survives_a_table_rebuild(window):
 
     w.RebuildRows()
 
-    assert w.table.item(0, app_module.COL_PRICE).text() == "¥44 ↓ 6"
-    assert _delta(w) == "↓ 6"
+    assert w.table.item(0, app_module.COL_PRICE).text() == "¥44 ↓6"
+    assert _delta(w) == "↓6"
 
 
 def test_stock_count_shows_after_the_price(window):
-    """抓到「最低价仅1件」就在现价后面补一截「仅剩 1 件」，用弱化色。"""
+    """抓到「最低价仅1件」就在现价后面补一截「 · 1件」，用弱化色。"""
     w = window("10000008780\n")
     w.LoadWatchlist(w.watchlist_path)
 
     w.OnResultReady(0, result_ok(price="¥44", stock=1))
 
     cell = w.table.item(0, app_module.COL_PRICE)
-    assert cell.text() == "¥44 仅剩 1 件"
-    assert _stock(w) == "仅剩 1 件"
+    assert cell.text() == "¥44 · 1件"
+    assert _stock(w) == " · 1件"
     assert cell.data(app_module.STOCK_COLOR_ROLE).name() == (
         theme.muted_color(w.dark).name()
     )
-    assert cell.toolTip() == "当前价格仅剩 1 件"  # 列窄到画不下时还能从提示里看到
+    assert cell.toolTip() == "当前价格还1件"  # 列窄到画不下时还能从提示里看到
 
 
 def test_stock_count_sits_after_the_delta(window):
@@ -911,9 +911,9 @@ def test_stock_count_sits_after_the_delta(window):
     w.OnResultReady(0, result_ok(price="¥44", stock=2))
 
     cell = w.table.item(0, app_module.COL_PRICE)
-    assert cell.text() == "¥44 ↓ 6 仅剩 2 件"
-    assert _delta(w) == "↓ 6"
-    assert _stock(w) == "仅剩 2 件"
+    assert cell.text() == "¥44 ↓6 · 2件"
+    assert _delta(w) == "↓6"
+    assert _stock(w) == " · 2件"
 
 
 def test_stock_count_survives_a_table_rebuild(window):
@@ -924,8 +924,8 @@ def test_stock_count_survives_a_table_rebuild(window):
 
     w.RebuildRows()
 
-    assert w.table.item(0, app_module.COL_PRICE).text() == "¥44 仅剩 3 件"
-    assert _stock(w) == "仅剩 3 件"
+    assert w.table.item(0, app_module.COL_PRICE).text() == "¥44 · 3件"
+    assert _stock(w) == " · 3件"
 
 
 def test_failed_fetch_falls_back_to_the_cached_stock_count(window):
@@ -933,11 +933,11 @@ def test_failed_fetch_falls_back_to_the_cached_stock_count(window):
     w = window("10000008780\n")
     _seed_cache(w, price="¥44", stock=2)
     w.LoadWatchlist(w.watchlist_path)
-    assert _stock(w) == "仅剩 2 件"
+    assert _stock(w) == " · 2件"
 
     w.OnResultReady(0, result_fail("读取超时"))
 
-    assert w.table.item(0, app_module.COL_PRICE).text() == "¥44 仅剩 2 件"
+    assert w.table.item(0, app_module.COL_PRICE).text() == "¥44 · 2件"
 
 
 def test_no_stock_count_leaves_the_price_cell_alone(window):
@@ -970,7 +970,7 @@ def test_failed_fetch_falls_back_to_the_cached_price(window):
     _seed_cache(w, price="¥50")
     w.LoadWatchlist(w.watchlist_path)
     w.OnResultReady(0, result_ok(price="¥44"))
-    assert _delta(w) == "↓ 6"
+    assert _delta(w) == "↓6"
 
     w.OnResultReady(0, result_fail("读取超时"))
 
@@ -1003,7 +1003,7 @@ def test_price_delegate_hands_only_the_price_to_the_base_style(window):
     option = QStyleOptionViewItem()
     w.table.itemDelegateForColumn(app_module.COL_PRICE).initStyleOption(option, index)
 
-    assert index.data(Qt.DisplayRole) == "¥44 ↓ 6"
+    assert index.data(Qt.DisplayRole) == "¥44 ↓6"
     assert option.text == "¥44 "  # 分隔的空格留着，基类按它把现价摆在该在的地方
 
 
@@ -1012,7 +1012,7 @@ def test_segment_rect_sits_right_after_the_price(qapp):
     metrics = QFontMetrics(qapp.font())
     text_rect = QRect(0, 0, 120, 20)
     left = text_rect.left() + metrics.horizontalAdvance("¥44 ")
-    rect = app_module.segment_rect(metrics, text_rect, left, "↓ 6")
+    rect = app_module.segment_rect(metrics, text_rect, left, "↓6")
 
     assert rect.left() == metrics.horizontalAdvance("¥44 ")
     assert rect.top() == text_rect.top()
@@ -1024,7 +1024,7 @@ def test_segment_rect_gives_up_when_it_does_not_fit(qapp):
     """格子窄到放不下就干脆不画：宁可不显示这一截，也不要糊成一团。"""
     metrics = QFontMetrics(qapp.font())
     left = metrics.horizontalAdvance("¥44 ")
-    assert app_module.segment_rect(metrics, QRect(0, 0, 8, 20), left, "↓ 6") is None
+    assert app_module.segment_rect(metrics, QRect(0, 0, 8, 20), left, "↓6") is None
 
 
 def test_painting_a_price_cell_with_a_delta_does_not_blow_up(window, qapp):
@@ -1038,7 +1038,7 @@ def test_painting_a_price_cell_with_a_delta_does_not_blow_up(window, qapp):
 
     w.table.viewport().grab()
 
-    assert w.table.item(0, app_module.COL_PRICE).text() == "¥44 ↓ 6"
+    assert w.table.item(0, app_module.COL_PRICE).text() == "¥44 ↓6"
 
 
 # ---------------- 抓取前清空价格 ----------------
@@ -1347,8 +1347,8 @@ def test_full_run_pops_a_summary_of_the_changes(window, monkeypatch, wait_until)
     # 明细按清单顺序：甲在前、乙在后，各自的涨跌对得上
     detail = dialog.detail.toPlainText()
     assert detail.index("甲") < detail.index("乙")
-    assert "¥50 → ¥44" in detail and "↓ 6" in detail
-    assert "¥44 → ¥50" in detail and "↑ 6" in detail
+    assert "¥50 → ¥44" in detail and "↓6" in detail
+    assert "¥44 → ¥50" in detail and "↑6" in detail
 
 
 def test_summary_reports_new_deals(window, monkeypatch, wait_until):
@@ -1548,7 +1548,7 @@ def test_summary_keeps_its_colors_when_the_theme_toggles(window):
     w.ApplyTheme(False)
     w.run_changes = [
         {"kind": "down", "name": "甲", "old_price": "¥50", "new_price": "¥44",
-         "delta": "↓ 6", "change": -6}
+         "delta": "↓6", "change": -6}
     ]
     w.ShowSummary()
     assert theme.PRICE_DOWN_COLOR_LIGHT in w.summary_dialog.detail.toHtml().lower()
@@ -2932,11 +2932,11 @@ def test_deal_text(deal, expected):
 @pytest.mark.parametrize(
     "previous, previous_sold_out, current, current_sold_out, expected",
     [
-        ("¥50", False, "¥44", False, ("↓ 6", -6)),
-        ("¥44", False, "¥50", False, ("↑ 6", 6)),
+        ("¥50", False, "¥44", False, ("↓6", -6)),
+        ("¥44", False, "¥50", False, ("↑6", 6)),
         ("¥44", False, "¥44.00", False, None),          # 没变就不提，别挂个「-」
-        ("¥44.20", False, "¥50.70", False, ("↑ 6.5", 6.5)),
-        ("¥1,299.50", False, "¥1,299.75", False, ("↑ 0.25", 0.25)),
+        ("¥44.20", False, "¥50.70", False, ("↑6.5", 6.5)),
+        ("¥1,299.50", False, "¥1,299.75", False, ("↑0.25", 0.25)),
         ("¥138", True, "¥44", False, None),             # 上次售罄
         ("¥44", False, "¥138", True, None),             # 这次售罄
         ("", False, "¥44", False, None),                # 没有上次的价格
@@ -2955,8 +2955,8 @@ def test_price_delta(previous, previous_sold_out, current, current_sold_out, exp
 @pytest.mark.parametrize(
     "previous, result, kind, delta",
     [
-        ({"price_text": "¥44"}, {"price": "¥50"}, "up", "↑ 6"),
-        ({"price_text": "¥50"}, {"price": "¥44"}, "down", "↓ 6"),
+        ({"price_text": "¥44"}, {"price": "¥50"}, "up", "↑6"),
+        ({"price_text": "¥50"}, {"price": "¥44"}, "down", "↓6"),
         # 售罄前后不比价格（那两个数不是一回事），但状态本身变了要报
         ({"price_text": "¥44"}, {"price": "¥50", "sold_out": True}, "sold_out", ""),
         ({"price_text": "¥138", "sold_out": 1}, {"price": "¥44"}, "on_sale", ""),
@@ -3235,7 +3235,7 @@ def test_new_deals_still_rejects_a_younger_deal_with_the_same_price():
 def test_summary_sections_renders_every_block_with_content():
     """三块各带小标题、按价格变动 → 新增成交 → 低于预期价的顺序排。"""
     changes = [{"kind": "down", "name": "甲", "old_price": "¥50", "new_price": "¥44",
-                "delta": "↓ 6", "change": -6}]
+                "delta": "↓6", "change": -6}]
     deals = [{"name": "乙", "deals": [{"price": "¥44", "time": "2小时前"}]}]
     targets = [{"name": "丙", "price": "¥18", "expected_price": "20"}]
 
@@ -3251,7 +3251,7 @@ def test_summary_sections_renders_every_block_with_content():
     [
         ([], [], []),
         ([{"kind": "down", "name": "甲", "old_price": "¥50", "new_price": "¥44",
-           "delta": "↓ 6", "change": -6}], [], []),
+           "delta": "↓6", "change": -6}], [], []),
     ],
 )
 def test_summary_sections_drops_empty_blocks(changes, deals, targets):
@@ -3270,7 +3270,7 @@ def test_summary_tables_have_no_row_number_column():
     商品名摆第一列，扫一眼就是"哪件"；序号只是个位置，占了最显眼的地方又不说明什么。
     """
     changes = [{"kind": "down", "name": "甲", "old_price": "¥50", "new_price": "¥44",
-                "delta": "↓ 6", "change": -6}]
+                "delta": "↓6", "change": -6}]
     deals = [{"name": "乙", "deals": [{"price": "¥44", "time": "2小时前"}]}]
     targets = [{"name": "丙", "price": "¥18", "expected_price": "20"}]
 
@@ -3297,7 +3297,7 @@ def test_changes_html_escapes_the_name():
     """商品名是接口给的，带尖括号也不能把表格拆了。"""
     markup = app_module.changes_html(
         [{"kind": "up", "name": "<b>甲</b>", "old_price": "¥1", "new_price": "¥2",
-          "delta": "↑ 1", "change": 1}],
+          "delta": "↑1", "change": 1}],
         dark=False,
     )
 
@@ -3324,7 +3324,7 @@ def test_changes_html_shows_the_state_instead_of_a_delta(kind, expected):
 def test_changes_html_colors_the_delta_by_theme():
     """涨跌那格的颜色跟着主题走，和表格里的涨跌是同一套色。"""
     change = {"kind": "down", "name": "甲", "old_price": "¥50", "new_price": "¥44",
-              "delta": "↓ 6", "change": -6}
+              "delta": "↓6", "change": -6}
 
     assert theme.PRICE_DOWN_COLOR_LIGHT in app_module.changes_html([change], dark=False)
     assert theme.PRICE_DOWN_COLOR_DARK in app_module.changes_html([change], dark=True)
@@ -3332,23 +3332,23 @@ def test_changes_html_colors_the_delta_by_theme():
 
 def test_split_price_text():
     """拆现价 / 涨跌 / 剩余件数：后两截永远照这个顺序在末尾，按长度切；对不上就原样返回。"""
-    assert app_module.split_price_text("¥44 ↓ 6 仅剩 2 件", "↓ 6", "仅剩 2 件") == (
-        "¥44 ", "↓ 6", "仅剩 2 件",
+    assert app_module.split_price_text("¥44 ↓6 · 2件", "↓6", " · 2件") == (
+        "¥44 ", "↓6", " · 2件",
     )
-    # 价格没变、只有件数：现价那截留着分隔的空格，件数照样接得上
-    assert app_module.split_price_text("¥44 仅剩 2 件", None, "仅剩 2 件") == (
-        "¥44 ", "", "仅剩 2 件",
+    # 价格没变、只有件数：没有留给涨跌的那格空格，现价那截就是光一个价格
+    assert app_module.split_price_text("¥44 · 2件", None, " · 2件") == (
+        "¥44", "", " · 2件",
     )
     assert app_module.split_price_text("已售罄 ¥138", None, "") == ("已售罄 ¥138", "", "")
-    assert app_module.split_price_text("¥44", "↓ 6", "") == ("¥44", "", "")
-    assert app_module.split_price_text("", "↓ 6", "") == ("", "", "")
+    assert app_module.split_price_text("¥44", "↓6", "") == ("¥44", "", "")
+    assert app_module.split_price_text("", "↓6", "") == ("", "", "")
     # 传进来的那一截跟文本对不上（比如缓存里的写法变了）：不认它，整句都留在现价那截里
-    assert app_module.split_price_text("¥44 ↑ 3", "↓ 6", "仅剩 2 件") == ("¥44 ↑ 3", "", "")
+    assert app_module.split_price_text("¥44 ↑3", "↓6", " · 2件") == ("¥44 ↑3", "", "")
 
 
 def test_stock_text():
     """剩余件数的展示文本；没有件数（解析层归一成 None）就不多这一截。"""
-    assert app_module.stock_text(2) == "仅剩 2 件"
+    assert app_module.stock_text(2) == " · 2件"
     assert app_module.stock_text(None) == ""
     assert app_module.stock_text(0) == ""
 
