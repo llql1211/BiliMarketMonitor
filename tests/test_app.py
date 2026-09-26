@@ -137,6 +137,8 @@ class FakePoller(QObject):
         self._running = running
         self._paused = paused
         self.stopped = False
+        # 建线程时收到的 [(行号, LinkEntry)]：用例靠它断言这一轮到底抓了哪几件
+        self.tasks = args[0] if args else None
 
     def start(self):
         pass
@@ -207,7 +209,7 @@ def test_link_header_tooltip_explains_template(window):
 def test_idle_buttons_enabled(window):
     """空闲态下清单管理类按钮都应可点。"""
     w = window()
-    for btn in (w.btn_add, w.btn_delete, w.btn_normalize, w.btn_refresh_list):
+    for btn in (w.btn_add, w.btn_delete, w.btn_refresh_list, w.btn_fetch_new):
         assert btn.isEnabled()
 
 
@@ -694,12 +696,12 @@ def test_expected_price_rolls_back_when_watchlist_write_fails(window, monkeypatc
     assert _expected_cell(w).text() == "￥50"
 
 
-def test_normalize_keeps_expected_price(window, monkeypatch):
-    """整理清单重写整个文件，预期价不能在这一步丢掉。"""
+def test_refresh_keeps_expected_price(window):
+    """刷新列表会重写整个文件，预期价不能在这一步丢掉。"""
     w = window("10000008780 | 甲 | 50\n10000008781 | 乙 | 88\n")
     w.LoadWatchlist(w.watchlist_path)
 
-    w.OnNormalize()
+    w.OnRefreshList()
 
     assert [(e.cluster_id, e.expected_price) for e in links.load_links(w.watchlist_path)] == [
         ("10000008780", "50"),
@@ -1132,6 +1134,66 @@ def test_failed_result_also_stops_being_pending(window, monkeypatch):
     assert w.table.item(0, app_module.COL_PRICE).text() == "¥138"
 
 
+# ---------------- 仅抓取新添加 ----------------
+
+
+def _start_fetch_new(w, monkeypatch):
+    """起一轮「仅抓取新添加商品」，同样把线程挡掉。"""
+    monkeypatch.setattr(app_module, "PollerThread", FakePoller)
+    w.OnFetchNew()
+
+
+def test_fetch_new_only_asks_for_items_without_a_price(window, monkeypatch):
+    """只请求还没抓到过价的那几件；已经有价的连问都不问。"""
+    w = window("10000008780\n10000000002\n10000000003\n")
+    _seed_cache(w, price="¥138")                           # 第一行有价
+    _seed_cache(w, price="¥99", cluster_id="10000000003")  # 第三行也有
+    w.LoadWatchlist(w.watchlist_path)
+
+    _start_fetch_new(w, monkeypatch)
+
+    assert [e.cluster_id for _, e in w.poller.tasks] == ["10000000002"]
+
+
+def test_fetch_new_leaves_the_other_rows_prices_alone(window, monkeypatch):
+    """只抓新商品时，已经有价的行不该跟着空一整轮。"""
+    w = window("10000008780\n10000000002\n")
+    _seed_cache(w, price="¥138")
+    w.LoadWatchlist(w.watchlist_path)
+
+    _start_fetch_new(w, monkeypatch)
+
+    assert w.table.item(0, app_module.COL_PRICE).text() == "¥138"  # 没被清成「--」
+    assert w.table.item(1, app_module.COL_PRICE).text() == app_module.CLEARED_TEXT
+
+
+def test_fetch_new_counts_only_this_round_in_the_summary(window, monkeypatch):
+    """总结里报的是这一轮抓的几件，不是清单总件数。"""
+    w = window("10000008780\n10000000002\n10000000003\n")
+    _seed_cache(w, price="¥138")
+    _seed_cache(w, price="¥99", cluster_id="10000000003")
+    w.LoadWatchlist(w.watchlist_path)
+
+    _start_fetch_new(w, monkeypatch)
+    w.OnResultReady(1, result_ok(price="¥44"))
+    w.OnPollFinished()
+
+    assert w.summary_dialog.subtitle.text() == "本次共抓取 1 件商品"
+
+
+def test_fetch_new_with_nothing_new_does_not_start_a_run(window, monkeypatch):
+    """每一件都抓到过价时不启动：状态栏说一句就够了，别开一轮什么都不干的抓取。"""
+    w = window("10000008780\n")
+    _seed_cache(w, price="¥138")
+    w.LoadWatchlist(w.watchlist_path)
+
+    _start_fetch_new(w, monkeypatch)
+
+    assert w.poller is None
+    assert "没有新添加的商品" in w.progress_label.text()
+    assert w.table.item(0, app_module.COL_PRICE).text() == "¥138"  # 价格没动
+
+
 # ---------------- 快捷键 ----------------
 
 
@@ -1203,9 +1265,9 @@ def test_set_busy_toggles_buttons(window):
     w.SetBusy(True)
     assert not w.btn_add.isEnabled()
     assert not w.btn_delete.isEnabled()
-    assert not w.btn_normalize.isEnabled()
     assert not w.btn_refresh_list.isEnabled()
     assert not w.btn_fetch.isEnabled()
+    assert not w.btn_fetch_new.isEnabled()
     assert not w.shortcut_fetch.isEnabled()  # F5 跟着「开始抓取」一起开关
     assert w.btn_pause.isEnabled() and w.btn_stop.isEnabled()
 
@@ -1705,8 +1767,8 @@ def test_refresh_list_keeps_failed_rows_marked(window, data_files):
     assert cell.toolTip() == "HTTP 500"
 
 
-def test_normalize_rewrites_watchlist(window, data_files):
-    """「整理清单」把链接和裸 ID 统一成 `clusterId | 名字` 的规范格式。"""
+def test_refresh_rewrites_watchlist(window, data_files):
+    """「刷新列表」把链接和裸 ID 统一成 `clusterId | 名字` 的规范格式。"""
     w = window(
         "# 手写的注释\n"
         "https://mall.bilibili.com/neul-next/resell/detail.html"
@@ -1715,14 +1777,14 @@ def test_normalize_rewrites_watchlist(window, data_files):
     )
     w.LoadWatchlist(w.watchlist_path)
 
-    w.OnNormalize()
+    w.OnRefreshList()
     content = (data_files / "watchlist.txt").read_text(encoding="utf-8")
     lines = content.splitlines()
     assert lines[0].startswith("# 监视清单")
     assert "10000008780" in lines
     assert "10000000002" in lines
     assert "https://mall.bilibili.com" not in content
-    assert "清单已按规范格式整理" in w.progress_label.text()
+    assert "已按规范格式重写" in w.progress_label.text()
 
 
 def test_save_watchlist_prefers_freshest_name(window, data_files):
@@ -3412,13 +3474,18 @@ def test_load_watchlist_surfaces_notes(window, data_files):
 
 
 def test_refresh_list_keeps_the_note(window, data_files):
-    """「刷新商品列表」会覆盖状态栏文案，降级提示必须跟着一起显示。"""
+    """「刷新列表」会覆盖状态栏文案，降级提示必须跟着一起显示；
+    而既然有认不出的行，这次就不重写清单——那行写没了就找不回来了。"""
     w = window("1001 | 甲\n乱码行\n")
     w.LoadWatchlist(w.watchlist_path)
+    before = (data_files / "watchlist.txt").read_text(encoding="utf-8")
+
     w.OnRefreshList()
 
     assert "清单已同步" in w.progress_label.text()
     assert "认不出" in w.progress_label.text()
+    assert "未重写" in w.progress_label.text()
+    assert (data_files / "watchlist.txt").read_text(encoding="utf-8") == before
 
 
 def test_save_watchlist_reports_skipped_rows(window):
@@ -3428,10 +3495,8 @@ def test_save_watchlist_reports_skipped_rows(window):
     w.rows[1]["entry"].cluster_id = "不是数字"
 
     assert w.SaveWatchlist() is True
-    w.OnNormalize()
 
     assert "跳过" in w.last_note
-    assert "跳过" in w.progress_label.text()
     body = [
         line
         for line in open(w.watchlist_path, encoding="utf-8").read().split("\n")
@@ -3447,7 +3512,7 @@ def test_dangerous_name_is_cleaned_on_load_and_save(window):
 
     assert w.table.item(0, app_module.COL_NAME).text() == "甲 乙"
 
-    w.OnNormalize()
+    assert w.SaveWatchlist() is True
     body = [
         line
         for line in open(w.watchlist_path, encoding="utf-8").read().split("\n")

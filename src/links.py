@@ -77,7 +77,7 @@ def parse_line(line: str):
     return None, None, ""
 
 
-def load_links(path: str, notes=None):
+def load_links(path: str, notes=None, stats=None):
     """读取清单，返回去重后的 LinkEntry 列表（保持文件里的顺序）。
 
     同名条目以第一次出现的为准；文件里已有的名字会被保留。
@@ -85,6 +85,10 @@ def load_links(path: str, notes=None):
     notes 传一个 list 时，读入过程中的异常情况会 append 进去（编码不对、
     有认不出来的行），由调用方决定怎么提示；不传就只是静默降级。
     文件读不了（不存在 / 没权限）仍然抛 OSError，交给调用方兜底。
+
+    stats 传一个 dict 时，回填本次读入的统计（目前只有 unparsed：认不出商品 ID
+    的行数）。调用方要用这个数来判「能不能安全地把清单重写回去」——写回是按
+    解析结果重排的，认不出的行会被写没，所以那个数只有调用方知道该怎么用。
     """
     text, encoding_note = _read_text(path)
     if encoding_note:
@@ -109,8 +113,10 @@ def load_links(path: str, notes=None):
         _note(
             notes,
             f"watchlist 里有 {unparsed} 行认不出商品 ID，已跳过"
-            f"（点「整理清单」可按规范格式重写）",
+            f"（先手工改好这几行，清单才会被重写成规范格式）",
         )
+    if stats is not None:
+        stats["unparsed"] = unparsed
     return entries
 
 

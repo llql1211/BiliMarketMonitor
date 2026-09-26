@@ -1271,10 +1271,13 @@ class MainWindow(QMainWindow):
         self.poller = None
         self.names_learned = False  # 本次抓取是否学到了新名称（决定要不要回写清单）
         self.poller_stopped = False  # 本次抓取是否被「停止抓取」中止
+        self.last_unparsed = 0   # 上次读清单时认不出的行数（见 OnRefreshList 的重写判据）
         self.run_changes = []    # 本次抓取的价格变动，跑完弹总结用（见 price_change）
         self.run_deals = []      # 本次抓到的成交里新出现的几条（见 new_deals），按商品归拢
         self.run_targets = []    # 本次现价低于预期价的商品（见 SummaryDialog）
         self.run_failures = 0    # 本次抓取查询失败的条数：失败的那几件看不出变动
+        self.run_total = 0       # 本次抓取的目标件数：总结里「共抓取 N 件」用它而不是
+                                 # 清单总件数——「仅抓取新添加商品」只抓其中几件
         self.summary_dialog = None  # 最近一次弹的总结窗口，切主题时要跟着重画
         self.image_fetcher = ImageFetcher()  # 缩略图：key 是行号
         self.image_fetcher.fetched.connect(self.OnImageFetched)
@@ -1303,9 +1306,9 @@ class MainWindow(QMainWindow):
         btn_bar = QHBoxLayout()
         self.btn_add = QPushButton("添加…")
         self.btn_delete = QPushButton("删除选中")
-        self.btn_normalize = QPushButton("整理清单")
-        self.btn_refresh_list = QPushButton("刷新商品列表")
+        self.btn_refresh_list = QPushButton("刷新列表")
         self.btn_fetch = QPushButton("开始抓取")
+        self.btn_fetch_new = QPushButton("仅抓取新添加商品")
         self.btn_pause = QPushButton(PAUSE_TEXT)
         self.btn_stop = QPushButton("停止抓取")
         for btn, slot, tip in (
@@ -1313,13 +1316,15 @@ class MainWindow(QMainWindow):
              "输入商品 ID 或分享链接（一行一个），追加写入 watchlist.txt 末尾"),
             (self.btn_delete, self.OnDeleteSelected,
              "把选中的商品从 watchlist.txt 和缓存中删除"),
-            (self.btn_normalize, self.OnNormalize,
-             "按「clusterId | 商品名」格式重写 watchlist.txt"),
             (self.btn_refresh_list, self.OnRefreshList,
-             "重新读取 watchlist.txt（手工改动后点这里同步）"),
+             "重新读取 watchlist.txt（手工改动后点这里同步）\n"
+             "全部行都认得出时，会顺手按规范格式重写一遍"),
             (self.btn_fetch, self.OnFetchPrices,
              f"逐个抓取价格，间隔 {self.config['poll_interval_seconds']:g} 秒\n"
              f"快捷键 {FETCH_SHORTCUT}"),
+            (self.btn_fetch_new, self.OnFetchNew,
+             "只抓还没有价格的商品（新添加的，以及一直没抓成功的），\n"
+             "其他行的价格不动"),
             (self.btn_pause, self.OnTogglePause,
              "暂停 / 继续本次抓取（在两条商品之间生效，不打断正在进行的请求）"),
             (self.btn_stop, self.OnStopFetch,
@@ -1329,9 +1334,9 @@ class MainWindow(QMainWindow):
             btn_bar.addWidget(btn)
         self.btn_add.clicked.connect(self.OnAdd)
         self.btn_delete.clicked.connect(self.OnDeleteSelected)
-        self.btn_normalize.clicked.connect(self.OnNormalize)
         self.btn_refresh_list.clicked.connect(self.OnRefreshList)
         self.btn_fetch.clicked.connect(self.OnFetchPrices)
+        self.btn_fetch_new.clicked.connect(self.OnFetchNew)
         self.btn_pause.clicked.connect(self.OnTogglePause)
         self.btn_stop.clicked.connect(self.OnStopFetch)
 
@@ -1414,14 +1419,18 @@ class MainWindow(QMainWindow):
     def LoadWatchlist(self, path, show_errors=True):
         """读取清单 -> 同步缓存 -> 重建表格。"""
         notes = []
+        stats = {}
         try:
-            entries = links.load_links(path, notes)
+            entries = links.load_links(path, notes, stats)
         except OSError as err:
             if show_errors:
                 QMessageBox.warning(self, "读取失败", f"读取 watchlist 出错：\n{err}")
             return False
         self.watchlist_path = path
         self.watch_entries = entries
+        # 记下认不出的行数：>0 时清单不能重写（重写是按解析结果重排的，
+        # 那几行会被写没），见 OnRefreshList
+        self.last_unparsed = stats.get("unparsed", 0)
         added, removed = self.store.sync(
             [(e.cluster_id, e.name) for e in entries]
         )
@@ -1806,15 +1815,19 @@ class MainWindow(QMainWindow):
             self.ExpectedCell(item["entry"].expected_price, price, sold_out),
         )
 
-    def ClearPrices(self):
+    def ClearPrices(self, rows=None):
         """抓取开始前把各行的价格清成「--」：从空开始涨，才看得出刷到哪一行了。
 
         清的是现价/原价/均价三格——它们由同一次请求一起回来，只清一个反而怪。
         「预期价格」不在此列：那是用户设的，跟这次抓没抓到没关系（见 SetPriceCells）。
         标记记在行模型上（price_cleared），这样抓取中途换主题重画表格时，
         已经抓到的行照常显示新价，没轮到的还是「--」。
+
+        rows 给一组行号时只清那几行（「仅抓取新添加商品」只抓其中一部分，
+        其余行的价格不该跟着空一整轮），不传就是所有行都清一遍。
         """
-        for row, item in enumerate(self.rows):
+        for row in range(len(self.rows)) if rows is None else rows:
+            item = self.rows[row]
             item["price_cleared"] = True
             self.SetPriceCells(row, item)
 
@@ -1901,8 +1914,8 @@ class MainWindow(QMainWindow):
 
     def SetBusy(self, busy: bool):
         """抓取中：清单管理类按钮置灰、暂停/停止放开；空闲时反过来。"""
-        for btn in (self.btn_add, self.btn_delete, self.btn_normalize,
-                    self.btn_refresh_list, self.btn_fetch):
+        for btn in (self.btn_add, self.btn_delete, self.btn_refresh_list,
+                    self.btn_fetch, self.btn_fetch_new):
             btn.setEnabled(not busy)
         # 快捷键跟着「开始抓取」按钮一起开关：F5 的语义就是点那个按钮，
         # 按钮灰着的时候它也该照样没反应
@@ -1937,11 +1950,6 @@ class MainWindow(QMainWindow):
             return False
         self.last_note = self.Note(notes)
         return True
-
-    def OnNormalize(self):
-        """手动整理清单：把链接、乱序格式统一成「clusterId | 商品名」。"""
-        if self.SaveWatchlist():
-            self.progress_label.setText("清单已按规范格式整理" + self.last_note)
 
     def OnAdd(self):
         """添加商品：弹窗输入 ID/链接（一行一个），追加到 watchlist.txt 末尾并立即显示为新行。"""
@@ -2026,14 +2034,30 @@ class MainWindow(QMainWindow):
             )
 
     def OnRefreshList(self):
-        """重新读取 watchlist.txt：新增的补成新行，删掉的移除，已抓数据保留。"""
+        """重新读取 watchlist.txt：新增的补成新行，删掉的移除，已抓数据保留。
+
+        读进来顺手按规范格式写回一遍——手工编辑（粘链接、剪切粘贴换顺序）之后就
+        靠这一步把文件理顺，不然得等下一次添加/删除/拖动才被顺手整理到。
+
+        但必须先重读、且只认得出全部行时才写：重写是按解析结果重排的，
+        但凡有一行认不出，那一行就会被写没——宁可这次不整理，也不删人家手写的行。
+        """
         if self.IsPolling():
             return
         if not self.LoadWatchlist(self.watchlist_path):
             return
-        self.progress_label.setText(
-            f"清单已同步，共 {len(self.rows)} 件商品" + self.last_note
-        )
+        # SaveWatchlist 会覆盖 last_note，先把这次读入的降级提示留一份
+        load_note = self.last_note
+        status = f"清单已同步，共 {len(self.rows)} 件商品"
+        if self.last_unparsed:
+            self.progress_label.setText(
+                status + "，清单未重写（先修好认不出的行）" + load_note
+            )
+            return
+        if self.SaveWatchlist():
+            self.progress_label.setText(
+                status + "，已按规范格式重写" + load_note + self.last_note
+            )
 
     def SelectItems(self, cluster_ids):
         """把选中态落到这几件商品此刻所在的行上。
@@ -2096,6 +2120,33 @@ class MainWindow(QMainWindow):
         if not tasks:
             QMessageBox.information(self, "提示", "watchlist 中没有商品链接。")
             return
+        self.StartFetch(tasks)
+
+    @staticmethod
+    def IsNewItem(item) -> bool:
+        """这件商品还没被成功抓到过价格（新添加的，以及一直抓失败的）。
+
+        判据取缓存里的 price_text：它跟 price_updated_at 是一起写的
+        （见 store.upsert_item），所以"没有价格"就等于"从没抓到过价"，
+        跟本次运行里加了什么无关，重启后依旧准确。
+        """
+        return not (item["record"] or {}).get("price_text")
+
+    def OnFetchNew(self):
+        """只抓还没有价格的商品，不动其他行。"""
+        if self.IsPolling():
+            return
+        rows = [i for i, item in enumerate(self.rows) if self.IsNewItem(item)]
+        if not rows:
+            self.progress_label.setText("没有新添加的商品：每一件都已经抓到过价格")
+            return
+        self.StartFetch([(i, self.rows[i]["entry"]) for i in rows])
+
+    def StartFetch(self, tasks):
+        """两个抓取入口共用的起跑：复位本轮状态、清价、建轮询线程。
+
+        tasks 为 [(行号, LinkEntry)]，可以只覆盖清单里的一部分（见 OnFetchNew）。
+        """
         self.last_note = ""  # 开始新的一轮抓取，不带着之前的降级提示
         self.names_learned = False
         self.poller_stopped = False
@@ -2103,7 +2154,10 @@ class MainWindow(QMainWindow):
         self.run_deals = []
         self.run_targets = []
         self.run_failures = 0
-        self.ClearPrices()  # 先把价格清空，好一眼看出刷到哪一行了
+        self.run_total = len(tasks)
+        # 只清这次要抓的那几行，好一眼看出刷到哪一行；部分抓取时其余行的
+        # 价格不该跟着空一整轮
+        self.ClearPrices([row for row, _ in tasks])
         self.SetBusy(True)
         self.poller = PollerThread(
             tasks,
@@ -2280,7 +2334,7 @@ class MainWindow(QMainWindow):
             self.run_changes,
             self.run_deals,
             self.run_targets,
-            len(self.rows),
+            self.run_total,
             self.run_failures,
             self.dark,
             self,
