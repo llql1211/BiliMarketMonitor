@@ -722,6 +722,78 @@ def test_refresh_keeps_expected_price(window):
     ]
 
 
+# ---------------- 近30天均价 ----------------
+
+
+@pytest.mark.parametrize(
+    "price, avg, sold_out, cheaper",
+    [
+        ("¥44", "¥205", False, True),    # 比均价便宜
+        ("¥205", "¥205", False, False),  # 持平不算：那就是均价那个水平
+        ("¥300", "¥205", False, False),  # 比均价贵
+        ("¥44", "¥205", True, False),    # 售罄行不比：那格的"现价"其实是原价
+        ("面议", "¥205", False, False),  # 现价认不出数字
+        ("¥44", "面议", False, False),   # 均价认不出数字
+        ("¥44", "", False, False),       # 接口没给均价
+        ("¥44", None, False, False),
+    ],
+)
+def test_below_average(price, avg, sold_out, cheaper):
+    """低于均价的判断：口径与 expected_reached 一致，售罄和认不出数字都不比。"""
+    assert app_module.below_average(price, avg, sold_out) is cheaper
+
+
+def _avg_cell(w, row=0):
+    return w.table.item(row, app_module.COL_AVG)
+
+
+def test_avg_cell_highlights_when_cheaper_than_average(window):
+    """现价低于均价时均价那格变绿加粗；没到那个份上就是平常的字色。"""
+    w = window("10000008780 | 甲\n10000008781 | 乙\n10000008782 | 丙\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, result_ok(price="¥44", avg=205))   # 44 < 205 → 划算
+    w.OnResultReady(1, result_ok(price="¥300", avg=205))  # 比均价贵 → 不变
+    w.OnResultReady(2, result_ok(price="¥44", avg=None))  # 接口没给均价 → 占位符
+
+    cheaper = _avg_cell(w, 0)
+    assert cheaper.text() == "¥205"
+    assert cheaper.font().bold()
+    assert cheaper.foreground().color().name() == theme.below_average_color(w.dark).name()
+    assert "低于近30天均价" in cheaper.toolTip()
+
+    normal = _avg_cell(w, 1)
+    assert normal.text() == "¥205"
+    assert not normal.font().bold()  # 只有更便宜才加粗
+    assert normal.toolTip() == "¥205"  # 不变绿时提示还是整格文本
+
+    assert _avg_cell(w, 2).text() == app_module.NO_DATA_TEXT
+
+
+def test_avg_cell_ignores_sold_out_price(window):
+    """售罄行的现价其实是原价，不能拿它算「比均价划算」——不然整屏假绿。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.OnResultReady(0, result_ok(price="¥88", avg=205, sold_out=True))
+
+    assert _avg_cell(w).text() == "¥205"
+    assert not _avg_cell(w).font().bold()
+
+
+def test_avg_cell_follows_theme(window):
+    """便宜色跟着主题走——不重画的话换完主题会停在旧主题的绿上。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, result_ok(price="¥44", avg=205))
+
+    before = _avg_cell(w).foreground().color().name()
+    w.OnToggleTheme()
+    after = _avg_cell(w).foreground().color().name()
+
+    assert after == theme.below_average_color(w.dark).name()
+    assert after != before
+
+
 # ---------------- 缓存价格 / 涨跌 ----------------
 
 

@@ -109,6 +109,12 @@ EXPECTED_HEADER_TIP = (
 )
 SET_EXPECTED_TIP = "双击设置预期价格"
 EDIT_EXPECTED_TIP = "双击修改预期价格"
+
+# 「近30天均价」列
+AVG_HEADER_TIP = (
+    "接口给的近 30 天成交均价\n"
+    "现价比它低时，这一格会变绿加粗——说明这会儿买比最近一个月都划算"
+)
 EXPECTED_BAD_INPUT = "预期价格得是大于 0 的数字，比如 50。"
 EXPECTED_BAD_TITLE = "预期价格认不出来"
 
@@ -222,6 +228,25 @@ def expected_reached(expected_price, price, sold_out) -> bool:
     if target is None or current is None:
         return False
     return current < target
+
+
+def below_average(price, avg_price, sold_out) -> bool:
+    """现价是不是比近 30 天均价还低（这会儿买比最近一个月都划算）。
+
+    判"没得比"的口径与 expected_reached 一致，理由也一样：
+    - 售罄行不比：那格的"现价"装的其实是原价（见 PriceText），拿它跟均价
+      比出来的"划算"没有意义；
+    - 有一边认不出数字就不比：宁可这格不变色，也不要拿猜出来的数骗人。
+
+    严格低于才算：持平说明就是均价那个水平，"比最近一个月划算"这话不成立。
+    """
+    if sold_out:
+        return False
+    average = parser.price_number(avg_price)
+    current = parser.price_number(price)
+    if average is None or current is None:
+        return False
+    return current < average
 
 
 def expected_number(expected_price) -> str:
@@ -1428,6 +1453,7 @@ class MainWindow(QMainWindow):
             f"点击「打开」用浏览器访问商品详情页\n链接由配置里的模板拼出：\n{template}"
         )
         self.table.horizontalHeaderItem(COL_EXPECT).setToolTip(EXPECTED_HEADER_TIP)
+        self.table.horizontalHeaderItem(COL_AVG).setToolTip(AVG_HEADER_TIP)
         self.table.cellClicked.connect(self.OnCellClick)
         self.table.cellDoubleClicked.connect(self.OnCellDoubleClick)
         self.table.rows_dropped.connect(self.OnRowsDropped)
@@ -1720,6 +1746,31 @@ class MainWindow(QMainWindow):
             color=theme.muted_color(self.dark),
         )
 
+    def AvgCell(self, avg, price, sold_out):
+        """「近30天均价」格：现价比它低时绿色加粗，其余照常显示。
+
+        低于均价意味着这会儿买比最近一个月都划算，这是这一格唯一值得扫一眼的
+        信息；没到那个份上它只是个参照值，跟原价一样"有就行、别抢眼"，所以不给
+        弱化色、也不加粗，就是平常的字色。
+
+        加粗跟「预期价格」到价、近期成交高亮同一个路子：单靠颜色，色觉障碍的人
+        看不出差别，截图里也容易糊成一片。
+        """
+        if not avg:
+            return self.MakeCell(NO_DATA_TEXT)
+        cheaper = below_average(price, avg, sold_out)
+        cell = self.MakeCell(
+            str(avg),
+            # 不变绿时给 None，让 MakeCell 照旧把整格文本当提示
+            tooltip=f"现价 {price} 低于近30天均价 {avg}" if cheaper else None,
+            color=theme.below_average_color(self.dark) if cheaper else None,
+        )
+        if cheaper:
+            font = cell.font()
+            font.setBold(True)
+            cell.setFont(font)
+        return cell
+
     def ClearedCell(self):
         """待抓取中的占位格：一个「--」，不挂提示（提示里只有「--」等于没说）。"""
         return self.MakeCell(CLEARED_TEXT, tooltip="")
@@ -1839,9 +1890,7 @@ class MainWindow(QMainWindow):
                 self.PriceCell(price, sold_out, note, item.get("delta"), stock),
             )
             self.table.setItem(row, COL_REF, self.ReferenceCell(reference))
-            self.table.setItem(
-                row, COL_AVG, self.MakeCell(str(avg) if avg else NO_DATA_TEXT)
-            )
+            self.table.setItem(row, COL_AVG, self.AvgCell(avg, price, sold_out))
 
         self.table.setItem(
             row, COL_EXPECT,
