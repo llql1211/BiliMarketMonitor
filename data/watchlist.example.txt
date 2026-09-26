@@ -1,13 +1,13 @@
-# 监视清单示例：复制本文件为同目录下的 watchlist.txt 使用（watchlist.txt 不会被 git 跟踪）
-# 每行格式 <clusterId> | <商品名> | <预期价>，名称未知时只写 clusterId，没设预期价的行不写最后一段
-# 下面几种写法程序都能识别，但程序写回时会统一成上面那种格式：
+# 监视清单示例
+
+# 复制本文件为同目录下的 watchlist.txt 使用（其不会被 git 跟踪）
+# 注意：以 # 开头的行会被忽略
+
+# 每行格式为 `<clusterId> | <商品名> | <预期价>`，可以只写 clusterId；没设预期价就不用写
+# 下面几种写法程序都能识别，但程序写回时会统一成上面那种格式（分享链接中 share_medium、bbid 等参数会被忽略）：
+#   https://mall.bilibili.com/neul-next/resell/detail.html?clusterId=10000004212&noTitleBar=1&share_medium=android&bbid=XU8FF57870E1B13BBF6891E69F6F952B320E5
 #   10000004212 | Vsinger 洛天依拍立得相框 规格：D款
 #   10000004212 | Vsinger 洛天依拍立得相框 规格：D款 | 60
 #   10000008780
-# 预期价也可以双击表格里的「预期价格」那一格来设，两种改法等价
-# 预期价只写数字即可，表格里显示时会自动加上「￥」（这一行写「¥60」也认）
-# 也可以直接粘贴分享链接（share_medium、bbid 等参数会被忽略）：
-#   https://mall.bilibili.com/neul-next/resell/detail.html?clusterId=10000004212&noTitleBar=1&share_medium=android&bbid=XU8FF57870E1B13BBF6891E69F6F952B320E5
 
-10000004212 | Vsinger 洛天依拍立得相框 规格：D款 | 60
-10000008780 | 淬羽赫默 角色亚克力立牌 进阶大礼包 规格：大礼包
+# 预期价也可以双击表格「预期价格」单元格设置，只需填写数字，显示时会自动加上 ￥
