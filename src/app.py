@@ -479,13 +479,34 @@ def summary_headline(changes, new_deals_by_item, targets) -> str:
     return f"本次 {total} 项：" + " · ".join(parts)
 
 
-def summary_subtitle(total, failures) -> str:
-    """总结窗口的第二行：这一轮抓了多少件、几件没抓到。
+def format_duration(seconds) -> str:
+    """把秒数写成人话：不到一分钟给「21 秒」，再往上给「1 分 36 秒」「2 小时」。
+
+    精确到秒就够了——这个数是给人判"抓这点东西花这么久合不合理"的，不是拿来
+    对账的，再细也没人看。下限取 1 秒：真跑起来总不止一秒，取整成「0 秒」看着
+    像出了错。
+    """
+    total = max(1, int(round(max(0.0, seconds))))
+    if total < 60:
+        return f"{total} 秒"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        # 整分钟不写「1 分 0 秒」，那个 0 秒没有信息量
+        return f"{minutes} 分 {secs} 秒" if secs else f"{minutes} 分"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} 小时 {minutes} 分" if minutes else f"{hours} 小时"
+
+
+def summary_subtitle(total, failures, elapsed) -> str:
+    """总结窗口的第二行：这一轮抓了多少件、花了多久、几件没抓到。
 
     查询失败的那几件这次没有可比的价格，不说明的话，"没有变化"看起来就像
     它们也没事——失败本身得在总结里有个交代。
+
+    用时是这一轮的墙钟时间刨掉暂停的那段（见 MainWindow.RunElapsed）：暂停是
+    用户自己按的，算进去会让人以为抓取本身就那么慢。
     """
-    text = f"本次共抓取 {total} 件商品"
+    text = f"本次共抓取 {total} 件商品，用时 {format_duration(elapsed)}"
     if failures:
         text += f"，其中 {failures} 件查询失败（这几件看不出变化）"
     return text
@@ -1034,7 +1055,8 @@ class AddDialog(QDialog):
 
 
 class SummaryDialog(QDialog):
-    """一轮抓取跑完后的总结窗口：先说这一轮有几项，再分块列出明细。
+    """一轮抓取跑完后的总结窗口：先说这一轮有几项、抓了多少件、花了多久，
+    再分块列出明细。
 
     明细有三块（各一张小表，见 summary_sections）：价格变动、新增成交、
     低于预期价格。
@@ -1045,13 +1067,16 @@ class SummaryDialog(QDialog):
     什么都没有时也照样弹（用户要的是每轮都有个收尾交代），此时藏掉明细那块空框。
     """
 
-    def __init__(self, changes, deals, targets, total, failures, dark, parent=None):
+    def __init__(
+        self, changes, deals, targets, total, failures, elapsed, dark, parent=None
+    ):
         super().__init__(parent)
         self.changes = _dicts(changes)
         self.deals = _dicts(deals)
         self.targets = _dicts(targets)
         self.total = total
         self.failures = failures
+        self.elapsed = elapsed  # 本轮实际耗时（秒，刨掉暂停），见 MainWindow.RunElapsed
         self.setWindowTitle(SUMMARY_TITLE)
         self.setMinimumWidth(360)  # 没有明细时窗口会收得很窄，别让按钮挤成一团
 
@@ -1094,7 +1119,9 @@ class SummaryDialog(QDialog):
         不会出现"换了主题、数字还是旧的"这种对不上的情况。
         """
         self.headline.setText(summary_headline(self.changes, self.deals, self.targets))
-        self.subtitle.setText(summary_subtitle(self.total, self.failures))
+        self.subtitle.setText(
+            summary_subtitle(self.total, self.failures, self.elapsed)
+        )
         self.detail.setHtml(
             summary_sections(self.changes, self.deals, self.targets, dark)
         )
@@ -1278,6 +1305,12 @@ class MainWindow(QMainWindow):
         self.run_failures = 0    # 本次抓取查询失败的条数：失败的那几件看不出变动
         self.run_total = 0       # 本次抓取的目标件数：总结里「共抓取 N 件」用它而不是
                                  # 清单总件数——「仅抓取新添加商品」只抓其中几件
+        # 本轮的计时：起点、已暂停的累计秒数、当前这次暂停的起点（见 RunElapsed）
+        # 起点先落在建窗那一刻：没起过一轮就收尾（只有测试会这样）也不会崩
+        self.run_started_at = time.monotonic()
+        self.run_paused_seconds = 0.0
+        self.run_paused_at = None
+        self.run_elapsed = 0.0   # 收尾时算好存下来：总结窗口换主题重渲染时要拿它
         self.summary_dialog = None  # 最近一次弹的总结窗口，切主题时要跟着重画
         self.image_fetcher = ImageFetcher()  # 缩略图：key 是行号
         self.image_fetcher.fetched.connect(self.OnImageFetched)
@@ -2155,6 +2188,10 @@ class MainWindow(QMainWindow):
         self.run_targets = []
         self.run_failures = 0
         self.run_total = len(tasks)
+        self.run_started_at = time.monotonic()  # 计时起点；暂停另记，见 RunElapsed
+        self.run_paused_seconds = 0.0
+        self.run_paused_at = None
+        self.run_elapsed = 0.0
         # 只清这次要抓的那几行，好一眼看出刷到哪一行；部分抓取时其余行的
         # 价格不该跟着空一整轮
         self.ClearPrices([row for row, _ in tasks])
@@ -2286,9 +2323,14 @@ class MainWindow(QMainWindow):
             return
         if self.poller.is_paused():
             self.poller.resume()
+            # 攒下这一段暂停的时长：总结里的「用时」要把它刨掉（见 RunElapsed）
+            if self.run_paused_at is not None:
+                self.run_paused_seconds += time.monotonic() - self.run_paused_at
+                self.run_paused_at = None
             self.progress_label.setText("继续抓取…")
         else:
             self.poller.pause()
+            self.run_paused_at = time.monotonic()
             self.progress_label.setText("已暂停（当前这条请求返回后生效）")
         # 文案跟着状态走，用户一眼能看出现在点它是「暂停」还是「继续」
         self.btn_pause.setText(RESUME_TEXT if self.poller.is_paused() else PAUSE_TEXT)
@@ -2303,12 +2345,26 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         self.progress_label.setText("正在停止…")
 
+    def RunElapsed(self) -> float:
+        """本轮从起跑到收尾实际花掉的秒数：墙钟时间刨掉暂停的那段。
+
+        暂停是用户自己按的，算进「用时」会让人以为抓取本身就那么慢。暂停时长在
+        OnTogglePause 里攒；要是收尾时还暂停着（正常不会，暂停中跑不完），那段也
+        一并刨掉。起点在 StartFetch 里定，没起过一轮就用建窗那一刻（见 __init__）。
+        """
+        idle = self.run_paused_seconds
+        if self.run_paused_at is not None:
+            idle += time.monotonic() - self.run_paused_at
+        return max(0.0, time.monotonic() - self.run_started_at - idle)
+
     def OnPollFinished(self):
         self.SetBusy(False)
         self.RestorePendingPrices()  # 没轮到的行别一直空着（停止抓取的也一样）
         if self.poller_stopped:
             self.progress_label.setText("已停止抓取，已抓到的结果保留")
             return
+        # 先定格用时：总结窗口换主题重渲染时要从这儿取，不能再算一遍
+        self.run_elapsed = self.RunElapsed()
         if self.names_learned:
             # 抓到了新名称，顺手把清单刷新一次，方便用户直接在文件里管理
             if self.SaveWatchlist():
@@ -2336,6 +2392,7 @@ class MainWindow(QMainWindow):
             self.run_targets,
             self.run_total,
             self.run_failures,
+            self.run_elapsed,
             self.dark,
             self,
         )

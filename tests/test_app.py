@@ -101,6 +101,19 @@ def result_fail(message="HTTP 500"):
     return parser.parse_error(client.ApiError(message))
 
 
+def _assert_subtitle(text, total, failures=0):
+    """断言总结副标题里的件数（和失败数）。
+
+    用时那一截是真跑出来的，钉死成「用时 2 秒」在慢机器上就会飘，所以这里只钉
+    件数；用时的写法另有确定性用例（见 抓取总结 里的用时几条）。
+    """
+    assert text.startswith(f"本次共抓取 {total} 件商品，用时 ")
+    if failures:
+        assert text.endswith(f"，其中 {failures} 件查询失败（这几件看不出变化）")
+    else:
+        assert "查询失败" not in text
+
+
 def _tasks(ids):
     """PollerThread 要的 [(行号, LinkEntry)]。"""
     return [(i, links.LinkEntry(cid, f"名{cid}", "")) for i, cid in enumerate(ids)]
@@ -1178,7 +1191,7 @@ def test_fetch_new_counts_only_this_round_in_the_summary(window, monkeypatch):
     w.OnResultReady(1, result_ok(price="¥44"))
     w.OnPollFinished()
 
-    assert w.summary_dialog.subtitle.text() == "本次共抓取 1 件商品"
+    _assert_subtitle(w.summary_dialog.subtitle.text(), 1)
 
 
 def test_fetch_new_with_nothing_new_does_not_start_a_run(window, monkeypatch):
@@ -1405,7 +1418,7 @@ def test_full_run_pops_a_summary_of_the_changes(window, monkeypatch, wait_until)
     assert dialog is not None and dialog.isVisible()
     assert dialog.windowTitle() == app_module.SUMMARY_TITLE
     assert dialog.headline.text() == "本次 2 项：降价 1 · 涨价 1"
-    assert dialog.subtitle.text() == "本次共抓取 2 件商品"
+    _assert_subtitle(dialog.subtitle.text(), 2)
     # 明细按清单顺序：甲在前、乙在后，各自的涨跌对得上
     detail = dialog.detail.toPlainText()
     assert detail.index("甲") < detail.index("乙")
@@ -1510,7 +1523,7 @@ def test_summary_still_pops_when_nothing_changed(window, monkeypatch, wait_until
     assert _wait_run(w, wait_until)
 
     assert w.summary_dialog.headline.text() == app_module.NO_CHANGE_TEXT
-    assert w.summary_dialog.subtitle.text() == "本次共抓取 1 件商品"
+    _assert_subtitle(w.summary_dialog.subtitle.text(), 1)
     assert w.summary_dialog.detail.isVisible() is False  # 别摆个空框
 
 
@@ -1574,9 +1587,48 @@ def test_summary_mentions_failed_queries(window, monkeypatch, wait_until):
     assert _wait_run(w, wait_until)
 
     assert w.summary_dialog.headline.text() == "本次 1 项：降价 1"
-    assert w.summary_dialog.subtitle.text() == (
-        "本次共抓取 2 件商品，其中 1 件查询失败（这几件看不出变化）"
-    )
+    _assert_subtitle(w.summary_dialog.subtitle.text(), 2, failures=1)
+
+
+def test_summary_reports_the_elapsed_time(window):
+    """总结里报这一轮花了多久：起点摆在 21 秒前，就该说「用时 21 秒」。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.run_total = 1
+    w.run_started_at = time.monotonic() - 21.4
+
+    w.OnPollFinished()
+
+    assert w.summary_dialog.subtitle.text() == "本次共抓取 1 件商品，用时 21 秒"
+
+
+def test_paused_time_is_left_out_of_the_elapsed(window):
+    """暂停的那段不算进用时：暂停是用户自己按的，算进去像是抓取慢。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.run_total = 1
+    w.run_started_at = time.monotonic() - 100
+    w.run_paused_seconds = 80  # 中间暂停过 80 秒
+
+    w.OnPollFinished()
+
+    assert w.summary_dialog.subtitle.text() == "本次共抓取 1 件商品，用时 20 秒"
+
+
+def test_toggle_pause_accumulates_the_idle_time(window):
+    """暂停/继续得把暂停时长攒下来，收尾时用时才刨得掉（见 RunElapsed）。"""
+    w = window()
+    w.poller = FakePoller()
+    w.run_paused_seconds = 0.0
+    w.run_paused_at = None
+
+    w.OnTogglePause()
+    assert w.run_paused_at is not None  # 暂停中：起点先记下
+    time.sleep(0.05)
+    w.OnTogglePause()
+
+    assert w.run_paused_at is None  # 继续了，这段已经结账
+    assert w.run_paused_seconds >= 0.05
 
 
 def test_stopped_run_shows_no_summary(window):
@@ -3093,10 +3145,29 @@ def test_summary_headline_counts_items_not_deals():
 
 def test_summary_subtitle_mentions_failures():
     """查失败的几件要交代：它们这次看不出变化，不说就像"一切正常"。"""
-    assert app_module.summary_subtitle(12, 0) == "本次共抓取 12 件商品"
-    assert app_module.summary_subtitle(12, 2) == (
-        "本次共抓取 12 件商品，其中 2 件查询失败（这几件看不出变化）"
+    assert app_module.summary_subtitle(12, 0, 21) == "本次共抓取 12 件商品，用时 21 秒"
+    assert app_module.summary_subtitle(12, 2, 21) == (
+        "本次共抓取 12 件商品，用时 21 秒，其中 2 件查询失败（这几件看不出变化）"
     )
+
+
+@pytest.mark.parametrize(
+    "seconds, expected",
+    [
+        (0.2, "1 秒"),        # 真跑起来总不止一秒，取整成「0 秒」看着像出错
+        (21.4, "21 秒"),
+        (59.6, "1 分"),       # 60 秒整不该写成「1 分 0 秒」
+        (60, "1 分"),
+        (96, "1 分 36 秒"),
+        (3599, "59 分 59 秒"),
+        (3600, "1 小时"),
+        (5400, "1 小时 30 分"),
+        (86400, "24 小时"),
+    ],
+)
+def test_format_duration(seconds, expected):
+    """用时的写法：秒 / 分秒 / 小时分，整的那一级不拖个 0 出来。"""
+    assert app_module.format_duration(seconds) == expected
 
 
 # 这一组用例用「N秒前」写时间：它是 1 秒宽的窄格子，老记录变老多少秒可以精确算出来，
