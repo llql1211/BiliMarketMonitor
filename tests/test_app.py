@@ -3972,3 +3972,108 @@ def test_highlight_survives_table_rebuild(window):
 
     assert _deal_item(w).font().bold()
     assert _deal_item(w).foreground().color().name() == "#e07000"
+
+
+# ---------------- 顶部的「上次更新时间」 ----------------
+#
+# 首屏那几格价格是从缓存里搬出来的，得说清是什么时候抓的，不然看的人分不清
+# 这是刚抓的还是上周的。取的是一屏数据里最新的那个抓取时刻（app.UpdateUpdatedLabel）。
+
+
+def _updated_text(w):
+    return w.updated_label.text()
+
+
+def _parse_updated(w):
+    """顶部那行里的时刻（datetime）——判「刚刷过」时用不着钉死到秒。"""
+    return datetime.fromisoformat(
+        _updated_text(w).removeprefix(app_module.LAST_UPDATE_PREFIX)
+    )
+
+
+def test_updated_label_says_never_fetched_on_a_fresh_cache(window):
+    """缓存里一条都没抓到过：说「尚未抓取过」，不拿当前时间凑一个。"""
+    w = window("10000008780\n")
+
+    w.LoadWatchlist(w.watchlist_path)
+
+    assert _updated_text(w) == app_module.NO_UPDATE_TEXT
+
+
+def test_updated_label_shows_the_cached_stamp(window):
+    """缓存里有抓取时刻，按「上次更新时间：yyyy-mm-dd hh:mm:ss」显示。"""
+    w = window("10000008780\n")
+    _seed_cache(w)
+
+    w.LoadWatchlist(w.watchlist_path)
+
+    assert _updated_text(w) == "上次更新时间：2026-09-16 10:30:00"
+
+
+def test_updated_label_takes_the_newest_row(window):
+    """多行各有各的抓取时刻，取最新的那个——跟行的顺序无关。
+
+    第一行新、第二行旧，就是为了让「取最后一个」这种写法过不了。
+    """
+    w = window("10000008780\n10000008781\n")
+    _seed_cache(w, when="2026-09-16T10:30:00")
+    _seed_cache(w, cluster_id="10000008781", when="2026-09-18T09:05:07")
+
+    w.LoadWatchlist(w.watchlist_path)
+
+    assert _updated_text(w) == "上次更新时间：2026-09-18 09:05:07"
+
+
+def test_updated_label_skips_unreadable_stamps(window):
+    """老库补列留下的空时间戳、认不出的串都不算数，认得出来的那条照样用。"""
+    w = window("10000008780\n10000008781\n")
+    _seed_cache(w, when=None)
+    _seed_cache(w, cluster_id="10000008781", when="上周三")
+
+    w.LoadWatchlist(w.watchlist_path)
+
+    assert _updated_text(w) == app_module.NO_UPDATE_TEXT
+
+
+def test_updated_label_follows_a_successful_fetch(window):
+    """抓完一条就往前走：屏幕上的价格变成刚抓的了，这个时间得跟着。"""
+    w = window("10000008780\n")
+    _seed_cache(w)
+    w.LoadWatchlist(w.watchlist_path)
+    assert _updated_text(w) == "上次更新时间：2026-09-16 10:30:00"
+
+    w.OnResultReady(0, result_ok())
+
+    stamp = _parse_updated(w)
+    assert abs((datetime.now() - stamp).total_seconds()) < 60
+
+
+def test_updated_label_ignores_a_failed_fetch(window):
+    """这次没抓到，缓存里的价格还是老的那个，时间也就不该跟着变。"""
+    w = window("10000008780\n")
+    _seed_cache(w)
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.OnResultReady(0, result_fail())
+
+    assert _updated_text(w) == "上次更新时间：2026-09-16 10:30:00"
+
+
+def test_updated_label_uses_the_muted_colour(window):
+    """次要信息，跟「原价」那格同一个弱化色，别跟按钮抢眼。"""
+    w = window("10000008780\n")
+    for dark in (False, True):
+        w.ApplyTheme(dark)
+        assert theme.muted_color(dark).name() in w.updated_label.styleSheet()
+
+
+def test_updated_label_does_not_widen_the_window(window):
+    """这行字得自己占一行，不能塞进按钮行里。
+
+    七个按钮已经占到 1265px（深色主题 1393），默认窗口才 1500；这行字再加进去就是
+    1557，Qt 只好把窗口撑大——最小宽一旦超过 resize 的默认值，窗口尺寸就由它说了算。
+    """
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    assert w.minimumSizeHint().width() <= w.width()

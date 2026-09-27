@@ -135,6 +135,9 @@ PRICE_ALIGN = Qt.AlignLeft | Qt.AlignVCenter
 
 PAUSE_TEXT = "暂停抓取"
 RESUME_TEXT = "继续抓取"
+# 顶部那行「上次更新时间」：一次都没抓到过的时候显示这个（有数据时见 _cached_note）
+NO_UPDATE_TEXT = "尚未抓取过"
+LAST_UPDATE_PREFIX = "上次更新时间："
 # 「开始抓取」的快捷键：按钮提示里的字和实际键位都从这一个常量来，改一处就够
 FETCH_SHORTCUT = "F5"
 ADD_PLACEHOLDER = "粘贴商品 ID 或分享链接，一行一个…"
@@ -374,12 +377,17 @@ def _parse_stamp(value):
         return None
 
 
+def _format_stamp(stamp) -> str:
+    """datetime →「2026-09-16 10:30:00」。跟缓存里存的格式差在中间那个 T 上。"""
+    return stamp.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _display_time(value) -> str:
     """缓存里的 ISO 时间串 →「2026-09-16 10:30:00」；认不出来就原样返回。"""
     if not isinstance(value, str) or not value.strip():
         return ""
     stamp = _parse_stamp(value)
-    return stamp.strftime("%Y-%m-%d %H:%M:%S") if stamp else value
+    return _format_stamp(stamp) if stamp else value
 
 
 def _cached_note(updated_at) -> str:
@@ -388,7 +396,7 @@ def _cached_note(updated_at) -> str:
     宁可少一句提示，也不要拿当前时间凑一个，那是在骗人。
     """
     stamp = _display_time(updated_at)
-    return f"上次更新时间：{stamp}" if stamp else ""
+    return f"{LAST_UPDATE_PREFIX}{stamp}" if stamp else ""
 
 
 def _elapsed_since(anchor):
@@ -1406,6 +1414,18 @@ class MainWindow(QMainWindow):
         central = QWidget()
         layout = QVBoxLayout(central)
 
+        # 顶部第一行：「上次更新时间」。它说的是"这屏数据有多旧"，跟按钮不是一类东西；
+        # 而且挤进按钮行会把窗口顶宽——七个按钮已经占到 1265px，默认窗口才 1500，
+        # 这行字再加进去（约 290px）就溢出了。文字由 UpdateUpdatedLabel() 填。
+        self.updated_label = QLabel()
+        self.updated_label.setToolTip(
+            "缓存里最新一次成功抓到价格的时间\n"
+            "抓取失败的行不刷新它；一件都没抓到过时显示「尚未抓取过」"
+        )
+        # 清单都没读进来（比如没有 watchlist.txt）时也得有句话，空着比不显示还费解
+        self.UpdateUpdatedLabel()
+        layout.addWidget(self.updated_label)
+
         # 顶部按钮行
         btn_bar = QHBoxLayout()
         self.btn_add = QPushButton("添加…")
@@ -1611,6 +1631,24 @@ class MainWindow(QMainWindow):
         self.row_images.clear()  # 行号会整体挪位，缩略图的归属得跟着重算
         for row, item in enumerate(self.rows):
             self.FillRow(row, item)
+        self.UpdateUpdatedLabel()
+
+    def UpdateUpdatedLabel(self):
+        """刷新顶部那行「上次更新时间」。
+
+        扫的是各行缓存记录里的 price_updated_at，取最新那个——它跟那行的价格是一起
+        写的，所以"中途停止""只抓新商品"这些都自然算得对，不用另外记一次本轮时间。
+        跟表格描述的是同一屏数据，所以删掉唯一抓过的那行之后也该回到「尚未抓取过」：
+        屏幕上确实一件数据都没有了。
+        """
+        newest = None
+        for item in self.rows:
+            stamp = _parse_stamp((item["record"] or {}).get("price_updated_at"))
+            if stamp is not None and (newest is None or stamp > newest):
+                newest = stamp
+        self.updated_label.setText(
+            f"{LAST_UPDATE_PREFIX}{_format_stamp(newest)}" if newest else NO_UPDATE_TEXT
+        )
 
     def SetThumbnail(self, row, image_url):
         """给某行配缩略图：缓存里有就直接贴，没有才后台下载。
@@ -2392,6 +2430,8 @@ class MainWindow(QMainWindow):
 
         self.SetPriceCells(row, item)
         self.SetDealCells(row, item)
+        # 这一行的价格刚写进缓存，顶部那个时间得跟着往前走
+        self.UpdateUpdatedLabel()
 
         # 名称：接口返回的才是最新的；失败时如果原本没有名字，标出来而不是留个"…"
         name_item = self.table.item(row, COL_NAME)
@@ -2525,6 +2565,8 @@ class MainWindow(QMainWindow):
         # 悬停提示的延时是全局样式提示（样式表管不到），跟主题一起装。
         # 表格里格子密，默认 0.7 秒太容易顺着光标一路弹出来。
         theme.install_tooltip_delay(app)
+        # 次要信息跟着主题弱化（跟「原价」那格同一个色），别跟按钮抢眼
+        self.updated_label.setStyleSheet(f"color: {theme.muted_color(dark).name()};")
         self.btn_theme.setText("浅色模式" if dark else "暗色模式")
         self.btn_theme.setToolTip(
             "当前是暗色主题，点击切换为浅色" if dark else "当前是浅色主题，点击切换为暗色"
