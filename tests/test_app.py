@@ -5,7 +5,7 @@
 """
 
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 import requests
@@ -3685,6 +3685,164 @@ def test_close_event_closes_store(window):
     w.close()
 
     assert w.store.conn is None
+
+
+# ---------------- 缓存里的成交（首屏） ----------------
+#
+# 缓存里存着上一轮抓到的成交，刚打开程序就该摆出来，不必等再抓一轮。
+# 麻烦在于缓存里那句「1分钟前」是抓取那一刻的说法：原样搬到首屏，三天前抓的
+# 那条到今天还写着「1分钟前」。重算见 app._reaged_deals。
+
+
+def _ago(seconds):
+    """N 秒前的时刻串——重算年龄的用例拿它当那组成交的抓取时刻。"""
+    return (datetime.now() - timedelta(seconds=seconds)).isoformat()
+
+
+def _deals(w, row=0):
+    """一行里三个成交格子的文本。"""
+    return [w.table.item(row, app_module.COL_DEAL_BASE + i).text() for i in range(3)]
+
+
+def test_cached_deals_show_up_on_startup(window):
+    """缓存里有成交，首屏就显示，不留三个「—」。"""
+    w = window("10000008780\n")
+    _seed_cache(
+        w, deals=[{"price": "¥205", "time": "2小时前"}], deals_when=_ago(3 * 86400)
+    )
+
+    w.LoadWatchlist(w.watchlist_path)
+
+    assert _deals(w) == ["¥205 · 3天前", app_module.NO_DATA_TEXT, app_module.NO_DATA_TEXT]
+    assert not _deal_item(w).font().bold()  # 三天前的算不上「近期成交」
+
+
+def test_cached_deal_age_counts_from_the_fetch(window):
+    """那句「2小时前」是抓取那一刻说的，得按抓到之后又过了多久往后挪。"""
+    w = window("10000008780\n")
+    _seed_cache(w, deals=[{"price": "¥205", "time": "2小时前"}], deals_when=_ago(3600))
+
+    w.LoadWatchlist(w.watchlist_path)
+
+    assert _deals(w)[0] == "¥205 · 3小时前"
+
+
+def test_recent_cached_deal_is_highlighted(window):
+    """重算完还够新鲜的照样高亮：刚抓完就重启，不该一开窗三条全不亮。"""
+    w = window("10000008780\n")
+    _seed_cache(w, deals=[{"price": "¥205", "time": "刚刚"}], deals_when=_ago(300))
+
+    w.LoadWatchlist(w.watchlist_path)
+
+    assert _deals(w)[0] == "¥205 · 5分钟前"
+    assert _deal_item(w).font().bold()
+    assert _deal_item(w).foreground().color().name() == "#e07000"
+
+
+def test_cached_deals_survive_a_table_rebuild(window):
+    """重画表格（拖拽排序、刷新清单、换主题）后缓存那组还在，年龄按锚点重算。"""
+    w = window("10000008780\n")
+    _seed_cache(w, deals=[{"price": "¥205", "time": "2小时前"}], deals_when=_ago(3600))
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.RenderTable()
+
+    assert _deals(w)[0] == "¥205 · 3小时前"
+
+
+def test_cached_deal_without_an_anchor_shows_price_only(window):
+    """有成交、却没有抓取时刻（老库补列留下的空洞）：时间留空，价格照显。"""
+    w = window("10000008780\n")
+    _seed_cache(w, deals=[{"price": "¥205", "time": "2小时前"}])
+    with w.store.conn:
+        w.store.conn.execute(
+            "UPDATE items SET deals_updated_at = NULL WHERE cluster_id = '10000008780'"
+        )
+
+    w.LoadWatchlist(w.watchlist_path)
+
+    assert _deals(w)[0] == "¥205"
+    assert not _deal_item(w).font().bold()
+
+
+@pytest.mark.parametrize(
+    "text, elapsed, expected",
+    [
+        ("刚刚", 0, "刚刚"),
+        ("刚刚", 120, "2分钟前"),
+        ("2小时前", 3600, "3小时前"),
+        ("8天前", 86400, "1周前"),  # 满一周就说「周」，跟接口自己的说法一致
+    ],
+)
+def test_reaged_deals_shift_by_the_elapsed(text, elapsed, expected):
+    """对照表：原文 + 抓完之后又过了多久 = 现在该显示的说法。"""
+    aged = app_module._reaged_deals([{"price": "¥205", "time": text}], elapsed)
+
+    assert aged[0]["time"] == expected
+    # 显示的说法和判定用的年龄得对得上：精确年龄要落在那句话的区间里
+    # （「1周前」说的是"一周多、不到两周"，见 parser.age_bounds）
+    lower, upper = parser.age_bounds(expected)
+    assert lower <= aged[0]["age_seconds"] <= upper
+
+
+def test_reaged_deal_with_an_unreadable_time_keeps_its_text():
+    """认不出年龄的成交照旧显示原文（可能是绝对日期），只是不高亮。"""
+    aged = app_module._reaged_deals([{"price": "¥205", "time": "很久以前"}], 3600)
+
+    assert aged == [{"price": "¥205", "time": "很久以前", "age_seconds": None}]
+
+
+def test_reaged_deal_without_an_anchor_drops_the_time():
+    """连这组是什么时候抓的都认不出来，相对说法就一律留不得——价格是真的，照留。"""
+    aged = app_module._reaged_deals([{"price": "¥205", "time": "2小时前"}], None)
+
+    assert aged == [{"price": "¥205", "time": "", "age_seconds": None}]
+
+
+def test_reaged_deals_skip_junk():
+    """缓存是外部输入，形状不对的那条跳过，别把渲染卡住。"""
+    aged = app_module._reaged_deals(
+        [None, {"time": "1小时前"}, {"price": "¥205", "time": "1小时前"}], 0
+    )
+
+    assert [deal["price"] for deal in aged] == ["¥205"]
+
+
+def test_this_round_deals_win_over_the_cache(window):
+    """抓到新一轮就用新的，缓存那组只顶到抓取回填之前。"""
+    w = window("10000008780\n")
+    _seed_cache(
+        w, deals=[{"price": "¥205", "time": "2小时前"}], deals_when=_ago(3 * 86400)
+    )
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.OnResultReady(0, result_ok(deal_times=["5小时前"]))
+
+    assert _deals(w) == ["¥205 · 5小时前", app_module.NO_DATA_TEXT, app_module.NO_DATA_TEXT]
+
+
+def test_failed_fetch_keeps_showing_the_cached_deals(window):
+    """这次没抓到不等于上次那几条不存在——跟价格一样退回缓存，而不是清成「—」。"""
+    w = window("10000008780\n")
+    _seed_cache(
+        w, deals=[{"price": "¥205", "time": "2小时前"}], deals_when=_ago(3 * 86400)
+    )
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.OnResultReady(0, result_fail())
+
+    assert _deals(w)[0] == "¥205 · 3天前"
+
+
+def test_successful_fetch_without_deals_clears_the_cells(window):
+    """抓到了、确实没有成交（比如售罄）：就别再摆着上一轮那几条。"""
+    w = window("10000008780\n")
+    _seed_cache(w, deals=[{"price": "¥205", "time": "刚刚"}], deals_when=_ago(60))
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.OnResultReady(0, result_ok(avg=None))  # 响应里没有成交那一段
+
+    assert _deals(w) == [app_module.NO_DATA_TEXT] * 3
 
 
 # ---------------- 近期成交高亮 ----------------

@@ -39,6 +39,17 @@ _JUST_NOW_BOUNDS = (0, 60)
 
 _RELATIVE_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*(.*?)前$")
 
+# 写回「N分钟前」时用的单位表：从大到小，同值的别名只留一个
+# （_RELATIVE_UNITS 是"这个说法值多少秒"，这里是"这些秒数该用哪种说法"）
+_AGE_UNIT_NAMES = (
+    (31536000, "年"),
+    (2592000, "个月"),
+    (604800, "周"),
+    (86400, "天"),
+    (3600, "小时"),
+    (60, "分钟"),
+)
+
 # 价格文本里认数字：只取第一个数，千分位逗号在匹配前先抹掉
 _PRICE_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
@@ -82,6 +93,26 @@ def parse_relative_time(text) -> int | None:
     """
     bounds = age_bounds(text)
     return bounds[0] if bounds else None
+
+
+def format_age(seconds) -> str | None:
+    """秒数 →「9小时前」这类说法，parse_relative_time() 的反方向；认不出返回 None。
+
+    给缓存里的成交用：它们存的是抓取那一刻的相对时间，隔一天再显示原文就成了谎话，
+    得按"又过了多久"重算一遍（见 app._reaged_deals）。
+
+    按整单位往下取：36000 秒说「10小时前」，也只是说"至少 10 小时"——跟
+    age_bounds() 把下界当年龄用是同一个口径，宁可把成交说得老一点，也不要说新。
+    不足一分钟的说「刚刚」。
+    """
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    for unit, name in _AGE_UNIT_NAMES:
+        if seconds >= unit:
+            return f"{int(seconds // unit)}{name}前"
+    return _JUST_NOW_WORDS[0]
 
 
 def price_number(text) -> float | None:

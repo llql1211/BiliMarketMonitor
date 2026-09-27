@@ -391,6 +391,52 @@ def _cached_note(updated_at) -> str:
     return f"上次更新时间：{stamp}" if stamp else ""
 
 
+def _elapsed_since(anchor):
+    """缓存里的时刻串 → 到现在过了多少秒；认不出来返回 None。
+
+    跟 MainWindow.DealsElapsed 的区别就在认不出来的时候：那边按 0 算（判"有没有
+    新成交"时退化成"年龄区间一格没挪"，宁可多报一条也不漏报），这边返回 None，
+    调用处据此认定"这组数据是什么时候抓的都不知道"，该闭嘴的地方就闭嘴
+    （见 _reaged_deals）。
+    """
+    stamp = _parse_stamp(anchor)
+    if stamp is None:
+        return None
+    return max(0.0, (datetime.now() - stamp).total_seconds())
+
+
+def _reaged_deals(deals, elapsed):
+    """缓存里那组成交，按「抓到它到现在又过了多久」重写成现在的说法。
+
+    成交没有时间戳，缓存里存的是抓取那一刻接口给的人话（「1分钟前」）。原样搬到
+    首屏就是在骗人：三天前抓的那条，到今天还写着「1分钟前」。抓取时刻到现在这段
+    加上去，才是它此刻的年龄下界（见 parser.format_age）。
+
+    两种认不出的情况分开处理，都往"少说一句"那边倒：
+    - 认不出这条成交的年龄（绝对日期、错别字）→ 原文照旧，也不高亮。原文可能是
+      个日期，照抄不算撒谎；
+    - 认不出这组是什么时候抓的 → 相对说法一律不能留，只留价格。价格是抓到的值，
+      它不会过期，时间会。
+    """
+    aged = []
+    for deal in deals or []:
+        if not isinstance(deal, dict) or not deal.get("price"):
+            continue
+        if elapsed is None:  # 不知道这组多老 → 相对说法留不得
+            aged.append({"price": deal["price"], "time": "", "age_seconds": None})
+            continue
+        age = parser.parse_relative_time(deal.get("time"))
+        if age is None:  # 认不出年龄 → 原文照旧，也不高亮
+            text = deal.get("time") or ""
+            aged.append({"price": deal["price"], "time": text, "age_seconds": None})
+            continue
+        age = int(age + elapsed)
+        aged.append(
+            {"price": deal["price"], "time": parser.format_age(age), "age_seconds": age}
+        )
+    return aged
+
+
 def _tips(*parts) -> str:
     """拼提示文本：只留非空的那几段，一行一句。"""
     return "\n".join(part for part in parts if part)
@@ -1945,7 +1991,7 @@ class MainWindow(QMainWindow):
         self.table.setItem(row, COL_CID, self.MakeCell(cluster_id))
 
         self.SetPriceCells(row, item)
-        self.SetDealCells(row, values.get("deals"))
+        self.SetDealCells(row, item)
 
         self.table.setItem(
             row, COL_IMG, self.MakeCell("", tooltip="双击查看大图", align=Qt.AlignCenter)
@@ -1958,13 +2004,23 @@ class MainWindow(QMainWindow):
         link_item.setData(Qt.UserRole, url)
         self.table.setItem(row, COL_LINK, link_item)
 
-    def SetDealCells(self, row, deals):
+    def SetDealCells(self, row, item):
         """填「成交①/②/③」三格，够新鲜的那几条加粗 + 高亮色。
+
+        取值跟 SetPriceCells 一个口径：本次抓到的优先，抓失败就退回缓存里上一轮
+        那组，年龄按它的抓取时刻重算（见 _reaged_deals）。刚打开程序时三格都不空
+        着——缓存里有上一轮抓到的成交，没道理等到再抓一轮才显示；抓失败时也留着
+        上次那几条，那是真抓到过的成交，不会因为这次没抓到就变成不存在。
 
         首屏渲染（FillRow）和抓取回填（OnResultReady）都走这里，
         免得同一段渲染逻辑写两遍，哪天真改出不一致来。
         """
-        deals = deals or []
+        values = item["values"] or {}
+        if values.get("ok"):
+            deals = values.get("deals") or []
+        else:
+            cached, anchor = store.cached_deals_of(item["record"] or {})
+            deals = _reaged_deals(cached, _elapsed_since(anchor))
         for i in range(3):
             if i < len(deals):
                 deal = deals[i]
@@ -2266,10 +2322,8 @@ class MainWindow(QMainWindow):
         认不出这个时刻（老缓存没这列、文本坏了）就按 0 算：判定退化成"年龄区间
         一格没挪"，认得出同一条的照样认得出，只是更容易把老的算成新的。
         """
-        stamp = _parse_stamp(anchor)
-        if stamp is None:
-            return 0.0
-        return max(0.0, (datetime.now() - stamp).total_seconds())
+        elapsed = _elapsed_since(anchor)
+        return 0.0 if elapsed is None else elapsed
 
     def OnResultReady(self, row, result):
         if row >= self.table.rowCount():
@@ -2337,7 +2391,7 @@ class MainWindow(QMainWindow):
         item["values"] = result  # 失败的也记下来，重建表格时不会退回"待抓取"
 
         self.SetPriceCells(row, item)
-        self.SetDealCells(row, result["deals"])
+        self.SetDealCells(row, item)
 
         # 名称：接口返回的才是最新的；失败时如果原本没有名字，标出来而不是留个"…"
         name_item = self.table.item(row, COL_NAME)

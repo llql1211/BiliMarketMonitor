@@ -522,6 +522,47 @@ def test_deal_age_follows_the_displayed_time():
     ]
 
 
+# ---------------- 秒数 -> 相对时间说法（显示缓存里的成交用） ----------------
+#
+# parse_relative_time 的反方向：缓存里存的相对时间是抓取那一刻说的话，隔一天
+# 再显示就成了谎话，得按"又过了多久"重算一遍（见 app._reaged_deals）。
+
+
+@pytest.mark.parametrize(
+    "seconds, expected",
+    [
+        (0, "刚刚"),
+        (59, "刚刚"),          # 不满一分钟，凑不出「0分钟前」这种说法
+        (60, "1分钟前"),
+        (3599, "59分钟前"),
+        (3600, "1小时前"),
+        (36000, "10小时前"),
+        (86399, "23小时前"),    # 差一秒满一天，就还不算「1天前」
+        (86400, "1天前"),
+        (3 * 86400, "3天前"),
+        (7 * 86400, "1周前"),
+        (30 * 86400, "1个月前"),  # 满 30 天起说「个月」
+        (365 * 86400, "1年前"),
+        (90.5, "1分钟前"),      # 小数按整单位往下取
+    ],
+)
+def test_format_age(seconds, expected):
+    """秒数换成相对说法。"""
+    assert parser.format_age(seconds) == expected
+
+
+@pytest.mark.parametrize("seconds", [None, "", "60", -1, float("inf"), True])
+def test_format_age_unknown_input(seconds):
+    """认不出的输入一律 None——宁可不说，也不要编一句时间出来。"""
+    assert parser.format_age(seconds) is None
+
+
+@pytest.mark.parametrize("seconds", [0, 60, 3600, 7200, 5 * 86400, 365 * 86400])
+def test_format_age_reads_back_as_the_same_seconds(seconds):
+    """写出来的说法得能被自己读回同一个秒数（界面上显示的和判定用的年龄对得上）。"""
+    assert parser.parse_relative_time(parser.format_age(seconds)) == seconds
+
+
 # ---------------- 价格文本 -> 数字（算涨跌用） ----------------
 #
 # 缓存和结果里存的都是「¥44」这样的展示文本，要算涨跌得先把数字抠出来。

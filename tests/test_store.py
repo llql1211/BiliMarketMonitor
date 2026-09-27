@@ -551,6 +551,21 @@ def test_cached_deals_without_a_record_is_empty(db):
     assert store.Store(db).cached_deals("404") == ([], None)
 
 
+def test_cached_deals_of_reads_a_record_in_hand(db):
+    """拿在手里的记录也能直接读，跟按 ID 查是同一条路（界面重画时不再查一次库）。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", None, deals=[{"price": "¥205", "time": "刚刚"}])
+
+    record = st.get_item("1001")
+    assert store.cached_deals_of(record) == st.cached_deals("1001")
+
+
+@pytest.mark.parametrize("record", [None, {}, {"deals_json": None}, {"deals_json": "[1, 2]"}])
+def test_cached_deals_of_tolerates_an_empty_record(record):
+    """没有成交的记录（或者压根没记录）给空基准，不抛异常。"""
+    assert store.cached_deals_of(record) == ([], None)
+
+
 @pytest.mark.parametrize("junk", ["{不是 JSON", '"字符串"', "123", "[1, 2, 3]"])
 def test_cached_deals_survives_a_broken_json_column(db, junk):
     """缓存里那格被写坏了只当"没有基准"——一条坏记录不该让整轮抓取崩掉。

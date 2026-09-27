@@ -153,29 +153,14 @@ class Store:
         """上次抓到的成交记录，返回 (成交列表, 抓取时刻)；没有基准时是 ([], None)。
 
         抓取时刻是判定「这轮有没有新成交」的锚点：只有它跟这组成交是同一批抓回来的，
-        算出来的时间差才作数（见 app.new_deals）。
+        算出来的时间差才作数（见 app.new_deals）。也用来把缓存那组成交重算成
+        "现在多久以前"再显示（见 app._reaged_deals）。
 
         这条路上任何不对的地方都降级成「没有基准」——JSON 坏了、形状不是列表、
         老库还没补出这两列，都只该让这一件商品少一次新增成交的提示，不该让整轮
         抓取崩在这儿。缓存库的原则就是「能起来就行」。
         """
-        record = self.get_item(cluster_id)
-        if not record:
-            return [], None
-        raw = record.get("deals_json")
-        if not isinstance(raw, str) or not raw:
-            return [], None
-        try:
-            deals = json.loads(raw)
-        except ValueError:
-            return [], None
-        if not isinstance(deals, list):
-            return [], None
-        deals = _dicts(deals)
-        if not deals:
-            return [], None  # 解析出来是空的（"[]"、[1,2,3] 这类）也算没有基准
-        anchor = record.get("deals_updated_at")
-        return deals, anchor if isinstance(anchor, str) and anchor else None
+        return cached_deals_of(self.get_item(cluster_id))
 
     def get_all(self):
         """返回全部缓存记录（新抓取的在前）。"""
@@ -418,6 +403,28 @@ def _deals_json(deals):
 def _dicts(items):
     """从缓存里读回来的东西中挑出成形的 dict（JSON 是外部输入，什么都可能在里面）。"""
     return [item for item in items or [] if isinstance(item, dict)]
+
+
+def cached_deals_of(record):
+    """从一条缓存记录里取 (成交列表, 抓取时刻)；没有基准时是 ([], None)。
+
+    跟 Store.cached_deals() 是同一条路，区别只在这边拿的是已经查出来的记录——
+    界面每重画一行都攥着 record 了，不必为同一件事再查一次库（见 app.FillRow）。
+    """
+    raw = (record or {}).get("deals_json")
+    if not isinstance(raw, str) or not raw:
+        return [], None
+    try:
+        deals = json.loads(raw)
+    except ValueError:
+        return [], None
+    if not isinstance(deals, list):
+        return [], None
+    deals = _dicts(deals)
+    if not deals:
+        return [], None  # 解析出来是空的（"[]"、[1,2,3] 这类）也算没有基准
+    anchor = record.get("deals_updated_at")
+    return deals, anchor if isinstance(anchor, str) and anchor else None
 
 
 def _clean_cached_text(value):
