@@ -125,6 +125,43 @@ def seed_expected_prices():
     )
 
 
+def seed_lowest_prices(skip=3, count=4, factor=0.85):
+    """往沙盒缓存里几行塞一条比现价低的史低价，好让表格场景看出这一列的样子。
+
+    挑的是「算得出涨跌」的那些行（有价、没售罄）里、跳过前 skip 个之后的几行。
+    前几个是 seed_sample_fetches 要喂新价的：那一下会把它们的史低价刷出来（图上
+    是命中色）；这几行则带着一条更便宜的旧记录出现（图上是平常色）；再往后的行
+    没有记录，显示占位符——三种样子一张图里都能看到。
+
+    只动沙盒副本，真实缓存一个字都不改（跟 seed_expected_prices 同一个出发点）。
+    价格写成「¥37.4」这种跟抓取结果一致的形状（真抓到时存的就是这个写法）。
+    """
+    import links
+    import parser
+    import store
+
+    path = links.default_watchlist_path()
+    if not os.path.exists(path):
+        return
+    entries = links.load_links(path)
+
+    db = store.Store(store.default_db_path())
+    try:
+        eligible = []
+        for entry in entries:
+            record = db.get_item(entry.cluster_id) or {}
+            price = parser.price_number(record.get("price_text"))
+            if price and not record.get("sold_out"):
+                eligible.append((entry.cluster_id, price))
+        for cluster_id, price in eligible[skip:skip + count]:
+            db.upsert_item(
+                cluster_id, None, None,
+                lowest_price=f"¥{_amount(price * factor)}",
+            )
+    finally:
+        db.close()
+
+
 def _amount(value) -> str:
     """60.0 -> "60"、60.5 -> "60.5"：别在清单里留一串没用的零。"""
     return f"{value:.2f}".rstrip("0").rstrip(".")
@@ -457,6 +494,7 @@ def main(argv):
     out = Path(args.out) if args.out else DEFAULT_OUT
     use_sandbox(Path(args.data) if args.data else SOURCE_DATA, SANDBOX, args.keep)
     seed_expected_prices()
+    seed_lowest_prices()
     out.mkdir(parents=True, exist_ok=True)
 
     for name in sorted(wanted):

@@ -85,10 +85,12 @@ ZOOM_MAX = 4.0    # 最多放到铺满的 4 倍；720 的图再往上就是马�
 
 ROW_NUMBER_PADDING = 16  # 序号槽左右留白，免得数字贴着分隔线
 
-COL_IMG, COL_NAME, COL_CID, COL_PRICE, COL_EXPECT, COL_REF, COL_AVG = 0, 1, 2, 3, 4, 5, 6
-COL_DEAL_BASE = 7  # 成交① 占 7/8/9 三列
-COL_LINK = 10
-HEADERS = ["图片", "商品名", "ID", "现价", "预期价", "原价", "近30天均价",
+COL_IMG, COL_NAME, COL_CID, COL_PRICE, COL_LOW, COL_EXPECT, COL_REF, COL_AVG = (
+    0, 1, 2, 3, 4, 5, 6, 7
+)
+COL_DEAL_BASE = 8  # 成交① 占 8/9/10 三列
+COL_LINK = 11
+HEADERS = ["图片", "商品名", "ID", "现价", "史低价", "预期价", "原价", "近30天均价",
            "成交1", "成交2", "成交3", "链接"]
 
 PENDING_TEXT = "…"      # 等待抓取
@@ -115,6 +117,15 @@ AVG_HEADER_TIP = (
     "接口给的近 30 天成交均价\n"
     "现价比它低时，这一格会变绿加粗——说明这会儿买比最近一个月都划算"
 )
+
+# 「史低价」列
+LOWEST_HEADER_TIP = (
+    "历次抓到的现价里最低的那个\n"
+    "每轮抓到更低的价就刷新，价格涨回去也不会把这个记录改高\n"
+    "售罄时那一格装的是原价，不参与比较\n"
+    "现价正落在史低价上（没比它贵）时，这一格会变绿加粗"
+)
+
 EXPECTED_BAD_INPUT = "预期价格得是大于 0 的数字，比如 50。"
 EXPECTED_BAD_TITLE = "预期价格认不出来"
 
@@ -216,6 +227,31 @@ def price_delta(previous_price, previous_sold_out, current_price, current_sold_o
     return None
 
 
+def updated_lowest(lowest, price, sold_out):
+    """这次抓到的价格要不要刷新史低价；要就给这个价格（原样存），不要给 None。
+
+    None 表示"这次不动它"——store.upsert_item 那边按 COALESCE 语义保留旧值，所以
+    下面这几种情况都从这里退化成"不更新"，不必让存储层再判一遍：
+
+    - 售罄的不参与：那格的"现价"其实是原价（见 PriceText），记进去就是一条假史低；
+    - 这次的价格认不出数字就不比：宁可不动，也不要拿猜出来的数当史低；
+    - 不比现存的更低就不写：史低价是一条只降不升的记录，涨回去当然不能改高，
+      持平也没必要重写一遍。
+
+    现存的值认不出数字（老缓存、手改过的库）时按"没有记录"处理，让这次的价格顶上
+    ——至少它是个认得出的数字，比留一条读不出来的记录强。
+    """
+    if sold_out:
+        return None
+    current = parser.price_number(price)
+    if current is None:
+        return None
+    stored = parser.price_number(lowest)
+    if stored is not None and current >= stored:
+        return None
+    return price
+
+
 def expected_reached(expected_price, price, sold_out) -> bool:
     """现价是不是已经跌到预期价以下了（到价）。
 
@@ -250,6 +286,26 @@ def below_average(price, avg_price, sold_out) -> bool:
     if average is None or current is None:
         return False
     return current < average
+
+
+def at_lowest(price, lowest, sold_out) -> bool:
+    """现价是不是正落在史低价这一档上（史上最便宜的时候，值得扫一眼）。
+
+    判"没得比"的口径与 expected_reached / below_average 一致：
+    - 售罄行不比：那格的"现价"装的其实是原价（见 PriceText）；
+    - 有一边认不出数字就不比：宁可这格不变色，也不要拿猜出来的数骗人。
+
+    不高于史低价就算命中。持平是常态——史低价本来就是历次抓到的现价里最低的那个，
+    这一档多半是刚抓到的这个价自己刷出来的；真出现"比史低价还低"只可能是缓存被
+    手改过，一起认下来，别为它单开一个分支。
+    """
+    if sold_out:
+        return False
+    low = parser.price_number(lowest)
+    current = parser.price_number(price)
+    if low is None or current is None:
+        return False
+    return current <= low
 
 
 def expected_number(expected_price) -> str:
@@ -1502,6 +1558,9 @@ class MainWindow(QMainWindow):
         # 了箭头后的空格和件数前的「余」，每格都短了一截，所以眼下有富余。真放不下
         # 时（见 PriceDeltaDelegate）件数那截退到悬停提示里，不跟涨跌叠着画。
         header.resizeSection(COL_PRICE, 140)
+        # 史低价跟原价/均价是一类参照值，宽度也照它们来；多出来的这 80 是从
+        # 「商品名」那列（Stretch）身上抠的，其余列的宽度一个没动
+        header.resizeSection(COL_LOW, 80)
         header.resizeSection(COL_EXPECT, 80)
         header.resizeSection(COL_REF, 80)
         header.resizeSection(COL_AVG, 90)
@@ -1518,6 +1577,7 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeaderItem(COL_LINK).setToolTip(
             f"点击「打开」用浏览器访问商品详情页\n链接由配置里的模板拼出：\n{template}"
         )
+        self.table.horizontalHeaderItem(COL_LOW).setToolTip(LOWEST_HEADER_TIP)
         self.table.horizontalHeaderItem(COL_EXPECT).setToolTip(EXPECTED_HEADER_TIP)
         self.table.horizontalHeaderItem(COL_AVG).setToolTip(AVG_HEADER_TIP)
         self.table.cellClicked.connect(self.OnCellClick)
@@ -1855,6 +1915,33 @@ class MainWindow(QMainWindow):
             cell.setFont(font)
         return cell
 
+    def LowestCell(self, lowest, price, sold_out):
+        """「史低价」格：历次抓到的最低价，现价正落在这个档位上时绿色加粗。
+
+        跟「近30天均价」一个路子：它是拿现价跟一条参照值比出来的"这会儿买划不划算"，
+        命中说明从记到过的最低价看，现在就是最便宜的一档。没命中的时候它只是个参照
+        值（"有就行、别抢眼"），平常字色显示，跟均价那格一致。
+
+        没记过史低价的行（新添加、一直失败、以及这一版之前就抓到的）显示占位符——
+        宁可空着，也不要拿现价凑一个"史低价"出来，那个数没有历史可言。
+        """
+        if not lowest:
+            return self.MakeCell(NO_DATA_TEXT)
+        at_low = at_lowest(price, lowest, sold_out)
+        cell = self.MakeCell(
+            str(lowest),
+            # 没命中时给 None，让 MakeCell 照旧把整格文本当提示
+            tooltip=f"现价 {price} 就是史低价，从没记到过比这更低的价格"
+            if at_low
+            else None,
+            color=theme.lowest_color(self.dark) if at_low else None,
+        )
+        if at_low:
+            font = cell.font()
+            font.setBold(True)
+            cell.setFont(font)
+        return cell
+
     def ClearedCell(self):
         """待抓取中的占位格：一个「--」，不挂提示（提示里只有「--」等于没说）。"""
         return self.MakeCell(CLEARED_TEXT, tooltip="")
@@ -1930,11 +2017,14 @@ class MainWindow(QMainWindow):
         return cell
 
     def SetPriceCells(self, row, item):
-        """填「现价 / 原价 / 近30天均价」三格，外加跟着它们走的「预期价格」格。
+        """填「现价 / 史低价 / 原价 / 近30天均价」四格，外加跟着它们走的「预期价格」格。
 
         取值优先级：这次抓到的 > 缓存里上次抓到的 > 占位符。抓失败时退回缓存，
         而不是把已经看到过的价格清掉——一次网络抖动不该让人白记一遍；代价是
         得在提示里说清这个数是什么时候抓的（_cached_note）。
+
+        史低价只从缓存里取：它不是"这次抓到的"，而是历次抓下来攒在库里的一条记录
+        （写入口见 OnResultReady），upsert 之后的那份 record 里就是最新值。
 
         预期价是用户设的不是抓来的，但它变不变色要看现价，所以跟着一起重画：
         不然抓完一轮，到价的行还挂着上一轮的旧颜色。
@@ -1942,16 +2032,18 @@ class MainWindow(QMainWindow):
         首屏渲染（FillRow）和抓取回填（OnResultReady）都走这里，
         免得同一段渲染逻辑写两遍，哪天真改出不一致来。
         """
+        record = item["record"] or {}
+        lowest = record.get("lowest_price")
         if item.get("price_cleared"):  # 本次抓取还没轮到它，先留个空
             self.table.setItem(row, COL_PRICE, self.ClearedCell())
             self.table.setItem(row, COL_REF, self.ClearedCell())
             self.table.setItem(row, COL_AVG, self.ClearedCell())
             # 预期价不跟着清：它不是抓来的，没有"还没轮到"这回事，
-            # 只是暂时没得比，按没到价的样子摆着
+            # 只是暂时没得比，按没到价的样子摆着。史低价同理：它是以前抓到过的事，
+            # 这轮刷到它只是可能更低，清成「--」等于把已经知道的事盖掉了
             price, sold_out, stock = None, None, ""
         else:
             values = item["values"] or {}
-            record = item["record"] or {}
             if values.get("ok"):
                 price, sold_out = values.get("price"), values.get("sold_out")
                 reference, avg = values.get("reference_price"), values.get("avg_price")
@@ -1976,6 +2068,7 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, COL_REF, self.ReferenceCell(reference))
             self.table.setItem(row, COL_AVG, self.AvgCell(avg, price, sold_out))
 
+        self.table.setItem(row, COL_LOW, self.LowestCell(lowest, price, sold_out))
         self.table.setItem(
             row, COL_EXPECT,
             self.ExpectedCell(item["entry"].expected_price, price, sold_out),
@@ -2406,7 +2499,9 @@ class MainWindow(QMainWindow):
                         "expected_price": item["entry"].expected_price,
                     }
                 )
-            # 第一次抓到的新商品写入缓存；已缓存的也顺手刷新名称、缩略图和价格
+            # 第一次抓到的新商品写入缓存；已缓存的也顺手刷新名称、缩略图和价格。
+            # 史低价要跟"这次抓取之前"那份比（跟涨跌同理），所以也在 upsert 之前算：
+            # 不刷新时递 None 进去，存储层按 COALESCE 保留旧值
             self.store.upsert_item(
                 cluster_id,
                 result["name"],
@@ -2416,6 +2511,9 @@ class MainWindow(QMainWindow):
                 avg_text=result["avg_price"],
                 sold_out=result["sold_out"],
                 stock_count=result["stock_count"],
+                lowest_price=updated_lowest(
+                    previous.get("lowest_price"), result["price"], result["sold_out"]
+                ),
                 deals=result["deals"],
             )
             item["record"] = self.store.get_item(cluster_id)

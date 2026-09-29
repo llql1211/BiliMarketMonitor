@@ -234,6 +234,16 @@ def below_average_color(dark: bool) -> QColor:
     return price_delta_color(-1, dark)
 
 
+def lowest_color(dark: bool) -> QColor:
+    """现价就是史低价时，「史低价」那格的颜色：跟跌色同一个绿。
+
+    与 expected_reached_color / below_average_color 同一个路子：便宜到位了，
+    方向跟降价一致，没必要另调一个色。单写一个函数只是让调用处读的是「史低价」
+    而不是「比均价低」——颜色本身仍然只有 PRICE_DOWN_COLOR 一处定义。
+    """
+    return price_delta_color(-1, dark)
+
+
 def style_placeholder(widget, dark: bool):
     """给输入框的占位文字（灰字）上色。
 

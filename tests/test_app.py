@@ -261,6 +261,7 @@ def test_pending_row_renders_placeholders(window):
     assert w.table.item(0, app_module.COL_NAME).text() == app_module.PENDING_TEXT
     for col in (
         app_module.COL_PRICE,
+        app_module.COL_LOW,
         app_module.COL_REF,
         app_module.COL_AVG,
         app_module.COL_DEAL_BASE,
@@ -794,6 +795,120 @@ def test_avg_cell_follows_theme(window):
     assert after != before
 
 
+# ---------------- 史低价 ----------------
+
+
+@pytest.mark.parametrize(
+    "lowest, price, sold_out, expected",
+    [
+        (None, "¥44", False, "¥44"),    # 第一次抓到：这个价就是史低价
+        ("", "¥44", False, "¥44"),      # 记过但空着（老库补出来的列）→ 按没有记录处理
+        ("¥50", "¥44", False, "¥44"),   # 抓到更低的 → 刷新记录
+        ("¥44", "¥50", False, None),    # 比史低价贵 → 不动
+        ("¥44", "¥44", False, None),    # 持平 → 也没必要重写一遍
+        ("¥50", "¥44", True, None),     # 售罄的不记：那格的"现价"其实是原价
+        ("¥44", None, False, None),     # 这次没抓到价格
+        ("¥44", "面议", False, None),   # 现价认不出数字 → 宁可不动
+        ("面议", "¥44", False, "¥44"),  # 存着的那条读不出数字 → 让这次的顶上
+    ],
+)
+def test_updated_lowest(lowest, price, sold_out, expected):
+    """史低价只降不升：售罄不比、认不出数字不比、不比现存的更低就不写。"""
+    assert app_module.updated_lowest(lowest, price, sold_out) == expected
+
+
+@pytest.mark.parametrize(
+    "price, lowest, sold_out, at_low",
+    [
+        ("¥44", "¥44", False, True),    # 现价就是史低价（这一档多半是刚刷出来的）
+        ("¥44", "¥50", False, True),    # 比史低价还低只可能是手改过的库，一起认
+        ("¥50", "¥44", False, False),   # 比史低价贵 → 不是最便宜的一档
+        ("¥44", "¥44", True, False),    # 售罄行不比：那格的"现价"其实是原价
+        ("面议", "¥44", False, False),  # 现价认不出数字
+        ("¥44", None, False, False),    # 还没记过史低价
+        ("¥44", "", False, False),
+    ],
+)
+def test_at_lowest(price, lowest, sold_out, at_low):
+    """命中史低价的判断：口径与到价、低于均价一致。"""
+    assert app_module.at_lowest(price, lowest, sold_out) is at_low
+
+
+def _low_cell(w, row=0):
+    return w.table.item(row, app_module.COL_LOW)
+
+
+def test_lowest_cell_highlights_a_new_low(window):
+    """抓到新低时这一格变绿加粗；价格涨回去记录留着，但不再变色。"""
+    w = window("10000008780 | 甲\n10000008781 | 乙\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.OnResultReady(0, result_ok(price="¥44"))  # 第一次抓到 → 这个价就是史低价
+    w.OnResultReady(1, result_ok(price="¥60"))
+    w.OnResultReady(1, result_ok(price="¥70"))  # 涨回去 → 记录不动，也就不再命中
+
+    fresh = _low_cell(w, 0)
+    assert fresh.text() == "¥44"
+    assert fresh.font().bold()
+    assert fresh.foreground().color().name() == theme.lowest_color(w.dark).name()
+    assert "就是史低价" in fresh.toolTip()
+
+    back_up = _low_cell(w, 1)
+    assert back_up.text() == "¥60"  # 史低价没跟着涨到 70
+    assert not back_up.font().bold()
+    assert back_up.toolTip() == "¥60"  # 没命中时提示还是整格文本
+
+
+def test_lowest_cell_ignores_sold_out_price(window):
+    """售罄那一下不记史低价：那格的"现价"其实是原价，记进去就是一条假记录。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.OnResultReady(0, result_ok(price="¥88", sold_out=True))
+
+    assert _low_cell(w).text() == app_module.NO_DATA_TEXT
+
+
+def test_cached_lowest_shows_on_startup(window):
+    """重开程序时上一次攒下的史低价照常显示；没记过的行还是占位符。"""
+    w = window("10000008780\n10000008781\n")
+    _seed_cache(w, price="¥50", lowest="¥38")
+
+    w.LoadWatchlist(w.watchlist_path)
+
+    cell = _low_cell(w)
+    assert cell.text() == "¥38"
+    assert not cell.font().bold()  # 现价 50 比史低价贵 → 不是最便宜的一档
+    assert _low_cell(w, 1).text() == app_module.NO_DATA_TEXT
+
+
+def test_clearing_prices_keeps_the_lowest(window):
+    """抓取开始清价时史低价不清：它是以前抓到过的事，不是这一轮的数据。"""
+    w = window("10000008780\n")
+    _seed_cache(w, price="¥50", lowest="¥38")
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.ClearPrices()
+
+    assert w.table.item(0, app_module.COL_PRICE).text() == app_module.CLEARED_TEXT
+    assert _low_cell(w).text() == "¥38"
+    assert not _low_cell(w).font().bold()  # 现价是空的，这轮没什么可比
+
+
+def test_lowest_cell_follows_theme(window):
+    """命中色跟着主题走——不重画的话换完主题会停在旧主题的绿上。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, result_ok(price="¥44"))
+
+    before = _low_cell(w).foreground().color().name()
+    w.OnToggleTheme()
+    after = _low_cell(w).foreground().color().name()
+
+    assert after == theme.lowest_color(w.dark).name()
+    assert after != before
+
+
 # ---------------- 缓存价格 / 涨跌 ----------------
 
 
@@ -802,19 +917,19 @@ CACHED_AT = "2026-09-16T10:30:00"
 
 def _seed_cache(
     w, price="¥50", reference=None, avg=None, sold_out=False, when=CACHED_AT,
-    cluster_id="10000008780", deals=None, deals_when=None, stock=None,
+    cluster_id="10000008780", deals=None, deals_when=None, stock=None, lowest=None,
 ):
     """往缓存里塞一条「上次抓取」的价格（默认第一行那件商品）。
 
     时间是写回去的（upsert 自己记的是当前时间），这样提示语可以断言；
     when=None 模拟老库补列后留下的空时间戳。deals 给成交（判新增时的基准），
     deals_when 给它的抓取时刻——两个都省掉就是"还没抓到过成交"。
-    stock 给上次抓到的剩余件数。
+    stock 给上次抓到的剩余件数，lowest 给攒下来的史低价（不传就是没记过）。
     """
     w.store.upsert_item(
         cluster_id, "甲", None,
         price_text=price, reference_price=reference, avg_text=avg, sold_out=sold_out,
-        stock_count=stock, deals=deals,
+        stock_count=stock, lowest_price=lowest, deals=deals,
     )
     with w.store.conn:
         w.store.conn.execute(
