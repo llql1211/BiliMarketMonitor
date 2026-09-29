@@ -29,6 +29,9 @@ ITEM_COLUMNS = (
     ("sold_out", "INTEGER"),        # 上次抓到的是不是售罄（0/1）
     ("stock_count", "INTEGER"),     # 上次抓到的「当前价格还剩几件」（没报就是 NULL）
     ("price_updated_at", "TEXT"),   # 上面几个价格字段是什么时候抓的
+    ("lowest_price", "TEXT"),       # 历次抓到的现价里最低的那个（售罄那次不算）。
+                                    # 跟上面那组快照的规则不同：只降不升，涨回去也
+                                    # 不改高；是缓存里唯一一条"重抓补不回来"的记录
     ("deals_json", "TEXT"),         # 上次抓到的近 N 条成交（JSON 数组）
     ("deals_updated_at", "TEXT"),   # 上面那组成交是什么时候抓的
 )
@@ -234,6 +237,7 @@ class Store:
         avg_text=None,
         sold_out=False,
         stock_count=None,
+        lowest_price=None,
         deals=None,
     ):
         """保存抓取结果；新值为空时保留旧值。
@@ -251,6 +255,12 @@ class Store:
         都在变——而那个时刻是算「隔了多久」的锚点，用错一个就会把老成交算成新的。
         deals=None 表示这次没抓到成交（整组保留），空列表表示抓到了、确实一条都没有，
         照实覆盖。
+
+        史低价（lowest_price）的规则跟上面两组都不同：它是一条**只降不升**的记录，
+        所以不是"这次抓到什么就存什么"，而是由调用方比过一遍再决定递不递进来
+        （见 app.updated_lowest）——递进来的只该是比现存更低的那个，None 表示这次
+        没有刷新它（没抓到价格、售罄、认不出数字都走这条）。这里不做比较，只按
+        COALESCE 存：值给什么写什么，给 None 就保留旧值。
         """
         self._begin()
         cluster_id = _clean_id(cluster_id)
@@ -263,8 +273,8 @@ class Store:
                 """INSERT INTO items (cluster_id, name, image_url, updated_at,
                                       price_text, reference_price, avg_text,
                                       sold_out, stock_count, price_updated_at,
-                                      deals_json, deals_updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      lowest_price, deals_json, deals_updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(cluster_id) DO UPDATE SET
                        name       = COALESCE(excluded.name, name),
                        image_url  = COALESCE(excluded.image_url, image_url),
@@ -285,6 +295,7 @@ class Store:
                        price_updated_at = CASE WHEN excluded.price_text IS NULL
                                                THEN price_updated_at
                                                ELSE excluded.price_updated_at END,
+                       lowest_price     = COALESCE(excluded.lowest_price, lowest_price),
                        deals_json       = COALESCE(excluded.deals_json, deals_json),
                        deals_updated_at = CASE WHEN excluded.deals_json IS NULL
                                                THEN deals_updated_at
@@ -300,6 +311,7 @@ class Store:
                     int(bool(sold_out)),
                     _clean_count(stock_count),
                     now,
+                    _clean_cached_text(lowest_price),
                     _deals_json(deals),
                     now,
                 ),

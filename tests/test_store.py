@@ -227,6 +227,57 @@ def test_upsert_blank_price_is_treated_as_missing(db, blank):
     assert row["sold_out"] == 1
 
 
+# ---------------- 史低价 ----------------
+
+
+def test_upsert_item_saves_lowest_price(db):
+    """史低价给了就写（比较在 app 那边做，这里只管存）。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", None, price_text="¥44", lowest_price="¥44")
+    assert st.get_item("1001")["lowest_price"] == "¥44"
+
+
+def test_upsert_lowest_price_none_preserves_the_record(db):
+    """传 None 表示"这次没刷新"，记录原样留着——现价涨回去也不会把它改高。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", None, price_text="¥44", lowest_price="¥44")
+    st.upsert_item("1001", "甲", None, price_text="¥60", lowest_price=None)
+
+    row = st.get_item("1001")
+    assert row["price_text"] == "¥60"  # 现价照常刷新
+    assert row["lowest_price"] == "¥44"  # 史低价不受影响
+
+
+def test_upsert_without_price_keeps_the_lowest_price(db):
+    """这次没抓到价格（整组价格保留）时，史低价也跟着留着。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", None, price_text="¥44", lowest_price="¥44")
+    st.upsert_item("1001", "甲", None)
+    assert st.get_item("1001")["lowest_price"] == "¥44"
+
+
+@pytest.mark.parametrize("blank", ["", "   ", None, 44])
+def test_upsert_blank_lowest_price_is_treated_as_missing(db, blank):
+    """空串或非字符串按「这次没刷新」处理，不会把已有的记录冲掉。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", None, price_text="¥44", lowest_price="¥44")
+    st.upsert_item("1001", "甲", None, price_text="¥38", lowest_price=blank)
+    assert st.get_item("1001")["lowest_price"] == "¥44"
+
+
+def test_lowest_price_is_not_backfilled_from_the_existing_price(db):
+    """已有的现价不会被当成史低价补上：那列从这一版开始攒，老行先空着。
+
+    上一版没有这一列，老库补出来的就是空的（见 _ensure_item_columns）；这里造的
+    状态与它一样——有价、没史低价——再看重开一遍会不会被"顺手"补上。
+    """
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", None, price_text="¥44")
+    st.close()
+
+    assert store.Store(db).get_item("1001")["lowest_price"] is None
+
+
 # ---------------- 老缓存库补列 ----------------
 
 
