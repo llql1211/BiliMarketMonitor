@@ -12,5 +12,6 @@ data/cache.db
 data/cache.db-*
 data/cache.db.bad-*
 data/config.toml
+data/config.toml.bak
 data/watchlist.txt
 data/watchlist.txt.bak
