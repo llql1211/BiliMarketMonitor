@@ -2521,6 +2521,199 @@ def test_enabled_without_webhook_is_reported_at_startup(window, capsys):
     assert "notify_wecom_webhook" in capsys.readouterr().out
 
 
+# ---- 触发判定 ----
+
+def _queue_names(w):
+    """队列里每件商品的「名字 | 标签」，比一条条断整段文字好读。"""
+    return [f"{item['name']} | {item['tags']}" for item in w.notify_queue]
+
+
+def _fetched(price, **kwargs):
+    """一次抓取结果，商品名统一给「甲」（清单里那件）。
+
+    通知里写的是**这次抓到的**名字（跟总结一个口径），不给的话会写成
+    _raw_response 的默认名，断言里就看不见清单里那个名字了。
+    """
+    return result_ok(name="甲", price=price, **kwargs)
+
+
+def test_restock_triggers_notification(window):
+    """售罄 → 在售：状态变了就推，不用收藏过（这条默认开着）。"""
+    w = window("10000008780 | 甲\n", config_toml=_notify_toml())
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, _fetched("¥88", sold_out=True))
+    assert w.notify_queue == []  # 售罄本身不推
+
+    w.OnResultReady(0, _fetched("¥88"))
+
+    assert _queue_names(w) == ["甲 | 恢复在售"]
+
+
+def test_first_observation_never_triggers(window):
+    """首次观察不发通知：没有上一轮记录，一切「变化」都是凭空成立的。"""
+    w = window("10000008780 | 甲 | 50 | *\n", config_toml=_notify_toml())
+    w.LoadWatchlist(w.watchlist_path)
+
+    # 收藏着、低于预期价（50）、也是史上最低——三个条件同时成立，照样不推
+    w.OnResultReady(0, _fetched("¥44"))
+
+    assert w.notify_queue == []
+    # 只是不推，缓存照写：下一轮就有比较的基准了
+    assert w.rows[0]["record"]["price_text"] == "¥44"
+
+
+def test_favorite_target_triggers_on_the_edge_only(window):
+    """收藏商品的到价：只在「上一次没到、这一次到了」那一刻推，不是每轮都推。"""
+    w = window("10000008780 | 甲 | 50 | *\n", config_toml=_notify_toml())
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, _fetched("¥66"))  # 没到价：攒基准
+    assert w.notify_queue == []
+
+    w.OnResultReady(0, _fetched("¥44"))  # 这一次到了
+
+    assert _queue_names(w) == ["甲 | 低于预期价"]
+
+    w.OnResultReady(0, _fetched("¥43"))  # 还是低于预期价，状态没变
+
+    assert _queue_names(w) == ["甲 | 低于预期价"]  # 没多出来第二条
+
+
+def test_any_target_switch_controls_unfavorited_items(window):
+    """非收藏商品的到价由 notify_on_any_target 单独控制，收藏那条管不着它。"""
+    w = window("10000008780 | 甲 | 50\n", config_toml=_notify_toml())
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, _fetched("¥66"))
+
+    w.OnResultReady(0, _fetched("¥44"))
+
+    assert w.notify_queue == []  # 默认关着，非收藏的不推
+
+    w = window(
+        "10000008780 | 甲 | 50\n",
+        config_toml=_notify_toml(notify_on_any_target="true"),
+    )
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, _fetched("¥66"))
+    w.OnResultReady(0, _fetched("¥44"))
+
+    assert _queue_names(w) == ["甲 | 低于预期价"]
+
+
+def test_favorite_lowest_triggers_only_when_the_record_is_refreshed(window):
+    """收藏商品创史低：判的是「刷新了记录」，不是「正落在史低价上」。"""
+    w = window(
+        "10000008780 | 甲 | *\n",
+        config_toml=_notify_toml(notify_on_favorite_lowest="true"),
+    )
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, _fetched("¥60"))  # 第一次：史低价是这一轮才写进去的，不算刷新
+    assert w.notify_queue == []
+
+    w.OnResultReady(0, _fetched("¥50"))  # 更低了 → 刷新记录
+
+    assert _queue_names(w) == ["甲 | 创史低"]
+
+    w.OnResultReady(0, _fetched("¥50"))  # 持平：记录不动，也就不推
+
+    assert _queue_names(w) == ["甲 | 创史低"]
+
+    w.OnResultReady(0, _fetched("¥55"))  # 涨回去：史低价只降不升
+
+    assert _queue_names(w) == ["甲 | 创史低"]
+
+
+def test_favorite_drop_triggers_only_for_favorites(window):
+    """收藏商品降价；没收藏的降价不推（这一项容易刷屏，默认还关着）。"""
+    w = window(
+        "10000008780 | 甲 | *\n",
+        config_toml=_notify_toml(notify_on_favorite_drop="true"),
+    )
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, _fetched("¥60"))
+
+    w.OnResultReady(0, _fetched("¥50"))
+
+    assert _queue_names(w) == ["甲 | 降价 ↓10"]
+
+    w = window(
+        "10000008780 | 甲\n",
+        config_toml=_notify_toml(notify_on_favorite_drop="true"),
+    )
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, _fetched("¥60"))
+    w.OnResultReady(0, _fetched("¥50"))
+
+    assert w.notify_queue == []  # 非收藏：降价不推
+
+
+def test_several_triggers_on_one_item_share_a_line(window):
+    """同一件商品一轮里命中几条，合并成一行，标签用「 · 」连着。"""
+    w = window(
+        "10000008780 | 甲 | 50 | *\n",
+        config_toml=_notify_toml(
+            notify_on_favorite_lowest="true", notify_on_restock="true"
+        ),
+    )
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, _fetched("¥88", sold_out=True))  # 攒基准
+    w.notify_queue.clear()
+
+    # 恢复在售 + 创史低 + 低于预期价，三件事同一轮发生
+    w.OnResultReady(0, _fetched("¥44"))
+
+    assert _queue_names(w) == ["甲 | 恢复在售 · 低于预期价 · 创史低"]
+    assert len(w.notify_queue) == 1
+
+
+def test_switch_turns_off_only_its_own_trigger(window):
+    """开关各自独立：关掉一条，别的照推——场景是收藏商品恢复在售、同时到价。"""
+    for key, kept in (
+        ("notify_on_restock", "低于预期价"),
+        ("notify_on_favorite_target", "恢复在售"),
+    ):
+        w = window(
+            "10000008780 | 甲 | 50 | *\n", config_toml=_notify_toml(**{key: "false"})
+        )
+        w.LoadWatchlist(w.watchlist_path)
+        w.OnResultReady(0, _fetched("¥88", sold_out=True))
+        w.notify_queue.clear()
+
+        w.OnResultReady(0, _fetched("¥44"))
+
+        assert _queue_names(w) == [f"甲 | {kept}"], f"{key} 不只关掉了自己那条"
+
+
+def test_notifications_stay_off_when_disabled(window):
+    """总开关关着时一个标签都不收集：省得攒一整轮再在收尾时被扔掉。"""
+    w = window(
+        "10000008780 | 甲 | 50 | *\n",
+        config_toml=_notify_toml(
+            notify_enabled="false",
+            notify_on_restock="true",
+            notify_on_favorite_target="true",
+        ),
+    )
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, _fetched("¥88", sold_out=True))
+    w.OnResultReady(0, _fetched("¥44"))
+
+    assert w.notify_queue == []
+
+
+def test_notification_carries_the_detail_link(window):
+    """通知里那一行带上详情页链接，手机上收到就能直接点开。"""
+    w = window("10000008780 | 甲\n", config_toml=_notify_toml())
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, _fetched("¥88", sold_out=True))
+
+    w.OnResultReady(0, _fetched("¥88"))
+
+    url = w.notify_queue[0]["url"]
+    assert "10000008780" in url
+    assert url.startswith("https://")
+    assert w.notify_queue[0]["price"] == "¥88"
+
+
 # ---- FlushNotifications ----
 
 def test_flush_does_nothing_when_disabled(window):
@@ -2617,6 +2810,23 @@ def test_flush_uses_the_configured_interval(window):
     assert len(sent) == 2
 
 
+def test_first_push_is_not_throttled_by_uptime(window, monkeypatch):
+    """开机头一分钟里的第一次推送也要发得出去。
+
+    限流的基准是「上次推送」，不是系统开机时刻：monotonic 走的是开机以来的
+    秒数，初值要是 0.0，刚开机的头一个间隔内所有通知都会被自己的限流挡掉，
+    而边沿只发生一次——挡掉就是永远错过。
+    """
+    w = window("10000008780 | 甲\n", config_toml=_notify_toml())
+    sent = _sent_notifications(w)
+    w.notify_queue.append(_item(name="甲"))
+    monkeypatch.setattr(app_module.time, "monotonic", lambda: 5.0)  # 开机才 5 秒
+
+    w.FlushNotifications()
+
+    assert len(sent) == 1
+
+
 # ---- BuildNotifyMarkdown ----
 
 def test_build_markdown_shape(window):
@@ -2707,6 +2917,33 @@ def test_notify_price_text(window):
 
 
 # ---- 接在抓取收尾上 ----
+
+def test_a_round_with_a_trigger_sends_one_message(window, monkeypatch, wait_until):
+    """整条链路走一遍：抓回来的结果命中触发，收尾时合成一条消息发出去。
+
+    前面那些用例各测一段（收集、发送、拼消息），这条把三段接起来跑——
+    真起抓取线程、真回结果、真在 OnPollFinished 里发。
+    """
+    w = window("10000008780 | 甲\n", config_toml=_notify_toml())
+    w.LoadWatchlist(w.watchlist_path)
+    # 先在缓存里摆一条「售罄」，这一轮抓回来的是在售 → 恢复在售
+    w.OnResultReady(0, _fetched("¥88", sold_out=True))
+    w.notify_queue.clear()
+    sent = _sent_notifications(w)
+    monkeypatch.setattr(
+        client, "fetch_cluster", _fetch_by_id({"10000008780": raw_ok(name="甲", price="¥88")})
+    )
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
+
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+
+    assert len(sent) == 1
+    url, text = sent[0]
+    assert url == WEBHOOK
+    assert "甲 | ¥88 | 恢复在售" in text
+    assert w.notify_queue == []  # 发出去就清空，不会下一轮又发一遍
+
 
 def test_poll_finished_flushes_notifications(window, monkeypatch, wait_until):
     """一轮抓完把攒下的通知发出去。"""

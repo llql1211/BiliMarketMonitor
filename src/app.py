@@ -156,6 +156,12 @@ AUTO_POLL_EMPTY_TEXT = "自动抓取：本次范围内没有商品，已跳过"
 # 成功那句文案由 notifier 自己发过来（见 Notifier._work），这里只管显示
 NOTIFY_FAIL_PREFIX = "企业微信推送失败："
 
+# 通知里那行标签的写法。一件商品同一轮可能同时踩中几条，全列在一行里，
+# 如「恢复在售 · 创史低」——比拆成几条消息省事，也看得出一件事的分量
+NOTIFY_TAG_RESTOCK = "恢复在售"
+NOTIFY_TAG_TARGET = "低于预期价"
+NOTIFY_TAG_LOWEST = "创史低"
+
 # 状态栏那行字的两个宽度（见 StatusLabel）：
 #   想要的宽度封顶 700——按钮行在默认窗口（1500）下正好空出这么多，量过：现有
 #   最长的那条文案（「共 N 件商品（缓存新增 x，删除 y），点「开始抓取」开始
@@ -1581,7 +1587,10 @@ class MainWindow(QMainWindow):
         self.notifier.sent.connect(self.OnNotifySent)
         self.notifier.failed.connect(self.OnNotifyFailed)
         self.notify_queue = []  # List[dict]：待推送的商品，字段见 BuildNotifyMarkdown
-        self.last_notify_at = 0.0
+        # 限流的基准是「上次推送的时刻」，初值取负无穷表示「还没发过」。
+        # 不能用 0.0：monotonic 走的是开机以来的秒数，开机头一分钟里启动程序，
+        # 第一次推送就会被自己的限流挡掉——而边沿只发生一次，挡掉就是永远错过
+        self.last_notify_at = float("-inf")
         self.InitUI()
         self.ApplyTheme(self.InitialDark())
         self.ScheduleAutoPoll()  # 开了自动抓取就挂上第一拍；没开就什么都不做
@@ -2777,9 +2786,27 @@ class MainWindow(QMainWindow):
                         "expected_price": item["entry"].expected_price,
                     }
                 )
-            # 第一次抓到的新商品写入缓存；已缓存的也顺手刷新名称、缩略图和价格。
             # 史低价要跟"这次抓取之前"那份比（跟涨跌同理），所以也在 upsert 之前算：
-            # 不刷新时递 None 进去，存储层按 COALESCE 保留旧值
+            # 不刷新时递 None 进去，存储层按 COALESCE 保留旧值。通知那边也要看
+            # 「这一轮刷没刷新记录」，算一次两处用
+            new_lowest = updated_lowest(
+                previous.get("lowest_price"), result["price"], result["sold_out"]
+            )
+            # 命中了通知条件就记进队列，等这一轮收尾时合成一条发出去——一件商品
+            # 命中几条也只占一行（见 NotifyTags），多件商品共用一条消息
+            tags = self.NotifyTags(item["entry"], previous, result, change, new_lowest)
+            if tags:
+                self.notify_queue.append(
+                    {
+                        "name": name,
+                        "price": result["price"],
+                        "tags": " · ".join(tags),
+                        "url": links.build_detail_url(
+                            cluster_id, self.config["detail_url_template"]
+                        ),
+                    }
+                )
+            # 第一次抓到的新商品写入缓存；已缓存的也顺手刷新名称、缩略图和价格
             self.store.upsert_item(
                 cluster_id,
                 result["name"],
@@ -2789,9 +2816,7 @@ class MainWindow(QMainWindow):
                 avg_text=result["avg_price"],
                 sold_out=result["sold_out"],
                 stock_count=result["stock_count"],
-                lowest_price=updated_lowest(
-                    previous.get("lowest_price"), result["price"], result["sold_out"]
-                ),
+                lowest_price=new_lowest,
                 deals=result["deals"],
             )
             item["record"] = self.store.get_item(cluster_id)
@@ -2945,6 +2970,61 @@ class MainWindow(QMainWindow):
             self.ToggleFavorite(row)
 
     # ---------------- 通知 ----------------
+
+    def NotifyTags(self, entry, previous, result, change, new_lowest):
+        """这一条抓取结果命中了哪几类通知，返回要写进消息的标签。
+
+        五个开关（`notify_on_*`）互相独立，一件商品同一轮可能同时踩中几条，
+        所以返回的是列表，最后拼成一行。
+
+        两类情况一个标签都不给：
+
+        - **推送总开关关着**：开关只在启动时读一次，这儿直接问一句，省得攒了
+          一整轮再在收尾时被扔掉；
+        - **首次观察**：缓存里没有上一轮的价格（`price_text` 为空——刚加进清单的商品，
+          或者上一轮售罄到没报出价格）。这时候「到价」「创史低」全都凭空成立：
+          拿一个刚认识的商品跟你昨天设的预期价比，比出来的不是变动；「恢复在售」
+          「降价」本来也判不出来（`price_change` 没有基准就返回 None，
+          而史低价那条记录是这一轮才写进去的）。
+        """
+        if not self.config["notify_enabled"] or not previous.get("price_text"):
+            return []
+
+        favorite = entry.favorite
+        tags = []
+        if change is not None:
+            if change["kind"] == CHANGE_ON_SALE and self.config["notify_on_restock"]:
+                tags.append(NOTIFY_TAG_RESTOCK)
+            if (
+                change["kind"] == CHANGE_DOWN
+                and favorite
+                and self.config["notify_on_favorite_drop"]
+            ):
+                tags.append(f"降价 {change['delta']}")
+
+        # 到价是**状态**不是边沿：每轮都推「低于预期价」等于天天喊狼来了。
+        # 判据取「上一次没到、这一次到了」，上一次的状态按缓存里那份价格现算——
+        # 缓存里没存这个 bool，也不值得为它加一列。
+        reached = expected_reached(
+            entry.expected_price, result["price"], result["sold_out"]
+        )
+        if reached and not expected_reached(
+            entry.expected_price, previous.get("price_text"), previous.get("sold_out")
+        ):
+            if favorite and self.config["notify_on_favorite_target"]:
+                tags.append(NOTIFY_TAG_TARGET)
+            elif not favorite and self.config["notify_on_any_target"]:
+                tags.append(NOTIFY_TAG_TARGET)
+
+        # 创史低判的是「这一轮刷新了记录」，不是「现价等于史低价」——后者每轮
+        # 都成立（史低价本来就是历次抓到的现价里最低的那个），推起来没完
+        if (
+            new_lowest is not None
+            and favorite
+            and self.config["notify_on_favorite_lowest"]
+        ):
+            tags.append(NOTIFY_TAG_LOWEST)
+        return tags
 
     def FlushNotifications(self):
         """把这一轮攒下的通知发出去。
