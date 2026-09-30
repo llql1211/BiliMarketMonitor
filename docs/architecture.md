@@ -33,7 +33,7 @@ BiliMarketMonitor/
 │   ├── watchlist.txt.bak       # 写回前留的备份，只留第一次那份（不入库）
 │   ├── cache.db                # 本地缓存（首次运行自动生成，不入库）
 │   └── cache.db.bad-<时间戳>    # 缓存损坏时的备份（自动改名留档，不入库）
-├── src/                # 应用代码，7 个模块（见下）
+├── src/                # 应用代码，8 个模块（见下）
 ├── tests/              # pytest 测试，界面走 offscreen（见「测试」）
 ├── tools/              # 开发/维护工具，不随程序分发（见 tools/README.md）
 ├── docs/               # 本文档，以及 README 用的截图
@@ -56,6 +56,7 @@ BiliMarketMonitor/
 | [src/config.py](../src/config.py) | 配置读取与逐项校验 | `load_config()`、`data_dir()`、`DEFAULTS` |
 | [src/store.py](../src/store.py) | SQLite 缓存：随清单增删、损坏自愈 | `Store`（`sync` / `upsert_item` / `get_all` / `cached_deals`）、`default_db_path()` |
 | [src/theme.py](../src/theme.py) | 深浅两套 QSS、系统深浅色判断、各处配色 | `apply_theme(app, dark)`、`qss_for(dark)`、`system_uses_dark()` |
+| [src/notifier.py](../src/notifier.py) | 企业微信群机器人推送：只管把一条 markdown 发出去 | `Notifier`（`send` / `sent` / `failed`）、`_post_wecom(...)` |
 
 几点值得单独记住：
 
@@ -63,8 +64,16 @@ BiliMarketMonitor/
   无文档的响应、拼出来的 URL）尤其如此。
 - **异常一律降级 + 留痕**，不往上抛、不弹窗打断。`store` 和 `links` 把这次操作的异常情况攒在
   各自的 `notes` 里，`app` 收上去统一在状态栏说一句。详见「降级与留痕」。
-- **测试面**：`parser` 和 `links` 是纯函数，最好测；`app` 有 2370 行、逻辑最重，测试也最厚
-  （`tests/test_app.py` 3600 行）；改这两处时对应测试一起改。
+- **`notifier` 不 import 本项目任何模块**，连 `config` 都不认识——webhook 地址、要发的正文
+  都由 `app` 拼好传进来。这样依赖箭头只有 `app → notifier` 一条，`_post_wecom` 也能当纯函数测。
+  代价是「企业微信地址前缀」在 `config._WECOM_PREFIX` 和 `notifier.WECOM_API_PREFIX` 各留了一份，
+  由 `tests/test_notifier.py::test_webhook_prefix_matches_config` 盯着两边别写岔。
+- **网页地址（webhook）是敏感信息**：只在 `data/config.toml` 里出现（`config.example.toml` 给的是空串），
+  不入库、不写进缓存；出错文案里可能夹着它（requests 的网络异常会把整条 URL 抄进去），
+  所以 `notifier._redact_webhook` 会把 `key=` 后面那段先抹掉再往外说。
+- **测试面**：`parser` 和 `links` 是纯函数，最好测；`app` 有 3100 多行、逻辑最重，测试也最厚
+  （`tests/test_app.py` 5100 行）；改这两处时对应测试一起改。
+  `notifier` 的发送链路全 mock，测试一个字节都不出网。
 
 ## 数据流
 
@@ -86,6 +95,7 @@ data/watchlist.txt
    信号回主线程 ──► 刷新表格 + store.upsert_item() 写缓存
                     ├► links.save_watchlist()  学到了新名字才回写清单
                     └► OnPollFinished 收尾，顺手挂下一拍自动抓取
+                         └► FlushNotifications()  攒下的通知合成一条，交给 notifier
 ```
 
 - **配置只在启动时读一次**（`MainWindow.__init__` 里的 `config.load_config()`），
@@ -95,6 +105,11 @@ data/watchlist.txt
   里挑出一批任务，然后调**同一个** `StartFetch`，之后的事（线程、进度、写缓存、回写清单）
   完全没有分叉。唯一的区别是 `MainWindow.fetch_source` 记着这轮是谁发起的，
   它决定状态栏的措辞（`查询中 3/12` / `自动抓取（收藏）3/12`）和跑完弹不弹总结。
+- **推送在 `OnPollFinished` 里发，但和「总结」不是一回事**：总结在用户中途「停止抓取」的那一轮
+  不弹（半份数据容易让人误会），而已经观察到的补货、到价都是真的——所以 `FlushNotifications()`
+  挂在 `poller_stopped` 那个分支**之前**，该推的照推。
+  `MainWindow.notify_queue` 只由触发逻辑填（见 `notify_on_*` 配置），本轮没攒下东西
+  或总开关关着就一个线程都不起；`last_notify_at` 管限流，间隔之内不重新计时也不丢队列。
 - **清单是唯一的跟踪标准**，缓存只是加速层。所以缓存丢了、坏了都能重新抓回来，
   而清单里的东西是不可再生的（尤其是预期价，那是抓不回来的用户意图）。
 - **每个改动了清单的动作都会立刻写回**：添加、删除选中、拖动排序、双击改预期价、
@@ -137,6 +152,15 @@ data/watchlist.txt
     时统一挂。范围里一件商品都没有时也不发请求，写一句状态栏提示就重挂，否则会变成空转。
   - **关掉时 `ScheduleAutoPoll()` 什么都不做**，定时器就此空着，`closeEvent` 里再 `stop()`
     一次收尾。
+- **`Notifier(QObject)`**：推送跟拉图一个路子，**一次发送一个 daemon 线程**，
+  发完 emit `sent` / `failed` 回主线程。大多数轮次根本没通知可发，于是天然「不发就不起线程」，
+  不必养一个常驻 worker。发送失败不重试（晚到一分钟的提醒本来就没意义）。
+  - `send()` 只负责起线程就返回，界面不等它；`_work()` 里把异常全兜住——子线程里漏出去的
+    异常没人接，连提示都没有。
+  - 结果不回弹窗，只写状态栏：成功那句由 `notifier` 自己给（`NOTIFY_OK_TEXT`），
+    失败由 `app.OnNotifyFailed` 加个前缀、在控制台打一行留痕。
+  - **HTTP 200 不等于发出去了**：企业微信的失败是包在响应体里的（`errcode != 0`），
+    所以 `_post_wecom` 必须把 `errcode` 也验一遍。
 - 跨线程的信号是**排队投递**的，所以测试里光 `sleep` 等不到，得转事件循环
   （`tests/conftest.py` 的 `wait_until` / `join_thread` 两个 fixture 就是干这个的）。
 
@@ -291,6 +315,7 @@ data/watchlist.txt
 | 配置里写了 `inf` / `nan`、模板不是 http(s) 链接 | 该项退回默认值并打印一条警告，其他配置照常生效 |
 | 成交时间是认不出的格式（如绝对日期、错别字） | 照旧显示原文，只是不高亮 |
 | 配置里的高亮色认不出来（如 `orangejuice`） | 退回默认橙色并打印提示，不会静默变成「高亮没生效」 |
+| 推送发不出去（网络、webhook 被删、地址填错） | 控制台打一行带原因，状态栏在后面接一句「企业微信推送失败：…」；**不弹窗**，抓取结果照旧 |
 
 留痕的路子是同一个：`store` 和 `links` 的公开操作都收一个 `notes` 列表（不传就只静默降级），
 模块往里面 append，`app` 取走后拼成一句话送进状态栏。区别是 `store` 自己持有 `notes`
@@ -355,6 +380,7 @@ pixi run test           # 等价于 pixi run python -m pytest
 | [tests/test_client.py](../tests/test_client.py) | 请求形态与各类失败的统一出口 |
 | [tests/test_config.py](../tests/test_config.py) | 配置优先级与逐项校验 |
 | [tests/test_links.py](../tests/test_links.py) | 清单解析、去重、规范化回写 |
+| [tests/test_notifier.py](../tests/test_notifier.py) | 企业微信报文、`errcode` 判定、地址校验与脱敏、发送线程回信号 |
 | [tests/test_parser.py](../tests/test_parser.py) | 响应解析与全路径判空 |
 | [tests/test_store.py](../tests/test_store.py) | 缓存随清单增删、设置项、损坏自愈 |
 | [tests/test_theme.py](../tests/test_theme.py) | 样式表、占位文字配色、系统深浅色判断 |
@@ -391,6 +417,8 @@ pixi run shot           # 出图在 tmp/out/，每个场景深色/浅色各一�
 | 清单接受的写法 | `links.parse_line()` / `_split_fields()` |
 | 收藏的写回、回滚与星标 | 交互在 `app.ToggleFavorite()`；清单那段在 `links.parse_line()` / `_strip_favorite()`，缓存那列由 `store.sync()` / `set_favorite()` 写，星标颜色在 `theme.favorite_color()` |
 | 自动抓取的间隔、范围与总结开关 | `data/config.toml` 的 `auto_poll_*` 四项，校验在 `config.py`；调度在 `app.ScheduleAutoPoll()` / `OnAutoPoll()` / `AutoPollTasks()` |
+| 企业微信推送的开关、地址、限流 | `data/config.toml` 的 `notify_*` 八项，校验在 `config.py`；正文在 `app.BuildNotifyMarkdown()`，发送在 `notifier.py` |
+| 推送消息长什么样 | `app.BuildNotifyMarkdown()`（分块与超长截断）+ `notifier._post_wecom()`（报文格式）；改完看 `status-notify*` 场景出图 |
 | 相对时间的单位表 | `parser._RELATIVE_UNITS` |
 
 ## 相关文档

@@ -475,6 +475,50 @@ def _main(dark):
     return window
 
 
+def _status_window(dark):
+    """真窗口，状态栏那行字留给调用方去写。
+
+    不 resize：就用 MainWindow 自己的默认尺寸（1500x900）。这条状态栏跟七个按钮
+    挤在同一行，能显示多少字全看窗口多宽——要判断「这段话放不放得下」，得照着
+    用户打开时看到的那个尺寸量（跟 main 场景特意缩到 1280 的用意不同）。
+    """
+    import app
+    import links
+
+    window = app.MainWindow()
+    window.ApplyTheme(dark)
+    path = links.default_watchlist_path()
+    if os.path.exists(path):
+        window.LoadWatchlist(path)
+    return window
+
+
+@scene("status-notify")
+def _status_notify(dark):
+    """推送成功：状态栏那行字的样子（这句是常态，得看着不刺眼）。"""
+    import notifier
+
+    window = _status_window(dark)
+    window.OnNotifySent(notifier.NOTIFY_OK_TEXT)
+    return window
+
+
+@scene("status-notify-long")
+def _status_notify_long(dark):
+    """推送失败、原因又很长：看省略号收在哪儿，以及按钮行有没有被顶宽。
+
+    走真入口 OnNotifyFailed，而不是自己往标签里塞一段长文本：省略是
+    StatusLabel 干的（见 app.StatusLabel），另造一份就看不到真实效果了。
+    """
+    window = _status_window(dark)
+    window.OnNotifyFailed(
+        "网络请求失败: HTTPSConnectionPool(host='qyapi.weixin.qq.com', port=443): "
+        "Max retries exceeded with url: /cgi-bin/webhook/send?key=*** "
+        "(Caused by ConnectTimeoutError(...: Read timed out. (read timeout=10)))"
+    )
+    return window
+
+
 # ---------------- 渲染 ----------------
 
 # offscreen 平台插件在 Windows 上不带字体库（QFontDatabase().families() 是空的），
