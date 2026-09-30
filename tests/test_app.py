@@ -723,6 +723,193 @@ def test_refresh_keeps_expected_price(window):
     ]
 
 
+# ---------------- 收藏 ----------------
+
+
+def _favorite_cell(w, row=0):
+    return w.table.item(row, app_module.COL_FAVORITE)
+
+
+def _file_favorite(path):
+    """清单文件里第一行的收藏标记。"""
+    return links.load_links(path)[0].favorite
+
+
+def test_favorite_cell_states(window):
+    """收藏格两态：收藏了实心黄星，没收藏空心灰星，提示语也跟着换。"""
+    w = window("10000008780 | 甲 | *\n10000008781 | 乙\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    on = _favorite_cell(w, 0)
+    assert on.text() == app_module.FAVORITE_ON_TEXT
+    assert on.toolTip() == app_module.FAVORITE_ON_TIP
+    assert on.foreground().color().name() == theme.favorite_color(w.dark, True).name()
+
+    off = _favorite_cell(w, 1)
+    assert off.text() == app_module.FAVORITE_OFF_TEXT
+    assert off.toolTip() == app_module.FAVORITE_OFF_TIP
+    assert off.foreground().color().name() == theme.favorite_color(w.dark, False).name()
+
+
+def test_favorite_off_star_is_the_muted_colour(window):
+    """没收藏的空心星跟「原价」同色：一屏里它占大多数，不该比商品名还显眼。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    assert _favorite_cell(w).foreground().color().name() == theme.muted_color(w.dark).name()
+
+
+def test_favorite_cell_follows_theme(window):
+    """两套主题的星色不一样，换主题要重画，别停在旧主题那档上。"""
+    w = window("10000008780 | 甲 | *\n10000008781 | 乙\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    before = (_favorite_cell(w, 0).foreground().color().name(),
+              _favorite_cell(w, 1).foreground().color().name())
+    w.OnToggleTheme()
+    after = (_favorite_cell(w, 0).foreground().color().name(),
+             _favorite_cell(w, 1).foreground().color().name())
+
+    assert after == (theme.favorite_color(w.dark, True).name(),
+                     theme.favorite_color(w.dark, False).name())
+    assert after != before
+
+
+def test_favorite_header_tooltip_explains_the_click(window):
+    """表头说清楚这一格是能点的，也顺带告诉人文件里那一段长什么样。"""
+    w = window()
+    tip = w.table.horizontalHeaderItem(app_module.COL_FAVORITE).toolTip()
+    assert "单击" in tip and "收藏" in tip
+
+
+def test_click_favorite_cell_toggles_and_writes_back(window):
+    """单击收藏格：星标、清单文件、进度条三者一起跟上。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.OnCellClick(0, app_module.COL_FAVORITE)
+
+    assert w.rows[0]["entry"].favorite is True
+    assert _favorite_cell(w).text() == app_module.FAVORITE_ON_TEXT
+    assert _file_favorite(w.watchlist_path) is True
+    assert "已加入收藏" in w.progress_label.text()
+
+    w.OnCellClick(0, app_module.COL_FAVORITE)
+
+    assert w.rows[0]["entry"].favorite is False
+    assert _favorite_cell(w).text() == app_module.FAVORITE_OFF_TEXT
+    assert _file_favorite(w.watchlist_path) is False
+    assert "已取消收藏" in w.progress_label.text()
+
+
+def test_click_favorite_cell_writes_cache(window):
+    """缓存里那一列也跟着改：关掉程序再开时它要跟清单对得上。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.OnCellClick(0, app_module.COL_FAVORITE)
+    assert w.store.get_item("10000008780")["favorite"] == 1
+
+    w.OnCellClick(0, app_module.COL_FAVORITE)
+    assert w.store.get_item("10000008780")["favorite"] == 0
+
+
+def test_click_other_cells_does_not_toggle_favorite(window):
+    """单击别的格子不该顺手收藏——第一列贴着图片列，误点很容易。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.OnCellClick(0, app_module.COL_IMG)
+    w.OnCellClick(0, app_module.COL_NAME)
+
+    assert w.rows[0]["entry"].favorite is False
+    assert _file_favorite(w.watchlist_path) is False
+
+
+def test_favorite_can_be_toggled_while_fetching(window):
+    """抓取中也允许点：收藏只是 entry 上的一个 bool，跟轮询任务不搭界。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.SetBusy(True)
+
+    w.OnCellClick(0, app_module.COL_FAVORITE)
+
+    assert w.rows[0]["entry"].favorite is True
+    assert _file_favorite(w.watchlist_path) is True
+    assert not w.btn_add.isEnabled()  # 别的清单操作确实还灰着
+
+
+def test_favorite_rolls_back_when_watchlist_write_fails(window, monkeypatch):
+    """写清单失败就把表格和缓存一起退回去，不留「星亮着、文件里没有」的分叉。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    monkeypatch.setattr(
+        links, "save_watchlist", lambda *a, **k: (_ for _ in ()).throw(OSError("磁盘满"))
+    )
+
+    w.OnCellClick(0, app_module.COL_FAVORITE)
+
+    assert w.rows[0]["entry"].favorite is False  # 退回原值
+    assert _favorite_cell(w).text() == app_module.FAVORITE_OFF_TEXT
+    assert w.store.get_item("10000008780")["favorite"] == 0
+
+
+def test_favorite_rolls_back_to_on_when_unfavoriting_fails(window, monkeypatch):
+    """取消收藏时写盘失败也一样回滚：星还得亮着，跟文件里那份对上。"""
+    w = window("10000008780 | 甲 | *\n")
+    w.LoadWatchlist(w.watchlist_path)
+    monkeypatch.setattr(
+        links, "save_watchlist", lambda *a, **k: (_ for _ in ()).throw(OSError("磁盘满"))
+    )
+
+    w.OnCellClick(0, app_module.COL_FAVORITE)
+
+    assert w.rows[0]["entry"].favorite is True
+    assert _favorite_cell(w).text() == app_module.FAVORITE_ON_TEXT
+    assert w.store.get_item("10000008780")["favorite"] == 1
+
+
+def test_toggle_favorite_ignores_out_of_range_row(window):
+    """行号越界（比如点空白处）直接返回 False，不抛异常。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    assert w.ToggleFavorite(5) is False
+
+
+def test_load_watchlist_syncs_favorite_into_cache(window):
+    """启动时清单里的收藏要写进缓存，界面上那份也是从清单读的。"""
+    w = window("10000008780 | 甲 | *\n10000008781 | 乙\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    assert w.store.get_item("10000008780")["favorite"] == 1
+    assert w.store.get_item("10000008781")["favorite"] == 0
+
+
+def test_refresh_keeps_favorite(window):
+    """刷新列表会重写整个文件，收藏标记不能在这一步丢掉。"""
+    w = window("10000008780 | 甲 | 50\n10000008781 | 乙\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnCellClick(1, app_module.COL_FAVORITE)
+
+    w.OnRefreshList()
+
+    assert [(e.cluster_id, e.favorite) for e in links.load_links(w.watchlist_path)] == [
+        ("10000008780", False),
+        ("10000008781", True),
+    ]
+
+
+def test_favorite_survives_fetch_result(window):
+    """抓完一轮重画整行，收藏是从 entry 拿的，不会被抓取结果冲掉。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnCellClick(0, app_module.COL_FAVORITE)
+
+    w.OnResultReady(0, result_ok(price="¥44"))
+
+    assert _favorite_cell(w).text() == app_module.FAVORITE_ON_TEXT
+    assert w.rows[0]["entry"].favorite is True
+
+
 # ---------------- 近30天均价 ----------------
 
 

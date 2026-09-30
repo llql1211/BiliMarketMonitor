@@ -85,13 +85,14 @@ ZOOM_MAX = 4.0    # 最多放到铺满的 4 倍；720 的图再往上就是马�
 
 ROW_NUMBER_PADDING = 16  # 序号槽左右留白，免得数字贴着分隔线
 
+COL_FAVORITE = 0
 COL_IMG, COL_NAME, COL_CID, COL_PRICE, COL_LOW, COL_EXPECT, COL_REF, COL_AVG = (
-    0, 1, 2, 3, 4, 5, 6, 7
+    1, 2, 3, 4, 5, 6, 7, 8
 )
-COL_DEAL_BASE = 8  # 成交① 占 8/9/10 三列
-COL_LINK = 11
-HEADERS = ["图片", "商品名", "ID", "现价", "史低价", "预期价", "原价", "近30天均价",
-           "成交1", "成交2", "成交3", "链接"]
+COL_DEAL_BASE = 9  # 成交① 占 9/10/11 三列
+COL_LINK = 12
+HEADERS = ["收藏", "图片", "商品名", "ID", "现价", "史低价", "预期价", "原价",
+           "近30天均价", "成交1", "成交2", "成交3", "链接"]
 
 PENDING_TEXT = "…"      # 等待抓取
 NO_DATA_TEXT = "—"      # 无数据
@@ -116,6 +117,17 @@ EDIT_EXPECTED_TIP = "双击修改预期价格"
 AVG_HEADER_TIP = (
     "接口给的近 30 天成交均价\n"
     "现价比它低时，这一格会变绿加粗——说明这会儿买比最近一个月都划算"
+)
+
+# 「收藏」列（用户自己打的标记，存在 watchlist.txt 里）
+FAVORITE_ON_TEXT = "★"
+FAVORITE_OFF_TEXT = "☆"
+FAVORITE_ON_TIP = "点击取消收藏"
+FAVORITE_OFF_TIP = "点击加入收藏"
+FAVORITE_HEADER_TIP = (
+    "自己打的收藏标记：单击这一格切换\n"
+    "收藏的商品是实心黄星（☆ -> ★），没收藏的是空心灰星\n"
+    "存在 watchlist.txt 里（行尾那段 | *），跟着清单一起备份，抓取动不了它"
 )
 
 # 「史低价」列
@@ -1552,6 +1564,8 @@ class MainWindow(QMainWindow):
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
         self.table.setIconSize(QSize(IMAGE_SIZE, IMAGE_SIZE))
+        # 收藏那列只放一颗星：30 够「★」加左右留白了，宽了也是白占商品名的地
+        header.resizeSection(COL_FAVORITE, 30)
         header.resizeSection(COL_IMG, IMAGE_SIZE + 8)
         # 要放得下「¥6.56 ↓0.73 · 1件」这种：现价、涨跌、剩余件数三截并排。
         # 190 是照更长的旧写法量的（那时最长的两种量到 173 和 203）；现在的写法去掉
@@ -1577,6 +1591,7 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeaderItem(COL_LINK).setToolTip(
             f"点击「打开」用浏览器访问商品详情页\n链接由配置里的模板拼出：\n{template}"
         )
+        self.table.horizontalHeaderItem(COL_FAVORITE).setToolTip(FAVORITE_HEADER_TIP)
         self.table.horizontalHeaderItem(COL_LOW).setToolTip(LOWEST_HEADER_TIP)
         self.table.horizontalHeaderItem(COL_EXPECT).setToolTip(EXPECTED_HEADER_TIP)
         self.table.horizontalHeaderItem(COL_AVG).setToolTip(AVG_HEADER_TIP)
@@ -1617,7 +1632,7 @@ class MainWindow(QMainWindow):
         # 那几行会被写没），见 OnRefreshList
         self.last_unparsed = stats.get("unparsed", 0)
         added, removed = self.store.sync(
-            [(e.cluster_id, e.name) for e in entries]
+            [(e.cluster_id, e.name, e.favorite) for e in entries]
         )
         # store.notes 每次操作都会重置，必须紧接着读；下面 RebuildRows 会查缓存
         self.last_note = self.Note(notes, self.store.notes)
@@ -1639,6 +1654,10 @@ class MainWindow(QMainWindow):
         values         本次运行抓到的结果，表格重建时用来保留已显示的数据
         delta          本次抓取相比上次缓存价格的涨跌 (文本, 变化量)，没得比就是 None
         price_cleared  这一行在本次抓取里还没轮到，价格格留成「--」
+
+        收藏以清单为准（entry.favorite），缓存里那份（record["favorite"]）只是
+        备份——sync 已经把清单的收藏推进缓存了，两边平时一致；不一致时（手改过
+        库、缓存坏了重建）该信清单，它是用户意图的家。
         """
         return {
             "entry": entry,
@@ -1799,6 +1818,39 @@ class MainWindow(QMainWindow):
         )
         return True
 
+    def ToggleFavorite(self, row):
+        """单击收藏格：切换这一行的收藏标记，写缓存、写清单；写文件失败就回滚。
+
+        抓取中也允许点（SetBusy 不动）：收藏只是 entry 上的一个 bool，
+        PollerThread 手里的任务排的是"第几行抓哪件商品"，跟它没有关系；
+        写清单又是原子的（见 links.save_watchlist），不会写出一行半截的清单。
+
+        回滚的路子跟 SetExpectedPrice 一样，两边都退回去：缓存先写了一笔，
+        文件没写成的话也一并撤掉，免得留一份"缓存说收藏、清单说没有"的分叉
+        ——清单才是收藏的家，下次 sync 本来也会把缓存掰回来，但那之前显示的是
+        哪一份就得靠人去猜了。
+        """
+        if not 0 <= row < len(self.rows):
+            return False
+        entry = self.rows[row]["entry"]
+        before = entry.favorite
+        entry.favorite = not before
+        self.SetFavoriteCell(row, self.rows[row])
+
+        self.store.set_favorite(entry.cluster_id, entry.favorite)
+        if not self.SaveWatchlist():
+            entry.favorite = before
+            self.store.set_favorite(entry.cluster_id, before)
+            self.SetFavoriteCell(row, self.rows[row])
+            return False
+
+        what = "已加入收藏" if entry.favorite else "已取消收藏"
+        self.progress_label.setText(
+            f"「{entry.name or entry.cluster_id}」{what}，已写回 watchlist.txt"
+            + self.last_note
+        )
+        return True
+
     def PreviewRow(self, row):
         """打开某行的商品大图。这一行还没有缩略图时只在状态栏说一声。"""
         url = self.row_images.get(row)
@@ -1860,6 +1912,28 @@ class MainWindow(QMainWindow):
         if color is not None:
             item.setForeground(QBrush(color))
         return item
+
+    def FavoriteCell(self, favorite):
+        """「收藏」格：一颗实心（收藏）/ 空心（没收藏）的星，单击切换。
+
+        星是当文本画的，不是图标：一个字符跟着字体走，深浅两套主题也不必各备
+        一张图。颜色分两档（见 theme.favorite_color）——实心那颗是黄星，空心
+        那颗用弱化色，免得一屏的空心星比商品名还抢眼。
+
+        提示跟着状态走：这一格能点，得让人知道点下去是加还是删。
+        """
+        return self.MakeCell(
+            FAVORITE_ON_TEXT if favorite else FAVORITE_OFF_TEXT,
+            tooltip=FAVORITE_ON_TIP if favorite else FAVORITE_OFF_TIP,
+            align=Qt.AlignCenter,
+            color=theme.favorite_color(self.dark, bool(favorite)),
+        )
+
+    def SetFavoriteCell(self, row, item):
+        """只重画这一行的收藏格（点了星、或写文件失败回滚时用）。"""
+        self.table.setItem(
+            row, COL_FAVORITE, self.FavoriteCell(item["entry"].favorite)
+        )
 
     def PriceText(self, price, sold_out) -> str:
         """「现价」格的文本。
@@ -2121,6 +2195,7 @@ class MainWindow(QMainWindow):
 
         self.table.setItem(row, COL_CID, self.MakeCell(cluster_id))
 
+        self.SetFavoriteCell(row, item)
         self.SetPriceCells(row, item)
         self.SetDealCells(row, item)
 
@@ -2207,9 +2282,15 @@ class MainWindow(QMainWindow):
             values = item["values"] or {}
             record = item["record"] or {}
             name = (values.get("name") or record.get("name") or item["entry"].name or "")
-            # 预期价跟着行走：清单是它的家（见 links 模块的说明），改过就得写回去
+            # 预期价和收藏跟着行走：清单是它们的家（见 links 模块的说明），
+            # 这两段都只在用户设过时才写出去（见 links.save_watchlist）
             items.append(
-                (item["entry"].cluster_id, name, item["entry"].expected_price)
+                (
+                    item["entry"].cluster_id,
+                    name,
+                    item["entry"].expected_price,
+                    item["entry"].favorite,
+                )
             )
         notes = []
         try:
@@ -2232,16 +2313,18 @@ class MainWindow(QMainWindow):
         for line in dialog.text().splitlines():
             if not line.strip() or line.strip().startswith("#"):
                 continue  # 空行 / 注释行
-            cluster_id, name, expected_price = links.parse_line(line)
+            cluster_id, name, expected_price, favorite = links.parse_line(line)
             if cluster_id is None:
                 invalid += 1
                 continue
             if cluster_id in seen:  # 同一批里重复的只留第一条
                 continue
             seen.add(cluster_id)
-            # 粘进来的行里带了第三段（预期价）就一并收下，跟清单里是同一套格式
+            # 粘进来的行里带了后两段（预期价、收藏）就一并收下，跟清单里是同一套格式
             entries.append(
-                links.LinkEntry(cluster_id, name, expected_price, line.strip())
+                links.LinkEntry(
+                    cluster_id, name, expected_price, line.strip(), favorite
+                )
             )
 
         if not entries:
@@ -2263,7 +2346,9 @@ class MainWindow(QMainWindow):
         self.watch_entries.extend(new_entries)
         for entry in new_entries:
             self.rows.append(self.MakeRow(entry))
-        self.store.sync([(e.cluster_id, e.name) for e in self.watch_entries])
+        self.store.sync(
+            [(e.cluster_id, e.name, e.favorite) for e in self.watch_entries]
+        )
         self.RenderTable()
         self.SaveWatchlist()
         self.progress_label.setText(
@@ -2640,10 +2725,13 @@ class MainWindow(QMainWindow):
         self.summary_dialog.show()
 
     def OnCellClick(self, row, col):
+        """单击：收藏格切换收藏，「链接」格开浏览器，其余格子（选中、拖拽）不理会。"""
         if col == COL_LINK:
             url = self.row_urls.get(row)
             if url:
                 webbrowser.open(url)
+        elif col == COL_FAVORITE:
+            self.ToggleFavorite(row)
 
     # ---------------- 主题 ----------------
 

@@ -121,7 +121,33 @@ def seed_expected_prices():
         entry.expected_price = _amount(price * factor)
 
     links.save_watchlist(
-        path, [(e.cluster_id, e.name, e.expected_price) for e in entries]
+        path,
+        [(e.cluster_id, e.name, e.expected_price, e.favorite) for e in entries],
+    )
+
+
+def seed_favorites(rows=(0, 2)):
+    """给沙盒清单里几行打上收藏，好让表格场景里实心星和空心星并排出现。
+
+    只给两行（隔开一点）是有意的：一列全是实心或全是空心，看不出一屏里两种
+    颜色搭起来协不协调——空心那颗本来就是给"大多数"用的，得跟实心的摆在一起
+    才知道够不够安静。
+
+    只动沙盒副本，真实清单一个字都不改（跟 seed_expected_prices 同一个出发点）。
+    """
+    import links
+
+    path = links.default_watchlist_path()
+    if not os.path.exists(path):
+        return
+    entries = links.load_links(path)
+
+    for row in rows:
+        if row < len(entries):
+            entries[row].favorite = True
+    links.save_watchlist(
+        path,
+        [(e.cluster_id, e.name, e.expected_price, e.favorite) for e in entries],
     )
 
 
@@ -495,6 +521,7 @@ def main(argv):
     use_sandbox(Path(args.data) if args.data else SOURCE_DATA, SANDBOX, args.keep)
     seed_expected_prices()
     seed_lowest_prices()
+    seed_favorites()
     out.mkdir(parents=True, exist_ok=True)
 
     for name in sorted(wanted):

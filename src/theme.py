@@ -35,6 +35,11 @@ PRICE_DOWN_COLOR_LIGHT = "#1a7f37"
 PRICE_UP_COLOR_DARK = "#ff7b72"
 PRICE_DOWN_COLOR_DARK = "#3fb950"
 
+# 收藏那格的实心星色：黄。深浅各一档——浅色底下偏亮的黄在白底上会糊掉，
+# 暗色底下偏暗的黄又沉进背景里，两边都得挑一档才看得清。
+FAVORITE_COLOR_LIGHT = "#d99500"
+FAVORITE_COLOR_DARK = "#f0c419"
+
 DARK_QSS = """
 QWidget {
     background-color: #1e1f22;
@@ -232,6 +237,17 @@ def below_average_color(dark: bool) -> QColor:
     颜色本身仍然只有 PRICE_DOWN_COLOR 一处定义，改配色时不会漏掉这一格。
     """
     return price_delta_color(-1, dark)
+
+
+def favorite_color(dark: bool, filled: bool) -> QColor:
+    """「收藏」那格的星色：收藏了给实心黄星，没收藏给空心灰星。
+
+    空心那颗用 muted_color：它跟「原价」「没到价的预期价」是同一档——"有就行、
+    别抢眼"。一屏里没收藏的空心星占大多数，不该比商品名还显眼。
+    """
+    if not filled:
+        return muted_color(dark)
+    return QColor(FAVORITE_COLOR_DARK if dark else FAVORITE_COLOR_LIGHT)
 
 
 def lowest_color(dark: bool) -> QColor:
