@@ -260,6 +260,15 @@ def lowest_color(dark: bool) -> QColor:
     return price_delta_color(-1, dark)
 
 
+def error_color(dark: bool) -> QColor:
+    """表单里出错提示的颜色：跟「涨」同一个红。
+
+    单写一个函数只是让调用处读的是「出错」而不是「涨了」——颜色本身仍然只有
+    PRICE_UP_COLOR_* 一处定义（与 lowest_color 一个路子）。
+    """
+    return price_delta_color(1, dark)
+
+
 def style_placeholder(widget, dark: bool):
     """给输入框的占位文字（灰字）上色。
 

@@ -519,6 +519,53 @@ def _status_notify_long(dark):
     return window
 
 
+def _settings_dialog(dark, section, **overrides):
+    """造一个设置窗口并翻到指定那页。
+
+    值一律从 config.DEFAULTS 起，**不经过 MainWindow**：沙盒里的 config.toml 是
+    用户的真配置，里头可能躺着真的 webhook——那等于群的发送权限，绝不能进 PNG。
+    所以下面几个场景里的 webhook 也是编的地址，别改成去读真配置。
+    """
+    import config
+    import settings
+
+    values = dict(config.DEFAULTS)
+    values[settings.THEME_KEY] = dark
+    values.update(overrides)
+    dialog = settings.SettingsDialog(values, dark)
+    dialog.tabs.setCurrentIndex(dialog.section_index[section])
+    _KEEP.append(dialog)  # 场景返回的窗口一被回收，图也就没了
+    return dialog
+
+
+@scene("settings-basic")
+def _settings_basic(dark):
+    """「基本设置」页：标签、输入框、圈「？」三列并排，宽度和圈的大小都在这儿看。"""
+    return _settings_dialog(dark, "basic")
+
+
+@scene("settings-auto")
+def _settings_auto(dark):
+    """「定时抓取」页：复选框、输入框、下拉框三种控件混排的样子。"""
+    return _settings_dialog(dark, "auto")
+
+
+@scene("settings-notify")
+def _settings_notify(dark):
+    """「企业微信推送」页：长地址的输入框 + 底下那组「通知内容设置」。
+
+    webhook 里填的是编的地址，只是为了看清框有多宽——真地址不会出现在这里。
+    """
+    return _settings_dialog(
+        dark,
+        "notify",
+        notify_wecom_webhook=(
+            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=示例地址-别用真的"
+        ),
+        notify_on_favorite_lowest=True,
+    )
+
+
 # ---------------- 渲染 ----------------
 
 # offscreen 平台插件在 Windows 上不带字体库（QFontDatabase().families() 是空的），
