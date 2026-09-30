@@ -77,19 +77,24 @@ data/watchlist.txt
       │                    ▼
       │           把已知的名字、缩略图、上次价格先摆上表格（不用等网络）
       │
-      │  点「开始抓取」（或 F5）
+      │  点「开始抓取」（或 F5）／自动抓取到点
       ▼
   PollerThread（子线程，依次、非并发）
       │  client.fetch_cluster()      发请求，失败重试 1 次
       │  parser.parse_cluster()      判空提取字段
       ▼
    信号回主线程 ──► 刷新表格 + store.upsert_item() 写缓存
-                    └► links.save_watchlist()  学到了新名字才回写清单
+                    ├► links.save_watchlist()  学到了新名字才回写清单
+                    └► OnPollFinished 收尾，顺手挂下一拍自动抓取
 ```
 
 - **配置只在启动时读一次**（`MainWindow.__init__` 里的 `config.load_config()`），
   之后拼详情页链接、轮询间隔、重试间隔、超时、高亮阈值与颜色都以它为准。
-  改配置要重启程序。
+  改配置要重启程序。自动抓取那四项（`auto_poll_*`）也一样，改完必须重启。
+- **自动抓取和手动抓取走同一条路**：`OnAutoPoll` 只是按 `auto_poll_scope` 从 `self.rows`
+  里挑出一批任务，然后调**同一个** `StartFetch`，之后的事（线程、进度、写缓存、回写清单）
+  完全没有分叉。唯一的区别是 `MainWindow.fetch_source` 记着这轮是谁发起的，
+  它决定状态栏的措辞（`查询中 3/12` / `自动抓取（收藏）3/12`）和跑完弹不弹总结。
 - **清单是唯一的跟踪标准**，缓存只是加速层。所以缓存丢了、坏了都能重新抓回来，
   而清单里的东西是不可再生的（尤其是预期价，那是抓不回来的用户意图）。
 - **每个改动了清单的动作都会立刻写回**：添加、删除选中、拖动排序、双击改预期价、
@@ -120,6 +125,18 @@ data/watchlist.txt
   信号里带的是调用方自己认的 key（缩略图用行号，双击预览用请求号），对不上就丢掉。
   下载失败发 `failed` 而不是静默丢弃——大图下不下来得跟用户说一声，缩略图那边不接这个信号，
   等于照旧不吭声。
+- **`auto_poll_timer(QTimer)`**：自动抓取的节拍器，跑在**主线程**，它不是线程、也不发网络请求，
+  到点只是在主线程里把一批任务交给 `PollerThread`——网络那部分照旧在子线程。
+  - **单次触发 + 每轮收尾重挂**，不用周期定时器。周期定时器每一拍都不管上一轮跑没跑完，
+    撞上正在抓取的那一拍就得额外写「跳过这一拍，但别忘了挂下一拍」；单次触发的语义天然就是
+    「上一轮结束到下一轮开始」，间隔因此从上一轮**结束**算起，慢轮次只会把下一轮往后推。
+  - **重挂点在 `OnPollFinished`，三条收尾路径都要经过**：正常跑完、学到了新名字、用户中途
+    「停止抓取」。定时器是单次触发的，这一拍用完就空了，漏挂一次自动抓取就**悄悄停了**——
+    尤其是用户按「停止抓取」那次，他只是不要这一轮，不是不要整个功能。
+  - **正在抓取时不重挂**：`OnAutoPoll` 撞上 `IsPolling()` 就直接 return，等正在跑的那轮收尾
+    时统一挂。范围里一件商品都没有时也不发请求，写一句状态栏提示就重挂，否则会变成空转。
+  - **关掉时 `ScheduleAutoPoll()` 什么都不做**，定时器就此空着，`closeEvent` 里再 `stop()`
+    一次收尾。
 - 跨线程的信号是**排队投递**的，所以测试里光 `sleep` 等不到，得转事件循环
   （`tests/conftest.py` 的 `wait_until` / `join_thread` 两个 fixture 就是干这个的）。
 
@@ -373,6 +390,7 @@ pixi run shot           # 出图在 tmp/out/，每个场景深色/浅色各一�
 | 史低价的只降不升规则 | `app.updated_lowest()` / `at_lowest()`；存的那一列在 `store.ITEM_COLUMNS` |
 | 清单接受的写法 | `links.parse_line()` / `_split_fields()` |
 | 收藏的写回、回滚与星标 | 交互在 `app.ToggleFavorite()`；清单那段在 `links.parse_line()` / `_strip_favorite()`，缓存那列由 `store.sync()` / `set_favorite()` 写，星标颜色在 `theme.favorite_color()` |
+| 自动抓取的间隔、范围与总结开关 | `data/config.toml` 的 `auto_poll_*` 四项，校验在 `config.py`；调度在 `app.ScheduleAutoPoll()` / `OnAutoPoll()` / `AutoPollTasks()` |
 | 相对时间的单位表 | `parser._RELATIVE_UNITS` |
 
 ## 相关文档
