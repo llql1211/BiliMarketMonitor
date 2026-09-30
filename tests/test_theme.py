@@ -73,6 +73,22 @@ def test_dark_qss_paints_the_summary_editor_like_the_input_box():
     ), "QTextEdit 没跟着 QPlainTextEdit 一起配色"
 
 
+def test_dark_qss_paints_the_tab_bar_itself():
+    """设置窗口的页签得自己上色，不能交给原生样式。
+
+    页签是子控件：样式表里不写它，就由原生样式（Windows 那套）用自己的浅色
+    画底，而字色照 QWidget 那层走 #e3e3e3——深色下成了白底白字，看不清。
+    量过：写不写这几条，同一个窗口在 Fusion 与 windowsvista 下画出来的颜色不一样。
+    """
+    rules = {
+        "没选中的页签": r"QTabBar::tab\s*\{[^}]*background-color:\s*#2f3136",
+        "选中的页签": r"QTabBar::tab:selected\s*\{[^}]*background-color:\s*#1e1f22",
+        "页签条那一圈边框": r"QTabWidget::pane\s*\{[^}]*border:",
+    }
+    for what, pattern in rules.items():
+        assert re.search(pattern, theme.DARK_QSS), f"{what}没自己上色，会由原生样式画"
+
+
 @pytest.mark.parametrize("dark", [True, False])
 def test_apply_theme_sets_app_stylesheet(qapp, dark):
     """apply_theme 把对应 QSS 落到整个应用上。"""

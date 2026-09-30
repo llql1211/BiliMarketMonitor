@@ -72,6 +72,34 @@ QTableCornerButton::section {
     background-color: #2f3136;
     border: none;
 }
+QTabWidget::pane {
+    /* 内容区那一圈边框。不写的话由原生样式自己画，颜色跟暗色对不上 */
+    border: 1px solid #3a3c42;
+    top: -1px;  /* 页签压住上面那条线，接缝处不留双线 */
+}
+QTabBar::tab {
+    /* 页签是子控件，拿不到 QWidget 那层的底色，而是由原生样式（Windows 那套）
+       自己画成浅色；字色却照 QWidget 走 #e3e3e3，于是深色下成了白底白字。
+       这里显式给全底色和字色，样式表一旦接手，原生样式就不画了 */
+    background-color: #2f3136;
+    color: #c9cbd1;
+    padding: 6px 16px;
+    border: 1px solid #3a3c42;
+    border-bottom: none;
+    border-top-left-radius: 4px;
+    border-top-right-radius: 4px;
+    margin-right: 2px;
+}
+QTabBar::tab:selected {
+    background-color: #1e1f22;  /* 跟内容区同色，看着是一整页 */
+    color: #e3e3e3;
+}
+QTabBar::tab:hover:!selected {
+    background-color: #3d4046;
+}
+QTabBar::tab:!selected {
+    margin-top: 3px;  /* 没选中的矮一截，选中的那页像抽屉拉出来 */
+}
 QPushButton {
     background-color: #33353a;
     color: #e3e3e3;
