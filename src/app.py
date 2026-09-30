@@ -5,6 +5,7 @@
 2. 把能显示的数据（名称、缩略图、clusterID）摆上表格；
 3. 点「开始抓取」（或按 F5，两者等价）时逐个抓取价格，新商品连名称、缩略图一起抓；
    抓取过程中可以「暂停抓取」（两条商品之间生效）或「停止抓取」（已抓到的保留）。
+   也可以在 config.toml 里开自动抓取：按固定间隔自己跑，范围可限到收藏或售罄的商品。
 
 与旧版 src/App.py 的关键区别：轮询放在 QThread 子线程里做，
 通过信号槽把每条结果回传主线程刷新表格，避免界面假死。
@@ -19,7 +20,17 @@ import webbrowser
 from datetime import datetime
 
 import requests
-from PyQt5.QtCore import QEvent, QObject, QPoint, QRect, QSize, Qt, QThread, pyqtSignal
+from PyQt5.QtCore import (
+    QEvent,
+    QObject,
+    QPoint,
+    QRect,
+    QSize,
+    Qt,
+    QThread,
+    QTimer,
+    pyqtSignal,
+)
 from PyQt5.QtGui import (
     QBrush,
     QCursor,
@@ -129,6 +140,16 @@ FAVORITE_HEADER_TIP = (
     "收藏的商品是实心黄星（☆ -> ★），没收藏的是空心灰星\n"
     "存在 watchlist.txt 里（行尾那段 | *），跟着清单一起备份，抓取动不了它"
 )
+
+# 自动抓取（配置项见 config.DEFAULTS 的 auto_poll_* 四项）
+AUTO_SCOPE_LABELS = {"all": "全部", "favorite": "收藏", "sold_out": "售罄"}
+AUTO_POLL_OFF_TEXT = "自动：关"
+AUTO_POLL_LABEL_TIP = (
+    "自动抓取的状态，由 config.toml 里的 auto_poll_* 四项决定\n"
+    "间隔从上一轮结束算起，所以不会因为某轮抓得慢就把下一轮叠上来\n"
+    "关掉时显示「自动：关」，改完配置要重启程序"
+)
+AUTO_POLL_EMPTY_TEXT = "自动抓取：本次范围内没有商品，已跳过"
 
 # 「史低价」列
 LOWEST_HEADER_TIP = (
@@ -1469,8 +1490,16 @@ class MainWindow(QMainWindow):
         self.preview_seq = 0     # 大图请求号的发号器，一次一张，回包靠它认领
         self.previews = {}       # 未回来的大图请求号 -> (预览窗口, 图片地址)
         self.preview_images = {}  # 图片地址 -> 大图，看过的不再下一遍
+        # 自动抓取：单次触发的定时器，每轮收尾时重挂（见 ScheduleAutoPoll）。
+        # 不用周期定时器，是因为某一拍正撞上抓取时要额外写「跳过但别忘挂下一拍」，
+        # 而单次触发天然就是「上一轮结束到下一轮开始」
+        self.fetch_source = "manual"  # 这一轮是谁发起的：manual / auto
+        self.auto_poll_timer = QTimer(self)
+        self.auto_poll_timer.setSingleShot(True)
+        self.auto_poll_timer.timeout.connect(self.OnAutoPoll)
         self.InitUI()
         self.ApplyTheme(self.InitialDark())
+        self.ScheduleAutoPoll()  # 开了自动抓取就挂上第一拍；没开就什么都不做
 
     # ---------------- 界面 ----------------
 
@@ -1492,7 +1521,17 @@ class MainWindow(QMainWindow):
         )
         # 清单都没读进来（比如没有 watchlist.txt）时也得有句话，空着比不显示还费解
         self.UpdateUpdatedLabel()
-        layout.addWidget(self.updated_label)
+        # 自动抓取的状态跟它同一行、右对齐：也是「看一眼」的信息。本来打算搁在按钮行
+        # 的主题按钮旁，但那一行加上它就超出了默认窗口宽度（见
+        # test_updated_label_does_not_widen_the_window），这一行空着呢
+        self.auto_poll_label = QLabel()
+        self.auto_poll_label.setToolTip(AUTO_POLL_LABEL_TIP)
+        self.UpdateAutoPollLabel()
+        info_bar = QHBoxLayout()
+        info_bar.addWidget(self.updated_label)
+        info_bar.addStretch()
+        info_bar.addWidget(self.auto_poll_label)
+        layout.addLayout(info_bar)
 
         # 顶部按钮行
         btn_bar = QHBoxLayout()
@@ -2496,12 +2535,76 @@ class MainWindow(QMainWindow):
             return
         self.StartFetch([(i, self.rows[i]["entry"]) for i in rows])
 
-    def StartFetch(self, tasks):
+    # ---------------- 自动抓取 ----------------
+
+    def UpdateAutoPollLabel(self):
+        """刷新顶部那截自动抓取状态（关掉时只有「自动：关」）。"""
+        if not self.config["auto_poll_enabled"]:
+            self.auto_poll_label.setText(AUTO_POLL_OFF_TEXT)
+            return
+        minutes = self.config["auto_poll_interval_minutes"]
+        scope = AUTO_SCOPE_LABELS.get(self.config["auto_poll_scope"], "全部")
+        self.auto_poll_label.setText(f"自动：{minutes:g} 分钟 / {scope}")
+
+    def ScheduleAutoPoll(self):
+        """挂下一拍；没开自动抓取就什么都不做（定时器就此空着）。
+
+        单次触发 + 每轮收尾重挂，所以间隔指的是「上一轮结束到下一轮开始」，
+        某轮抓得慢只会让下一轮顺延，不会叠上来。
+        """
+        if not self.config["auto_poll_enabled"]:
+            return
+        # 至少 1 毫秒：config 只要求间隔大于 0，写成 0.0001 分钟的话 int() 会算成 0，
+        # 而 Qt 里 0 毫秒的意思是「尽快触发」，就成了空转
+        milliseconds = max(1, int(self.config["auto_poll_interval_minutes"] * 60_000))
+        self.auto_poll_timer.start(milliseconds)
+
+    def OnAutoPoll(self):
+        """自动抓取的那一拍：正在抓就跳过，没商品可抓就报一声再挂下一拍。"""
+        if self.IsPolling():
+            # 手动在抓，这一拍跳过。不在这儿重挂——正在跑的那轮收尾时会挂，
+            # 两边都挂的话定时器上会挂出两拍来
+            return
+        tasks = self.AutoPollTasks()
+        if not tasks:
+            self.progress_label.setText(AUTO_POLL_EMPTY_TEXT)
+            self.ScheduleAutoPoll()
+            return
+        self.StartFetch(tasks, source="auto")
+
+    def AutoPollTasks(self):
+        """本次自动抓取该抓哪几行：按 auto_poll_scope 从清单里筛。
+
+        售罄的判据取自缓存里上一轮的结果，刚加进来还没抓过的商品不算售罄，
+        所以「仅售罄」的范围要等抓过至少一轮才铺得开。
+        """
+        scope = self.config["auto_poll_scope"]
+        rows = []
+        for i, item in enumerate(self.rows):
+            if scope == "favorite" and not item["entry"].favorite:
+                continue
+            if scope == "sold_out" and not (item["record"] or {}).get("sold_out"):
+                continue
+            rows.append(i)
+        return [(i, self.rows[i]["entry"]) for i in rows]
+
+    def FetchProgressPrefix(self) -> str:
+        """状态栏那行字的开头：手动是「查询中」，自动则点明是自动、抓的是哪个范围。"""
+        if self.fetch_source != "auto":
+            return "查询中"
+        scope = self.config["auto_poll_scope"]
+        if scope == "all":
+            return "自动抓取"
+        return f"自动抓取（{AUTO_SCOPE_LABELS.get(scope, scope)}）"
+
+    def StartFetch(self, tasks, source="manual"):
         """两个抓取入口共用的起跑：复位本轮状态、清价、建轮询线程。
 
         tasks 为 [(行号, LinkEntry)]，可以只覆盖清单里的一部分（见 OnFetchNew）。
+        source 记下这轮是谁发起的（manual / auto），只影响状态栏文案与要不要弹总结。
         """
         self.last_note = ""  # 开始新的一轮抓取，不带着之前的降级提示
+        self.fetch_source = source
         self.names_learned = False
         self.poller_stopped = False
         self.run_changes = []  # 上一轮的变动和失败数不带到这一轮的总结里
@@ -2529,7 +2632,11 @@ class MainWindow(QMainWindow):
         self.poller.start()
 
     def OnProgress(self, current, total):
-        self.progress_label.setText(f"查询中 {current}/{total}")
+        prefix = self.FetchProgressPrefix()
+        # 开头带范围时后面不空格：「自动抓取（收藏）3/12」连着写更像一句话，
+        # 空一格会让人以为括号里那截是独立的一句
+        gap = "" if prefix.endswith("）") else " "
+        self.progress_label.setText(f"{prefix}{gap}{current}/{total}")
 
     @staticmethod
     def DealsElapsed(anchor) -> float:
@@ -2686,6 +2793,10 @@ class MainWindow(QMainWindow):
     def OnPollFinished(self):
         self.SetBusy(False)
         self.RestorePendingPrices()  # 没轮到的行别一直空着（停止抓取的也一样）
+        # 下一拍在这儿挂，三条收尾路径都要经过它：定时器是单次触发的，这一拍用完
+        # 就空了，漏挂一次自动抓取就悄悄停了——尤其是用户中途「停止抓取」那次，
+        # 他只是不想要这一轮，不是要把自动抓取关掉
+        self.ScheduleAutoPoll()
         if self.poller_stopped:
             self.progress_label.setText("已停止抓取，已抓到的结果保留")
             return
@@ -2697,9 +2808,19 @@ class MainWindow(QMainWindow):
                 self.progress_label.setText(
                     "完成，已把商品名写回 watchlist.txt" + self.last_note
                 )
-            self.ShowSummary()
+            self.MaybeShowSummary()
             return
         self.progress_label.setText("完成" + self.last_note)
+        self.MaybeShowSummary()
+
+    def MaybeShowSummary(self):
+        """这一轮该不该弹总结：手动抓取照旧弹，自动抓取按配置（默认不弹）。
+
+        自动抓取是没人看着的时候跑的，每半小时弹一个窗口只会把桌面糊满；
+        想看结果随时看表格就行，所以默认只有手动抓取才弹。
+        """
+        if self.fetch_source == "auto" and not self.config["auto_poll_show_summary"]:
+            return
         self.ShowSummary()
 
     def ShowSummary(self):
@@ -2753,6 +2874,7 @@ class MainWindow(QMainWindow):
         theme.install_tooltip_delay(app)
         # 次要信息跟着主题弱化（跟「原价」那格同一个色），别跟按钮抢眼
         self.updated_label.setStyleSheet(f"color: {theme.muted_color(dark).name()};")
+        self.auto_poll_label.setStyleSheet(f"color: {theme.muted_color(dark).name()};")
         self.btn_theme.setText("浅色模式" if dark else "暗色模式")
         self.btn_theme.setToolTip(
             "当前是暗色主题，点击切换为浅色" if dark else "当前是浅色主题，点击切换为暗色"
@@ -2785,7 +2907,8 @@ class MainWindow(QMainWindow):
             )
 
     def closeEvent(self, event):
-        """退出前把缓存连接关掉：SQLite 的写入要落盘，文件句柄也别留着。"""
+        """退出前把自动抓取停掉、缓存连接关掉：SQLite 的写入要落盘，文件句柄也别留着。"""
+        self.auto_poll_timer.stop()
         self.store.close()
         super().closeEvent(event)
 

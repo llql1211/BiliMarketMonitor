@@ -2047,6 +2047,264 @@ def test_summary_keeps_its_colors_when_the_theme_toggles(window):
     assert theme.PRICE_DOWN_COLOR_DARK in w.summary_dialog.detail.toHtml().lower()
 
 
+# ---------------- 自动抓取 ----------------
+#
+# 定时器是单次触发的，每轮收尾重挂（见 ScheduleAutoPoll）。所以用例都不等真定时器
+# 到期——间隔在配置里写成 30 分钟，那一拍由用例自己调 OnAutoPoll 触发，跑完再断言
+# 定时器有没有被重新挂上。
+
+
+def _auto_toml(**overrides):
+    """自动抓取的 config.toml 内容，默认开着、范围全部、不弹总结。"""
+    values = {
+        "auto_poll_enabled": "true",
+        "auto_poll_interval_minutes": "30",
+        "auto_poll_scope": '"all"',
+        "auto_poll_show_summary": "false",
+    }
+    values.update(overrides)
+    return "".join(f"{k} = {v}\n" for k, v in values.items())
+
+
+def _row_ids(tasks):
+    """[(行号, LinkEntry)] 里的 clusterId 列表，断言抓了哪几件用。"""
+    return [entry.cluster_id for _, entry in tasks]
+
+
+def test_auto_poll_tasks_scope_all(window):
+    """范围「全部」：清单里每一件都抓。"""
+    w = window("10000008780 | 甲\n10000000002 | 乙\n", config_toml=_auto_toml())
+    w.LoadWatchlist(w.watchlist_path)
+    assert _row_ids(w.AutoPollTasks()) == ["10000008780", "10000000002"]
+
+
+def test_auto_poll_tasks_scope_favorite(window):
+    """范围「收藏」：只抓行尾带 * 的那几件。"""
+    w = window(
+        "10000008780 | 甲\n10000000002 | 乙 | *\n10000000003 | 丙 | 50 | *\n",
+        config_toml=_auto_toml(auto_poll_scope='"favorite"'),
+    )
+    w.LoadWatchlist(w.watchlist_path)
+    assert _row_ids(w.AutoPollTasks()) == ["10000000002", "10000000003"]
+
+
+def test_auto_poll_tasks_scope_sold_out(window):
+    """范围「售罄」：只抓缓存里记着已售罄的那几件。"""
+    w = window("10000008780 | 甲\n10000000002 | 乙\n", config_toml=_auto_toml(
+        auto_poll_scope='"sold_out"',
+    ))
+    _seed_cache(w, sold_out=True)  # 甲售罄
+    _seed_cache(w, cluster_id="10000000002", sold_out=False)  # 乙在卖
+    w.LoadWatchlist(w.watchlist_path)
+    assert _row_ids(w.AutoPollTasks()) == ["10000008780"]
+
+
+def test_auto_poll_tasks_sold_out_needs_a_past_fetch(window):
+    """刚加进来还没抓过的商品不算售罄——不然「仅售罄」会把它一起捞进来。"""
+    w = window("10000008780 | 甲\n", config_toml=_auto_toml(
+        auto_poll_scope='"sold_out"',
+    ))
+    w.LoadWatchlist(w.watchlist_path)
+    assert w.AutoPollTasks() == []
+
+
+def test_auto_poll_skips_the_tick_while_polling(window, monkeypatch):
+    """手动在抓时那一拍跳过，而且不重挂：下一拍由正在跑的那轮的收尾去挂。
+
+    两边都挂的话，定时器上会挂出两拍来。
+    """
+    w = window("10000008780 | 甲\n", config_toml=_auto_toml())
+    w.LoadWatchlist(w.watchlist_path)
+    made = _record_pollers(monkeypatch)
+    w.poller = FakePoller()  # 手动那一轮还在跑
+    w.auto_poll_timer.stop()  # 这一拍已经到期（到期的单次定时器就是这个状态）
+
+    w.OnAutoPoll()
+
+    assert made == []  # 没有起第二轮
+    assert not w.auto_poll_timer.isActive()
+
+
+def test_auto_poll_with_nothing_in_scope_skips_and_reschedules(window, monkeypatch):
+    """范围内没有商品：提示一句、不启动抓取，但下一拍照样得挂上。"""
+    w = window("10000008780 | 甲\n", config_toml=_auto_toml(
+        auto_poll_scope='"favorite"',
+    ))
+    w.LoadWatchlist(w.watchlist_path)
+    made = _record_pollers(monkeypatch)
+
+    w.OnAutoPoll()
+
+    assert made == []
+    assert w.progress_label.text() == app_module.AUTO_POLL_EMPTY_TEXT
+    assert w.auto_poll_timer.isActive()
+
+
+def test_auto_poll_starts_a_fetch_of_the_scoped_rows(window, monkeypatch):
+    """范围内有商品时按范围起飞，并记下这轮是自动发起的。"""
+    w = window("10000008780 | 甲\n10000000002 | 乙 | *\n", config_toml=_auto_toml(
+        auto_poll_scope='"favorite"',
+    ))
+    w.LoadWatchlist(w.watchlist_path)
+    made = _record_pollers(monkeypatch)
+
+    w.OnAutoPoll()
+
+    assert len(made) == 1
+    assert _row_ids(made[0].tasks) == ["10000000002"]
+    assert w.fetch_source == "auto"
+
+
+def test_auto_poll_interval_is_read_as_minutes(window):
+    """间隔按分钟算。写错单位的话 30 秒一次，接口会被打爆。"""
+    w = window("10000008780 | 甲\n", config_toml=_auto_toml())
+    assert w.auto_poll_timer.isActive()
+    assert w.auto_poll_timer.interval() == 30 * 60_000
+    assert w.auto_poll_timer.isSingleShot()
+
+
+def test_auto_poll_disabled_leaves_the_timer_idle(window):
+    """默认关着：一开程序不该自己跑起来抓接口。"""
+    w = window()
+    assert w.config["auto_poll_enabled"] is False
+    assert not w.auto_poll_timer.isActive()
+    assert w.auto_poll_label.text() == app_module.AUTO_POLL_OFF_TEXT
+
+
+def test_auto_poll_label_shows_the_interval_and_scope(window):
+    """顶部那截状态：开着时报间隔与范围，关掉时只说「关」。"""
+    w = window("10000008780 | 甲\n", config_toml=_auto_toml(
+        auto_poll_interval_minutes="15", auto_poll_scope='"favorite"',
+    ))
+    assert w.auto_poll_label.text() == "自动：15 分钟 / 收藏"
+
+    off = window(config_toml=_auto_toml(auto_poll_enabled="false"))
+    assert off.auto_poll_label.text() == "自动：关"
+
+
+def test_auto_poll_label_uses_the_muted_colour(window):
+    """跟「上次更新时间」一样是次要信息，别跟按钮抢眼。"""
+    w = window()
+    for dark in (False, True):
+        w.ApplyTheme(dark)
+        assert theme.muted_color(dark).name() in w.auto_poll_label.styleSheet()
+
+
+def test_auto_poll_progress_names_the_scope(window):
+    """自动抓取时状态栏点明是自动、抓的哪个范围；手动照旧只写「查询中」。"""
+    w = window("10000008780 | 甲\n", config_toml=_auto_toml(
+        auto_poll_scope='"favorite"',
+    ))
+    w.LoadWatchlist(w.watchlist_path)
+    w.StartFetch([(0, w.rows[0]["entry"])], source="auto")
+    w.OnProgress(3, 12)
+    assert w.progress_label.text() == "自动抓取（收藏）3/12"
+
+    # 范围是「全部」时不写那截括号，省得白占地方
+    all_scope = window("10000008780 | 甲\n", config_toml=_auto_toml())
+    all_scope.LoadWatchlist(all_scope.watchlist_path)
+    all_scope.StartFetch([(0, all_scope.rows[0]["entry"])], source="auto")
+    all_scope.OnProgress(3, 12)
+    assert all_scope.progress_label.text() == "自动抓取 3/12"
+
+    manual = window("10000008780 | 甲\n")
+    manual.LoadWatchlist(manual.watchlist_path)
+    manual.StartFetch([(0, manual.rows[0]["entry"])])
+    manual.OnProgress(3, 12)
+    assert manual.progress_label.text() == "查询中 3/12"
+
+
+def test_poll_finished_reschedules_the_timer(window):
+    """收尾时挂下一拍：单次定时器用完就空了，漏挂等于自动抓取跑一轮就没了。"""
+    w = window("10000008780 | 甲\n", config_toml=_auto_toml())
+    w.SetBusy(True)
+    w.auto_poll_timer.stop()
+
+    w.OnPollFinished()
+
+    assert w.auto_poll_timer.isActive()
+
+
+def test_poll_finished_reschedules_even_after_a_manual_stop(window):
+    """手动按了「停止抓取」也照挂：用户不想要的是这一轮，不是要把自动抓取关掉。"""
+    w = window("10000008780 | 甲\n", config_toml=_auto_toml())
+    w.SetBusy(True)
+    w.poller_stopped = True
+    w.auto_poll_timer.stop()
+
+    w.OnPollFinished()
+
+    assert w.auto_poll_timer.isActive()
+
+
+def test_auto_poll_disabled_does_not_reschedule(window):
+    """关掉自动抓取时谁都不挂：收尾也不该偷偷把定时器点起来。"""
+    w = window("10000008780 | 甲\n")
+    w.SetBusy(True)
+
+    w.OnPollFinished()
+
+    assert not w.auto_poll_timer.isActive()
+
+
+def test_auto_poll_run_does_not_pop_a_summary(window, monkeypatch, wait_until):
+    """自动抓取跑完不弹总结：它是没人看着的时候跑的，每轮弹一个窗口会把桌面糊满。"""
+    w = window("10000008780 | 甲\n", config_toml=_auto_toml())
+    w.LoadWatchlist(w.watchlist_path)
+    monkeypatch.setattr(
+        client, "fetch_cluster", _fetch_by_id({"10000008780": raw_ok(name="甲")})
+    )
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
+
+    w.OnAutoPoll()
+    assert _wait_run(w, wait_until)
+
+    assert w.fetch_source == "auto"
+    assert w.summary_dialog is None
+    assert w.auto_poll_timer.isActive()  # 跑完这一轮，下一拍已经挂好了
+
+
+def test_auto_poll_pops_a_summary_when_asked(window, monkeypatch, wait_until):
+    """配置里要总结的话，自动抓取照弹（判据是配置，不是谁发起的）。"""
+    w = window("10000008780 | 甲\n", config_toml=_auto_toml(
+        auto_poll_show_summary="true",
+    ))
+    w.LoadWatchlist(w.watchlist_path)
+    monkeypatch.setattr(
+        client, "fetch_cluster", _fetch_by_id({"10000008780": raw_ok(name="甲")})
+    )
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
+
+    w.OnAutoPoll()
+    assert _wait_run(w, wait_until)
+
+    assert w.summary_dialog is not None and w.summary_dialog.isVisible()
+
+
+def test_manual_fetch_still_pops_a_summary(window, monkeypatch, wait_until):
+    """手动抓取那一项配置管不着：照旧弹。"""
+    w = window("10000008780 | 甲\n", config_toml=_auto_toml())
+    w.LoadWatchlist(w.watchlist_path)
+    monkeypatch.setattr(
+        client, "fetch_cluster", _fetch_by_id({"10000008780": raw_ok(name="甲")})
+    )
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
+
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+
+    assert w.fetch_source == "manual"
+    assert w.summary_dialog is not None and w.summary_dialog.isVisible()
+
+
+def test_close_event_stops_the_timer(window):
+    """关窗口得把定时器停掉：不然退出前还会自己起一轮抓取。"""
+    w = window("10000008780 | 甲\n", config_toml=_auto_toml())
+    assert w.auto_poll_timer.isActive()
+    w.close()
+    assert not w.auto_poll_timer.isActive()
+
+
 # ---------------- 添加 / 删除 / 整理 ----------------
 
 
