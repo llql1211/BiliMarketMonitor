@@ -1,11 +1,13 @@
-# 本文件为程序默认配置文件，默认无需修改。若想进行个性化配置，请把本文件
-# 复制为 config.toml 后按需修改。config.toml 不会被 git 跟踪。
+# 本文件为程序默认配置文件，若想进行个性化配置，请把本文件复制为 config.toml 再
+# 修改。config.toml 不会被 git 跟踪。
+
+# ---------------- 基本设置 ----------------
 
 # 商品详情页链接模板，必须包含 {clusterId} 占位符
 detail_url_template = "https://mall.bilibili.com/neul-next/resell/detail.html?clusterId={clusterId}"
 
-# 依次抓取每个商品之间的间隔（秒），建议不小于 2
-poll_interval_seconds = 2
+# 抓取商品的间隔（秒），不建议太小
+poll_interval_seconds = 0.5
 
 # 单个商品抓取失败后、重试前的等待（秒）
 retry_interval_seconds = 1
@@ -13,46 +15,41 @@ retry_interval_seconds = 1
 # 单次请求超时（秒）
 request_timeout_seconds = 10
 
-# 成交新鲜度高亮：最近一次成交发生在多少小时内，就把成交价格加粗并用下面的颜色显示。
-# 单位是小时；设为 0 表示关闭高亮
+# 近期成交发生在多少个小时内，就将成交高亮，并用下面的颜色表示。
+
+# 时间设为 0 表示关闭高亮。
 deal_highlight_within_hours = 24
 
-# 高亮成交用的文字颜色，支持 #rrggbb 和颜色名（如 orange）。
-# 默认值在深浅两种主题的表格底色下都看得清，自己换色时留意这一点
+# 文字颜色支持 RGB （如 #rrggbb）和颜色名（如 orange）。
 deal_highlight_color = "#e07000"
 
-# ---------------- 自动抓取 ----------------
+# ---------------- 定时抓取设置 ----------------
 
-# 是否按下面的间隔自动抓取。默认关闭，只有手动点「开始抓取」才抓
+# 是否启动定时抓取
 auto_poll_enabled = false
 
-# 自动抓取的间隔（分钟）。从上一轮结束算起，所以某一轮抓得慢只会把下一轮顺延，
-# 不会一轮叠一轮
+# 定时抓取间隔（分钟）
 auto_poll_interval_minutes = 30
 
-# 自动抓取的范围：all = 清单里全部商品，favorite = 只抓收藏的，
-# sold_out = 只抓缓存里记着「已售罄」的（想盯着什么时候补货）
+# 定时抓取的范围，取值只能为：
+# - all = 清单里全部商品；
+# - favorite = 只抓收藏的，
+# - sold_out = 只抓「已售罄」的
 auto_poll_scope = "all"
 
-# 自动抓取跑完是否弹总结窗口。默认不弹——自动抓取是没人看着的时候跑的，
-# 每轮都弹会把桌面糊满；手动抓取无论这一项怎么设都会弹
+# 自动抓取跑完是否弹总结窗口
 auto_poll_show_summary = false
 
-# ---------------- 企业微信推送 ----------------
+# ---------------- 企业微信推送设置 ----------------
 
 # 是否启用推送。默认关闭时下面这些项一个都不起作用
 notify_enabled = false
 
-# 企业微信群机器人的 webhook 地址，形如：
-# https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxx-xxxx-xxxx
-#
-# 群里点「…」→ 添加群机器人就能拿到。这个地址等同于发消息的权限，别外传、
-# 别提交进仓库（所以这份示例里留空）；一旦泄漏只能把机器人删了重建。
-# 留空表示「推送开着但还没配好」，程序会在状态栏提醒一句
+# 企业微信群机器人的 webhook 地址，形如：https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxx-xxxx-xxxx
+# 留空表示推送开着但还没配好，程序会在终端内提醒
 notify_wecom_webhook = ""
 
-# 两次推送之间的最小间隔（秒）。一次抓取里可能有好几件商品同时到价，攒成
-# 一条消息发出去；要是一轮里分几批触发，也至少隔这么久才发下一批
+# 两次推送间最小间隔（秒）
 notify_min_interval_seconds = 60
 
 # 通知类型，各自独立开关。前两项默认开着（补货和收藏到价是要盯着的事），
@@ -62,12 +59,16 @@ notify_min_interval_seconds = 60
 # 只在变化发生的那一刻推一次；第一次抓到的商品没有上一轮可比，只记个底，
 # 不发通知。一件商品同时踩中几条会写在同一行里，如「恢复在售 · 创史低」
 # 售罄→在售（任何商品）
+
+# 通知内容设置：
+
+# 任何售罄商品恢复在售：
 notify_on_restock = true
-# 收藏的商品跌破预期价（上一次不低、这一次低了）
+# 收藏商品跌破预期价（上一次不低、这一次低了）
 notify_on_favorite_target = true
-# 收藏的商品刷新史低价（现在正好等于史低价不算）
+# 收藏商品刷新史低价
 notify_on_favorite_lowest = false
-# 收藏的商品降价（价格上下波动很常见，开着容易刷屏）
+# 收藏商品降价（价格上下波动很常见，开着容易刷屏）
 notify_on_favorite_drop = false
-# 非收藏的商品跌破预期价（同样只在刚跌破时推）
+# 非收藏商品跌破预期价
 notify_on_any_target = false

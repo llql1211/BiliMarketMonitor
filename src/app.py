@@ -1633,7 +1633,7 @@ class MainWindow(QMainWindow):
         self.btn_delete = QPushButton("删除选中")
         self.btn_refresh_list = QPushButton("刷新列表")
         self.btn_fetch = QPushButton("开始抓取")
-        self.btn_fetch_new = QPushButton("仅抓取新添加商品")
+        self.btn_fetch_new = QPushButton("仅抓取新商品")
         self.btn_pause = QPushButton(PAUSE_TEXT)
         self.btn_stop = QPushButton("停止抓取")
         for btn, slot, tip in (
@@ -1643,7 +1643,7 @@ class MainWindow(QMainWindow):
              "把选中的商品从 watchlist.txt 和缓存中删除"),
             (self.btn_refresh_list, self.OnRefreshList,
              "重新读取 watchlist.txt（手工改动后点这里同步）\n"
-             "全部行都认得出时，会顺手按规范格式重写一遍"),
+             "全部行都认得出时，会顺手按规范格式重写一遍"), 
             (self.btn_fetch, self.OnFetchPrices,
              f"逐个抓取价格，间隔 {self.config['poll_interval_seconds']:g} 秒\n"
              f"快捷键 {FETCH_SHORTCUT}"),
