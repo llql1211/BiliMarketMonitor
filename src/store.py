@@ -21,6 +21,10 @@ DB_FILENAME = "cache.db"
 ITEM_COLUMNS = (
     ("cluster_id", "TEXT PRIMARY KEY"),
     ("name", "TEXT"),
+    ("favorite", "INTEGER DEFAULT 0"),  # 用户手动打的收藏标记（0/1）。
+                                        # 跟名字的来路不同：抓取碰不到它（见
+                                        # upsert_item 的列清单），只有点星和清单
+                                        # 同步两处会写
     ("image_url", "TEXT"),
     ("updated_at", "TEXT"),         # 名称 / 缩略图的抓取时间
     ("price_text", "TEXT"),         # 上次抓到的现价原文（如「¥44」）
@@ -176,8 +180,14 @@ class Store:
     def sync(self, items):
         """让缓存严格跟随 watchlist，返回 (新增数, 删除数)。
 
-        items 为 [(clusterId, 商品名)]；清单里的名字只用于补空，
+        items 为 [(clusterId, 商品名[, 收藏])]；清单里的名字只用于补空，
         已经抓取到的名字不会被清单里的旧名字覆盖。
+
+        收藏跟名字的规则不一样：它是**以清单为准整列覆盖**的。清单是用户意图的
+        家，缓存只是备份（删掉库也还能从清单恢复），所以清单说没收藏就得跟着清掉。
+        两元组的老写法继续能用，代价是它等于说"这件没收藏"——调用方要保留收藏
+        就得把第三段带上（app 那边两处都是带上的）。
+
         形状不对或 ID 非法的条目跳过（记进 notes），不打断整轮同步——
         一条坏记录不该让整个清单同步不上。
         """
@@ -186,21 +196,25 @@ class Store:
         wanted = {}
         skipped = 0
         for item in items or []:
-            cluster_id, name = _split_item(item)
+            cluster_id, name, favorite = _split_item(item)
             if cluster_id is None:
                 skipped += 1
                 continue
-            wanted[cluster_id] = _clean_name(name)
+            wanted[cluster_id] = (_clean_name(name), favorite)
         if skipped:
             self._note(f"清单里有 {skipped} 条记录无法识别，已跳过")
 
         added = removed = 0
         with self.conn:
-            for cluster_id, name in wanted.items():
+            for cluster_id, (name, favorite) in wanted.items():
                 exists = self.conn.execute(
                     "SELECT 1 FROM items WHERE cluster_id = ?", (cluster_id,)
                 ).fetchone()
                 if exists:
+                    self.conn.execute(
+                        "UPDATE items SET favorite = ? WHERE cluster_id = ?",
+                        (int(favorite), cluster_id),
+                    )
                     if name:
                         self.conn.execute(
                             """UPDATE items SET name = ?
@@ -209,9 +223,10 @@ class Store:
                         )
                 else:
                     self.conn.execute(
-                        """INSERT INTO items (cluster_id, name, image_url, updated_at)
-                           VALUES (?, ?, NULL, ?)""",
-                        (cluster_id, name, now),
+                        """INSERT INTO items (cluster_id, name, image_url, updated_at,
+                                              favorite)
+                           VALUES (?, ?, NULL, ?, ?)""",
+                        (cluster_id, name, now, int(favorite)),
                     )
                     added += 1
 
@@ -241,6 +256,10 @@ class Store:
         deals=None,
     ):
         """保存抓取结果；新值为空时保留旧值。
+
+        收藏（favorite）不在这里：它是用户设置，抓取结果里没有这一项，
+        所以下面那份列清单里压根不出现它——新插入的行按默认值 0 走，已有的行
+        一个字都不动（见 set_favorite 与 sync）。
 
         空串按"没抓到"处理：SQLite 里空串不是 NULL，COALESCE 挡不住它，
         会把已经缓存好的名字/缩略图冲掉。
@@ -317,6 +336,27 @@ class Store:
                 ),
             )
 
+    def set_favorite(self, cluster_id: str, favorite):
+        """手动打 / 取消收藏（items.favorite 存 0/1）。
+
+        这一列不跟着抓取走（见 upsert_item 的列清单），只由用户点星和清单同步
+        两处写：它是用户意图，抓回来的东西盖不掉它。
+
+        跟 upsert_item 不同，这里没有"补一条"的语义：记录不存在时这句 UPDATE
+        等于没写。缓存以清单为准，清单里有的商品在 sync 之后一定在缓存里，
+        点星点的是屏幕上那一行，不存在"查无此人"。
+        """
+        self._begin()
+        cluster_id = _clean_id(cluster_id)
+        if cluster_id is None:
+            self._note("收藏的 clusterId 不合法，已跳过写入")
+            return
+        with self.conn:
+            self.conn.execute(
+                "UPDATE items SET favorite = ? WHERE cluster_id = ?",
+                (int(bool(favorite)), cluster_id),
+            )
+
     def delete_item(self, cluster_id: str):
         self._begin()
         cluster_id = _clean_id(cluster_id)
@@ -367,12 +407,20 @@ def _clean_id(cluster_id):
 
 
 def _split_item(item):
-    """拆开 (clusterId, 名称) 并校验 ID；形状不对返回 (None, "")。"""
-    try:
+    """拆开 (clusterId, 名称[, 收藏]) 并校验 ID；形状不对返回 (None, "", False)。
+
+    收藏可以省略（等同于 False）：老调用方递两元组，以及只关心名字的那些路径。
+    """
+    if not isinstance(item, (tuple, list)):
+        return None, "", False  # 字符串会被逐字拆开，正好挡在门外
+    if len(item) == 2:
         cluster_id, name = item
-    except (TypeError, ValueError):
-        return None, ""
-    return _clean_id(cluster_id), name
+        favorite = False
+    elif len(item) == 3:
+        cluster_id, name, favorite = item
+    else:
+        return None, "", False
+    return _clean_id(cluster_id), name, bool(favorite)
 
 
 def _clean_name(name):

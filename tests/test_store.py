@@ -84,6 +84,123 @@ def test_sync_empty_list_clears_all(db):
     assert st.get_all() == []
 
 
+# ---------------- 收藏 ----------------
+#
+# 收藏是用户设置，不是抓取结果：清单（watchlist.txt）是它的正本，缓存里这一列
+# 只是副本，方便关掉窗口再开时不必先解析文件。所以写入它只有两条路——sync 按
+# 清单整体覆盖，set_favorite 手动改一条；upsert_item 那条路一个字都不许碰。
+
+
+def test_favorite_column_exists_at_creation(db):
+    """建表时就有 favorite 列，默认 0（老库重开后补列也一样）。"""
+    st = store.Store(db)
+    columns = {row["name"]: row for row in st.conn.execute("PRAGMA table_info(items)")}
+    assert "favorite" in columns
+    st.upsert_item("1001", "甲", None)
+    assert st.get_item("1001")["favorite"] == 0
+
+
+def test_set_favorite_writes_and_reads_back(db):
+    """set_favorite 打的标记查得回来，取消后回到 0。"""
+    st = store.Store(db)
+    st.sync([("1001", "甲")])
+
+    st.set_favorite("1001", True)
+    assert st.get_item("1001")["favorite"] == 1
+
+    st.set_favorite("1001", False)
+    assert st.get_item("1001")["favorite"] == 0
+
+
+def test_set_favorite_leaves_other_columns_alone(db):
+    """只改收藏这一列，名字、图片这些抓来的数据不受影响。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", "img", price_text="¥44")
+    st.set_favorite("1001", True)
+
+    row = st.get_item("1001")
+    assert (row["name"], row["image_url"], row["price_text"]) == ("甲", "img", "¥44")
+
+
+def test_set_favorite_skips_illegal_id(db):
+    """clusterId 不合法时跳过写入并记笔记，不抛异常。"""
+    st = store.Store(db)
+    for bad in (None, "abc", ""):
+        st.set_favorite(bad, True)
+        assert st.notes and "跳过" in st.notes[0]
+
+
+def test_sync_writes_favorite(db):
+    """sync 的三元组第三项就是收藏，缓存跟着清单走。"""
+    st = store.Store(db)
+    st.sync([("1001", "甲", True), ("1002", "乙", False)])
+    assert st.get_item("1001")["favorite"] == 1
+    assert st.get_item("1002")["favorite"] == 0
+
+
+def test_sync_updates_favorite_without_touching_name(db):
+    """已存在的那行只按清单改收藏，已经抓到的真名照旧。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "真名", "img")
+    st.sync([("1001", "清单里的旧名", True)])
+
+    row = st.get_item("1001")
+    assert row["favorite"] == 1
+    assert row["name"] == "真名"
+    assert row["image_url"] == "img"
+
+
+def test_sync_two_tuple_means_not_favorited(db):
+    """老调用点还在传两元组：语义是「没收藏」，并把这行原有的收藏清掉。
+
+    清单是正本，两元组就代表「清单上这行没有收藏标记」，所以不能保留旧值——
+    否则取消收藏会被下一次 sync 悄悄撤销。
+    """
+    st = store.Store(db)
+    st.sync([("1001", "甲", True)])
+    st.sync([("1001", "甲")])
+    assert st.get_item("1001")["favorite"] == 0
+
+
+def test_sync_clears_favorite_of_removed_then_readded_item(db):
+    """删掉再加回来是条新记录，收藏不跟着复活（清单那边也一并没了标记）。"""
+    st = store.Store(db)
+    st.sync([("1001", "甲", True)])
+    st.sync([])
+    st.sync([("1001", "甲")])
+    assert st.get_item("1001")["favorite"] == 0
+
+
+def test_upsert_item_does_not_touch_favorite(db):
+    """抓取结果里没有收藏这一项：upsert_item 不许动它，打过的标记得留着。"""
+    st = store.Store(db)
+    st.sync([("1001", "甲", True)])
+    st.upsert_item("1001", "甲", None, price_text="¥44")
+    assert st.get_item("1001")["favorite"] == 1
+
+
+def test_old_db_without_favorite_column_is_upgraded(db):
+    """老库打开时自动补上 favorite 列，老行算没收藏。"""
+    conn = sqlite3.connect(db)
+    with conn:
+        conn.execute(
+            """CREATE TABLE items (
+                   cluster_id TEXT PRIMARY KEY,
+                   name       TEXT,
+                   image_url  TEXT,
+                   updated_at TEXT
+               )"""
+        )
+        conn.execute("INSERT INTO items VALUES ('1001', '甲', 'img', '2024-01-01T00:00:00')")
+    conn.close()
+
+    st = store.Store(db)
+    assert st.get_item("1001")["favorite"] == 0
+    st.set_favorite("1001", True)
+    assert st.get_item("1001")["favorite"] == 1
+    assert st.notes == []  # 补列不该给用户报错
+
+
 # ---------------- upsert_item ----------------
 
 
@@ -448,7 +565,7 @@ def test_get_and_delete_illegal_id_are_noops(db):
 
 @pytest.mark.parametrize(
     "item",
-    ["1001", ("1001",), ("1001", "甲", "多余"), ("abc", "甲"), (None, "甲"), None],
+    ["1001", ("1001",), ("1001", "甲", "多余", "多"), ("abc", "甲"), (None, "甲"), None],
 )
 def test_sync_skips_malformed_items(db, item):
     """条目形状不对时跳过并记 notes，同批里其他条目照常同步。"""
