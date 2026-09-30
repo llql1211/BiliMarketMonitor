@@ -13,42 +13,59 @@ import links
 @pytest.mark.parametrize(
     "line, expected",
     [
-        ("10000008780", ("10000008780", "", "")),
-        ("10000008780 | 名字", ("10000008780", "名字", "")),
-        ("10000008780  |  名字", ("10000008780", "名字", "")),
+        ("10000008780", ("10000008780", "", "", False)),
+        ("10000008780 | 名字", ("10000008780", "名字", "", False)),
+        ("10000008780  |  名字", ("10000008780", "名字", "", False)),
         # 第三段是预期价；没设预期价的行维持老的两段写法
-        ("10000008780 | 名字 | 50", ("10000008780", "名字", "50")),
-        ("10000008780 | 名字 | ¥1,299.50", ("10000008780", "名字", "¥1,299.50")),
+        ("10000008780 | 名字 | 50", ("10000008780", "名字", "50", False)),
+        ("10000008780 | 名字 | ¥1,299.50", ("10000008780", "名字", "¥1,299.50", False)),
         # 名称未知但设了预期价：中间那段留空，靠末段是价格来认
-        ("10000008780 |  | 50", ("10000008780", "", "50")),
+        ("10000008780 |  | 50", ("10000008780", "", "50", False)),
         # 末段不是数字就不当预期价；多余段粘回名字里，不丢东西
-        ("10000008780 | 名字 | 50 | 多余", ("10000008780", "名字 50 多余", "")),
-        ("10000008780 | 名字 | 40 | 50", ("10000008780", "名字 40", "50")),
+        ("10000008780 | 名字 | 50 | 多余", ("10000008780", "名字 50 多余", "", False)),
+        ("10000008780 | 名字 | 40 | 50", ("10000008780", "名字 40", "50", False)),
         # 名字带 "|" 的手工行：末段不像价格，整段按老规矩当名字
-        ("10000008780 | 甲|乙", ("10000008780", "甲 乙", "")),
-        ("10000008780 | 甲|50", ("10000008780", "甲", "50")),
+        ("10000008780 | 甲|乙", ("10000008780", "甲 乙", "", False)),
+        ("10000008780 | 甲|50", ("10000008780", "甲", "50", False)),
+        # 第四段那个 * 是收藏标记，一二三四段都能带
+        ("10000008780 | *", ("10000008780", "", "", True)),
+        ("10000008780 | 名字 | *", ("10000008780", "名字", "", True)),
+        ("10000008780 | 名字 | 50 | *", ("10000008780", "名字", "50", True)),
+        ("10000008780 |  | 50 | *", ("10000008780", "", "50", True)),
+        ("10000008780 | 名字 |   50   |   *  ", ("10000008780", "名字", "50", True)),
+        # 收藏先剥、预期价后认："... | 50 | *" 剥掉末段之后，50 才是那个价格
+        # （反过来先认价格的话，* 不像价格，整段会连 50 一起被当成名字）
+        # 名字以星号结尾 ≠ 收藏：认的是「最后一段整个就是 *」
+        ("10000008780 | 限定版*", ("10000008780", "限定版*", "", False)),
+        # 名字里带 "|" 又要收藏：中间那几段照样粘回名字里
+        ("10000008780 | 甲|乙 | *", ("10000008780", "甲 乙", "", True)),
+        ("10000008780 | 甲|乙|50 | *", ("10000008780", "甲 乙", "50", True)),
         (
             "https://mall.bilibili.com/neul-next/resell/detail.html?"
             "clusterId=10000008780&share_medium=android&bbid=abc",
-            ("10000008780", "", ""),
+            ("10000008780", "", "", False),
         ),
         (
             "https://mall.bilibili.com/detail?clusterId=10000008780&x=1 | 分享的名字",
-            ("10000008780", "分享的名字", ""),
+            ("10000008780", "分享的名字", "", False),
         ),
         (
             "https://mall.bilibili.com/detail?clusterId=10000008780&x=1 | 分享的名字 | 88",
-            ("10000008780", "分享的名字", "88"),
+            ("10000008780", "分享的名字", "88", False),
         ),
-        ("# 注释行", (None, None, "")),
-        ("", (None, None, "")),
-        ("   ", (None, None, "")),
-        ("abc", (None, None, "")),
-        ("https://example.com/page?other=1", (None, None, "")),
+        (
+            "https://mall.bilibili.com/detail?clusterId=10000008780&x=1 | 名字 | 88 | *",
+            ("10000008780", "名字", "88", True),
+        ),
+        ("# 注释行", (None, None, "", False)),
+        ("", (None, None, "", False)),
+        ("   ", (None, None, "", False)),
+        ("abc", (None, None, "", False)),
+        ("https://example.com/page?other=1", (None, None, "", False)),
     ],
 )
 def test_parse_line_cases(line, expected):
-    """纯 ID / 带名 / 带预期价 / 分享链接 / 注释 / 空白 / 乱码各形态的解析结果。"""
+    """纯 ID / 带名 / 带预期价 / 带收藏 / 分享链接 / 注释 / 空白 / 乱码的解析结果。"""
     assert links.parse_line(line) == expected
 
 
@@ -228,13 +245,98 @@ def test_build_detail_url_unusable_returns_empty(cluster_id, template):
     assert links.build_detail_url(cluster_id, template) == ""
 
 
+# ---------------- 收藏标记 ----------------
+
+def _body(path):
+    """清单里去掉注释头和空行之后的正文本，专供比对写回格式。"""
+    return [line for line in path.read_text(encoding="utf-8").split("\n") if line]
+
+
+def test_save_watchlist_favorite_appends_a_mark(tmp_path):
+    """收藏的行末尾追加「| *」；没收藏的行一个字符都不多写（老写法原样保留）。"""
+    path = tmp_path / "watchlist.txt"
+    links.save_watchlist(
+        str(path),
+        [
+            ("1001", "甲", "50", True),   # 名 + 预期价 + 收藏
+            ("1002", "乙", "88"),         # 三两段的写法照样收，默认不收藏
+            ("1003", "丙", "", True),     # 只有名
+            ("1004", "", "", True),       # 连名都没有
+            ("1005", "戊"),               # 不收藏，也不设预期价
+        ],
+    )
+    assert _body(path)[2:] == [
+        "1001 | 甲 | 50 | *",
+        "1002 | 乙 | 88",
+        "1003 | 丙 | *",
+        "1004 | *",
+        "1005 | 戊",
+    ]
+
+
+def test_favorite_roundtrip(tmp_path):
+    """收藏标记写出去再读回来还在；没收藏的读回来是 False。"""
+    path = tmp_path / "watchlist.txt"
+    links.save_watchlist(str(path), [("1001", "甲", "50", True), ("1002", "乙")])
+    entries = links.load_links(str(path))
+    assert [(e.cluster_id, e.favorite) for e in entries] == [("1001", True), ("1002", False)]
+
+
+def test_load_links_keeps_favorite_in_raw(tmp_path):
+    """raw 记的是原行（带着收藏段），保存别的地方时不会把它抹掉。"""
+    path = tmp_path / "watchlist.txt"
+    path.write_text("1001 | 甲 | 50 | *\n", encoding="utf-8")
+    entry = links.load_links(str(path))[0]
+    assert entry.favorite is True
+    assert entry.raw == "1001 | 甲 | 50 | *"
+
+
+def test_load_links_old_format_without_favorite(tmp_path):
+    """老清单（一段 / 两段 / 三段）读进来收藏都是 False，写回也不多长出一段。"""
+    path = tmp_path / "watchlist.txt"
+    path.write_text("1001 | 甲\n1002 | 乙 | 50\n1003\n", encoding="utf-8")
+
+    entries = links.load_links(str(path))
+    assert [(e.cluster_id, e.favorite) for e in entries] == [
+        ("1001", False),
+        ("1002", False),
+        ("1003", False),
+    ]
+
+    links.save_watchlist(
+        str(path),
+        [(e.cluster_id, e.name, e.expected_price, e.favorite) for e in entries],
+    )
+    assert _body(path)[2:] == ["1001 | 甲", "1002 | 乙 | 50", "1003"]
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (True, True),
+        ("*", True),
+        ("  *  ", True),
+        (False, False),
+        ("", False),       # 空串不是收藏
+        ("x", False),      # 别的字符也不是
+        (1, False),        # 只认 True 和 "*"，数字 1 不认
+        (None, False),
+    ],
+)
+def test_save_watchlist_favorite_strictness(tmp_path, value, expected):
+    """收藏段只认 True 和清单里那个 "*" 写法，其余一律当没收藏，免得写出怪东西。"""
+    path = tmp_path / "watchlist.txt"
+    links.save_watchlist(str(path), [("1001", "甲", "", value)])
+    assert links.load_links(str(path))[0].favorite is expected
+
+
 # ---------------- 手工编辑出来的脏数据 ----------------
 
 
 @pytest.mark.parametrize("line", [None, 42, b"1001", ["1001"], {"id": "1"}])
 def test_parse_line_non_string(line):
-    """非字符串入参（None/数字/字节）返回 (None, None, "")，不抛 AttributeError。"""
-    assert links.parse_line(line) == (None, None, "")
+    """非字符串入参（None/数字/字节）返回 (None, None, "", False)，不抛 AttributeError。"""
+    assert links.parse_line(line) == (None, None, "", False)
 
 
 @pytest.mark.parametrize("extra_junk", ["", "1001 二\n"])
@@ -329,10 +431,10 @@ def test_save_watchlist_cleans_name_on_roundtrip(tmp_path):
 @pytest.mark.parametrize(
     "item",
     [
-        "1001",                  # 字符串会被逐字拆开
-        ("1001",),               # 缺名称
-        ("1001", "a", "b", "c"),  # 多一项
-        ("abc", "名字"),          # ID 不是数字
+        "1001",                        # 字符串会被逐字拆开
+        ("1001",),                     # 缺名称
+        ("1001", "a", "b", "c", "d"),  # 多一项
+        ("abc", "名字"),                # ID 不是数字
         (None, "名字"),
         ("", "名字"),
     ],

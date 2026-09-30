@@ -2,14 +2,14 @@
 
 清单由程序格式化维护，每行形如：
 
-    <clusterId> | <商品名> | <预期价>
+    <clusterId> | <商品名> | <预期价> | <收藏>
 
-商品名未知时只写 clusterId；预期价是用户自己设的，只有设过的行才写这一段，
-没设的行维持老样子（两段甚至一段），老清单原样读得进来。
+商品名未知时只写 clusterId；预期价和收藏都是用户自己设的，只有设过的行才写
+那一段，没设的行维持老样子（三段甚至一段），老清单原样读得进来。
 
-预期价放在清单里而不是缓存库里：它是抓不回来的用户意图，而缓存库按
+预期价和收藏放在清单里而不是缓存库里：它们是抓不回来的用户意图，而缓存库按
 store 模块自己的说法是「丢了还能重新抓」的加速层，不该存不可再生的东西。
-清单还自带 .bak 备份，也能手工批量改价。
+清单还自带 .bak 备份，也能手工批量改价、改收藏。
 
 为了兼容首次导入和手工编辑，读入时同时接受分享链接（含 share_medium、
 bbid 等无关参数）和纯数字 ID。
@@ -36,10 +36,13 @@ _PLAIN_ID_RE = re.compile(r"^(\d+)$")
 _MAX_NAME_LEN = 100
 # 预期价长度上限（"¥1,299.50" 这种写法也够用了）
 _MAX_PRICE_LEN = 20
+# 收藏标记：只认这一个字符，写在行尾单独一段里（见 _strip_favorite）
+_FAVORITE_MARK = "*"
 
 _HEADER = (
-    "# 监视清单：每行格式 <clusterId> | <商品名> | <预期价>，"
-    "名称未知时只写 clusterId，没设预期价的行不写最后一段",
+    "# 监视清单：每行格式 <clusterId> | <商品名> | <预期价> | <收藏>，"
+    "名称未知时只写 clusterId，没设预期价的行不写第三段，没收藏的行不写第四段"
+    "（收藏标记就是一个 *）",
     "# 由程序维护，手工修改后点界面上的「刷新商品列表」同步",
 )
 
@@ -50,31 +53,32 @@ class LinkEntry:
     name: str = ""            # 清单里记录的商品名，可能为空（尚未抓取过）
     expected_price: str = ""  # 用户设的预期价，空串表示没设
     raw: str = ""             # 原始行，仅用于排查问题
+    favorite: bool = False    # 用户打的收藏标记
 
 
 def parse_line(line: str):
-    """解析一行，返回 (clusterId, name, 预期价)；无法识别返回 (None, None, "")。
+    """解析一行，返回 (clusterId, name, 预期价, 收藏)；无法识别返回 (None, None, "", False)。
 
-    后两项拿不准时给空串而不是 None：调用方（界面、清单写回）都是按字符串
-    处理的，混进 None 只会逼着每处都判一次空。
+    后两项拿不准时给空串/False 而不是 None：调用方（界面、清单写回）都是按
+    字符串和布尔处理的，混进 None 只会逼着每处都判一次空。
     """
     if not isinstance(line, str):  # 调用方可能递进来 None / 数字
-        return None, None, ""
+        return None, None, "", False
     text = line.strip()
     if not text or text.startswith("#"):  # 空行 / 注释行
-        return None, None, ""
+        return None, None, "", False
 
-    head, name, expected = _split_fields(text)
+    head, name, expected, favorite = _split_fields(text)
 
     match = _CLUSTER_ID_RE.search(head)  # 分享链接
     if match:
-        return match.group(1), _clean_name(name), _clean_price(expected)
+        return match.group(1), _clean_name(name), _clean_price(expected), favorite
 
     match = _PLAIN_ID_RE.match(head)  # 纯数字 ID
     if match:
-        return match.group(1), _clean_name(name), _clean_price(expected)
+        return match.group(1), _clean_name(name), _clean_price(expected), favorite
 
-    return None, None, ""
+    return None, None, "", False
 
 
 def load_links(path: str, notes=None, stats=None):
@@ -98,7 +102,7 @@ def load_links(path: str, notes=None, stats=None):
     seen = set()
     unparsed = 0
     for line in text.splitlines():
-        cluster_id, name, expected_price = parse_line(line)
+        cluster_id, name, expected_price, favorite = parse_line(line)
         if cluster_id is None:
             # 空行/注释行是正常的，只有"看着有内容却认不出来"才算异常
             if line.strip() and not line.strip().startswith("#"):
@@ -107,7 +111,9 @@ def load_links(path: str, notes=None, stats=None):
         if cluster_id in seen:
             continue
         seen.add(cluster_id)
-        entries.append(LinkEntry(cluster_id, name, expected_price, line.strip()))
+        entries.append(
+            LinkEntry(cluster_id, name, expected_price, line.strip(), favorite)
+        )
 
     if unparsed:
         _note(
@@ -123,30 +129,35 @@ def load_links(path: str, notes=None, stats=None):
 def save_watchlist(path: str, items, notes=None) -> int:
     """按规范格式原子写回清单，返回被跳过的条目数。
 
-    items 为 [(clusterId, 商品名[, 预期价])]，顺序即写入顺序；名称沿用文件里
-    已有的值，预期价省略等同于没设。条目形状不对/ID 不是纯数字的跳过不写；
-    名字和预期价里的 "|"、换行会被清洗掉（否则会写出一行坏清单，下次读进来
-    就全乱了）。
+    items 为 [(clusterId, 商品名[, 预期价[, 收藏]])]，顺序即写入顺序；名称沿用
+    文件里已有的值，预期价和收藏省略等同于没设。条目形状不对/ID 不是纯数字的
+    跳过不写；名字和预期价里的 "|"、换行会被清洗掉（否则会写出一行坏清单，
+    下次读进来就全乱了）。
 
-    没设预期价时只写前两段（甚至只有 ID），免得老清单被一堆空尾巴撑开。
+    没设预期价时只写前两段（甚至只有 ID），没收藏时不写最后一段，免得老清单
+    被一堆空尾巴撑开。收藏标记追加在最后一段的末尾，「收藏但没名字没价」的行
+    写出来就是 `1001 | *`，读回来照样对得上。
     写前留一份 path + ".bak" 备份（只留第一次的），并用临时文件 + 替换避免写坏。
     """
     lines = list(_HEADER) + [""]
     skipped = 0
     for item in items or []:
-        cluster_id, name, expected_price = _split_item(item)
+        cluster_id, name, expected_price, favorite = _split_item(item)
         if cluster_id is None:
             skipped += 1
             continue
         name = _clean_name(name)
         expected_price = _clean_price(expected_price)
         if not name and not expected_price:
-            lines.append(cluster_id)
+            line = cluster_id
         elif not expected_price:
-            lines.append(f"{cluster_id} | {name}")
+            line = f"{cluster_id} | {name}"
         else:
             # 名称空着也得留出中间那段：解析是按位置认预期价的
-            lines.append(f"{cluster_id} | {name} | {expected_price}")
+            line = f"{cluster_id} | {name} | {expected_price}"
+        if favorite:
+            line += f" | {_FAVORITE_MARK}"
+        lines.append(line)
 
     if skipped:
         _note(notes, f"有 {skipped} 条记录格式不对（ID 不是纯数字），已跳过不写入")
@@ -216,7 +227,11 @@ def _read_text(path: str):
 
 
 def _split_fields(text: str):
-    """把一行切成 (ID/链接, 商品名, 预期价)，缺的段给空串。
+    """把一行切成 (ID/链接, 商品名, 预期价, 收藏)，缺的段给空串/False。
+
+    收藏先剥：它固定在行尾，剥掉之后剩下的部分才走老的那套切法。两层的顺序
+    不能颠倒——"1001 | 甲 | 50 | *" 要是先切价格，末段 "*" 不像价格，整个
+    "50 | *" 会被当成名字的一部分。
 
     预期价认的是「最后一段，且它真像个价格」，不是按位置取第三段：名字里带
     "|" 的手工行本来就存在（"甲|乙" 那条路径有测试守着），按位置切会把名字
@@ -229,30 +244,50 @@ def _split_fields(text: str):
     中间那几段粘回去当名字（不多不少正好贴着 ID 和预期价两侧），免得名字里
     的竖线被当成两段丢掉。
     """
+    text, favorite = _strip_favorite(text)
     parts = text.split("|")
     head = parts[0].strip()
     if len(parts) >= 3:
         last = parts[-1].strip()
         if parser.price_number(last) is not None:
-            return head, "|".join(parts[1:-1]).strip(), last
-    return head, "|".join(parts[1:]).strip() if len(parts) > 1 else "", ""
+            return head, "|".join(parts[1:-1]).strip(), last, favorite
+    name = "|".join(parts[1:]).strip() if len(parts) > 1 else ""
+    return head, name, "", favorite
+
+
+def _strip_favorite(text: str):
+    """剥掉行尾的收藏标记，返回 (剩下的文本, 是否收藏)。
+
+    认的是「最后一段整个就是 *」而不是「行尾有个 *」：名字以星号结尾的商品
+    （"限定版*"）不该被认成收藏。代价跟预期价那层一样——名字真以 "| *" 结尾
+    的手工行会被认成收藏，而程序写回时名字里的 "|" 早被 _clean_name 清掉了，
+    只剩手编的行有这风险；认错了也看得见：表格里那颗星亮着。
+    """
+    body, sep, tail = text.rpartition("|")
+    if sep and tail.strip() == _FAVORITE_MARK:
+        return body.rstrip(), True
+    return text, False
 
 
 def _split_item(item):
-    """拆开 (clusterId, 名称[, 预期价]) 并校验 ID；形状不对返回 (None, "", "")。
+    """拆开 (clusterId, 名称[, 预期价[, 收藏]]) 并校验 ID。
 
-    预期价可以省略：只关心 ID 和名称的调用方不用凑一个空字符串出来。
+    形状不对返回 (None, "", "", False)。预期价和收藏都可以省略：只关心 ID 和
+    名称的调用方不用凑一串空字符串出来。
     """
     if not isinstance(item, (tuple, list)):
-        return None, "", ""  # 字符串会被逐字拆开，正好挡在门外
+        return None, "", "", False  # 字符串会被逐字拆开，正好挡在门外
     if len(item) == 2:
         cluster_id, name = item
-        expected_price = ""
+        expected_price, favorite = "", False
     elif len(item) == 3:
         cluster_id, name, expected_price = item
+        favorite = False
+    elif len(item) == 4:
+        cluster_id, name, expected_price, favorite = item
     else:
-        return None, "", ""
-    return _clean_id(cluster_id), name, expected_price
+        return None, "", "", False
+    return _clean_id(cluster_id), name, expected_price, _clean_favorite(favorite)
 
 
 def _clean_id(cluster_id):
@@ -283,6 +318,17 @@ def _clean_price(value) -> str:
         return ""
     text = " ".join(value.replace("|", " ").split())
     return text[:_MAX_PRICE_LEN]
+
+
+def _clean_favorite(value) -> bool:
+    """收藏标记归一：只认 True 和清单里那个写法 "*"，其余一律当没收藏。
+
+    不写 bool(value) 是有意的：那样 "0"、"no" 这种字符串会算成收藏，
+    而这一列的输入来自调用方拼的元组，认宽了只会静默多写一颗星。
+    """
+    if isinstance(value, str):
+        return value.strip() == _FAVORITE_MARK
+    return value is True
 
 
 def _note(notes, message: str):
