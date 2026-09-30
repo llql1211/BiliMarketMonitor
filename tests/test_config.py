@@ -310,3 +310,124 @@ def test_unknown_key_still_rejected_with_registry(data_files):
     cfg, warnings = config.load_config()
     assert "mystery_key" not in cfg
     assert any("未知项" in w for w in warnings)
+
+
+# ---------------- 自动抓取 ----------------
+#
+# 默认必须是关着的：升级到这一版的人没做任何配置时，程序不该自己开始反复打接口。
+
+
+def test_auto_poll_defaults_are_off(data_files):
+    """两份配置都没写时的默认值：不自动抓、30 分钟、全部、不弹总结。"""
+    _remove(data_files, "config.example.toml", "config.toml")
+    cfg, _ = config.load_config()
+    assert cfg["auto_poll_enabled"] is False
+    assert cfg["auto_poll_interval_minutes"] == 30.0
+    assert cfg["auto_poll_scope"] == "all"
+    assert cfg["auto_poll_show_summary"] is False
+
+
+def test_auto_poll_user_config_overrides_example(data_files):
+    """四项都能被 config.toml 覆盖，且压过 example 里的值。"""
+    _write(data_files, "config.example.toml", (
+        "auto_poll_enabled = false\n"
+        "auto_poll_interval_minutes = 60\n"
+        'auto_poll_scope = "all"\n'
+        "auto_poll_show_summary = false\n"
+    ))
+    _write(data_files, "config.toml", (
+        "auto_poll_enabled = true\n"
+        "auto_poll_interval_minutes = 5\n"
+        'auto_poll_scope = "favorite"\n'
+        "auto_poll_show_summary = true\n"
+    ))
+    cfg, warnings = config.load_config()
+    assert cfg["auto_poll_enabled"] is True
+    assert cfg["auto_poll_interval_minutes"] == 5.0
+    assert cfg["auto_poll_scope"] == "favorite"
+    assert cfg["auto_poll_show_summary"] is True
+    assert not [w for w in warnings if "auto_poll" in w]
+
+
+@pytest.mark.parametrize("raw_value, expected", [
+    ('"all"', "all"),
+    ('"favorite"', "favorite"),
+    ('"sold_out"', "sold_out"),
+    ('"  favorite  "', "favorite"),  # 顺手去掉前后空格，省得为这点空白报一条警告
+])
+def test_auto_poll_scope_accepted(data_files, raw_value, expected):
+    """三个合法范围都收，前后带空格的写法也认。"""
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", f"auto_poll_scope = {raw_value}\n")
+    cfg, _ = config.load_config()
+    assert cfg["auto_poll_scope"] == expected
+
+
+@pytest.mark.parametrize(
+    "raw_value",
+    ['"favarite"',   # 拼错
+     '"FAVORITE"',   # 大小写不对：写错就得说一声，不能悄悄当成另一回事
+     '"全部"',
+     '""',
+     '"all,favorite"',
+     "1",
+     "true"],
+)
+def test_auto_poll_scope_falls_back_to_default(data_files, raw_value):
+    """认不出的范围退回 all 并记警告。
+
+    这里宁可退回默认值也不照字面用：写 `"favarite"` 的本意是「只抓收藏」，
+    退回"全部"只是多抓几件，而按字面走会一件都不抓（谁也不等于这个字符串）。
+    """
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", f"auto_poll_scope = {raw_value}\n")
+    cfg, warnings = config.load_config()
+    assert cfg["auto_poll_scope"] == "all"
+    assert any("auto_poll_scope" in w for w in warnings)
+
+
+@pytest.mark.parametrize(
+    "raw_value, expected_keyword",
+    [
+        ("0", "必须大于 0"),
+        ("-5", "必须大于 0"),
+        ("inf", "必须是有限数字"),
+        ("nan", "必须是有限数字"),
+        ('"30"', "不是数字"),
+        ("true", "不是数字"),
+    ],
+)
+def test_auto_poll_interval_rejected(data_files, raw_value, expected_keyword):
+    """间隔的非法值退回 30 分钟：0 或 nan 会让定时器空转，把接口打爆。"""
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", f"auto_poll_interval_minutes = {raw_value}\n")
+    cfg, warnings = config.load_config()
+    assert cfg["auto_poll_interval_minutes"] == config.DEFAULTS["auto_poll_interval_minutes"]
+    assert any(expected_keyword in w and "auto_poll_interval_minutes" in w for w in warnings)
+
+
+@pytest.mark.parametrize(
+    "key", ["auto_poll_enabled", "auto_poll_show_summary"]
+)
+@pytest.mark.parametrize("raw_value", ["1", "0", '"true"', '"false"', '"yes"'])
+def test_auto_poll_bool_rejected(data_files, key, raw_value):
+    """只认真布尔。
+
+    `"false"` 这种写法必须拒掉：非空字符串在 Python 里是真值，照它走会把
+    「关掉自动抓取」读成「打开」——正好和用户的本意相反。
+    """
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", f"{key} = {raw_value}\n")
+    cfg, warnings = config.load_config()
+    assert cfg[key] is False
+    assert any(key in w and "true / false" in w for w in warnings)
+
+
+@pytest.mark.parametrize("key", ["auto_poll_enabled", "auto_poll_show_summary"])
+@pytest.mark.parametrize("raw_value, expected", [("true", True), ("false", False)])
+def test_auto_poll_bool_accepted(data_files, key, raw_value, expected):
+    """真布尔照收。"""
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", f"{key} = {raw_value}\n")
+    cfg, _ = config.load_config()
+    assert cfg[key] is expected

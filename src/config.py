@@ -28,6 +28,12 @@ DEFAULTS = {
     # 成交高亮：最近一次成交在多少小时内就加粗上色（0 = 关闭）
     "deal_highlight_within_hours": 24.0,
     "deal_highlight_color": "#e07000",
+    # 自动抓取：按固定间隔反复抓，间隔从上一轮结束算起；
+    # 范围 all = 清单全部，favorite = 只抓收藏的，sold_out = 只抓缓存里记着售罄的
+    "auto_poll_enabled": False,
+    "auto_poll_interval_minutes": 30.0,
+    "auto_poll_scope": "all",
+    "auto_poll_show_summary": False,
 }
 
 
@@ -129,6 +135,36 @@ def _check_color(value, key, label, warnings):
     return None
 
 
+def _check_bool(value, key, label, warnings):
+    """只认真布尔值。
+
+    TOML 里写 `auto_poll_enabled = 1` 或 `"true"` 都拒掉：字符串 "false" 是真值
+    （非空串），照它走会把「关掉」读成「打开」，不如退回默认值并说一声。
+    """
+    if isinstance(value, bool):
+        return value
+    warnings.append(f"{label}配置的 {key} 不是 true / false，已忽略")
+    return None
+
+
+def _check_enum(*allowed):
+    """生成一个「只认这几个值」的校验器，给 auto_poll_scope 这类选项用。
+
+    拼错的选项静默退回默认值，比照字面用要安全——写 `scope = "favarite"` 的
+    本意显然是「只抓收藏」，退回"全部"只是多抓几件，按字面走则会一件都不抓。
+    """
+
+    def _check(value, key, label, warnings):
+        if isinstance(value, str) and value.strip() in allowed:
+            return value.strip()
+        warnings.append(
+            f"{label}配置的 {key} 只能是 {' / '.join(allowed)}，已忽略"
+        )
+        return None
+
+    return _check
+
+
 def _check_positive_number(value, key, label, warnings):
     return _check_number(value, key, label, warnings, allow_zero=False)
 
@@ -161,6 +197,10 @@ _VALIDATORS = {
     "request_timeout_seconds": _check_positive_number,
     "deal_highlight_within_hours": _check_non_negative_number,
     "deal_highlight_color": _check_color,
+    "auto_poll_enabled": _check_bool,
+    "auto_poll_interval_minutes": _check_positive_number,
+    "auto_poll_scope": _check_enum("all", "favorite", "sold_out"),
+    "auto_poll_show_summary": _check_bool,
 }
 
 

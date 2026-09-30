@@ -20,3 +20,20 @@ deal_highlight_within_hours = 24
 # 高亮成交用的文字颜色，支持 #rrggbb 和颜色名（如 orange）。
 # 默认值在深浅两种主题的表格底色下都看得清，自己换色时留意这一点
 deal_highlight_color = "#e07000"
+
+# ---------------- 自动抓取 ----------------
+
+# 是否按下面的间隔自动抓取。默认关闭，只有手动点「开始抓取」才抓
+auto_poll_enabled = false
+
+# 自动抓取的间隔（分钟）。从上一轮结束算起，所以某一轮抓得慢只会把下一轮顺延，
+# 不会一轮叠一轮
+auto_poll_interval_minutes = 30
+
+# 自动抓取的范围：all = 清单里全部商品，favorite = 只抓收藏的，
+# sold_out = 只抓缓存里记着「已售罄」的（想盯着什么时候补货）
+auto_poll_scope = "all"
+
+# 自动抓取跑完是否弹总结窗口。默认不弹——自动抓取是没人看着的时候跑的，
+# 每轮都弹会把桌面糊满；手动抓取无论这一项怎么设都会弹
+auto_poll_show_summary = false
