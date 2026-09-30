@@ -12,6 +12,7 @@ data/config.example.toml 兜底。
 import math
 import os
 import re
+import shutil
 import tomllib
 
 CONFIG_FILENAME = "config.toml"
@@ -83,6 +84,112 @@ def load_config():
         )
     _check_notify_pair(config, warnings)
     return config, warnings
+
+
+def save_config(changes, path=None):
+    """把设置窗口改过的项写回 config.toml，返回实际写下去的键（按 DEFAULTS 的顺序）。
+
+    只写传进来的这几项，别的行一个都不动——就地替换 `key = value` 那一行，
+    注释、用户自己排的顺序、程序不认识的项全留着。不整份重写是因为
+    config.toml 是用户手写的文件，注释是他自己写下的说明，冲掉就找不回来了；
+    顺带也不会把 example 里的默认值钉进用户文件：没动过的项继续跟着 example 走。
+
+    config.toml 不存在时拿 config.example.toml 当底稿（模板里的注释正好当说明），
+    两份都没有就从零写。写前留一份 path + ".bak"（只留第一次那份），
+    临时文件 + 替换避免写坏——跟 links.save_watchlist 是同一个套路，
+    那边是给清单写的；各留一份，是因为 config 是纯数据模块，不该反过来认识 links。
+
+    `changes` 里不认识的键（不在 DEFAULTS 里）直接跳过：调用方只该递配置项，
+    写进去也会被 load_config 当未知项警告一遍。
+    """
+    path = path or user_config_path()
+    wanted = [key for key in DEFAULTS if key in changes]
+    if not wanted:
+        return []
+
+    lines = _config_text(path).splitlines()
+    while lines and not lines[-1].strip():  # 末尾空行先摘掉，下面统一补一个换行
+        lines.pop()
+
+    written, missing = [], []
+    for key in wanted:
+        literal = _toml_literal(changes[key])
+        if _replace_line(lines, key, literal):
+            written.append(key)
+        else:
+            missing.append((key, literal))
+
+    if missing:
+        if lines:
+            # 空一行再补：补上去的项跟上面那段（多半是别的主题的）分得开
+            lines.append("")
+        lines.extend(f"{key} = {literal}" for key, literal in missing)
+
+    _write_atomic(path, "\n".join(lines) + "\n")
+    return written + [key for key, _ in missing]
+
+
+def _config_text(path):
+    """要改的那份文本：优先 config.toml，文件不存在才退回 example。
+
+    只有「文件不存在」才退回：读不动（权限之类）时得让 OSError 冒上去，
+    不然会拿 example 当底稿，把用户那份没读成的配置覆盖掉。
+    """
+    for candidate in (path, example_config_path()):
+        try:
+            with open(candidate, "r", encoding="utf-8") as f:
+                return f.read()
+        except FileNotFoundError:
+            continue
+    return ""
+
+
+_KEY_LINE = re.compile(r"^(\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*)=")
+
+
+def _replace_line(lines, key, literal):
+    """把 `key = ...` 那一行改成新值，改了返回 True。
+
+    只认顶格（缩进任意）的键值行：被注释掉的 `# poll_interval_seconds = 2`
+    不算数——那是用户自己留的记录，动它比在末尾补一行更唐突。
+    """
+    for index, line in enumerate(lines):
+        match = _KEY_LINE.match(line)
+        if match and match.group(2) == key:
+            lines[index] = f"{match.group(1)}{key} = {literal}"
+            return True
+    return False
+
+
+def _toml_literal(value):
+    """把值写成 TOML 字面量。
+
+    数字一律当浮点写（`60.0`）：间隔、超时这些项在 DEFAULTS 里本来就是 float，
+    写成 `60` 会变成整数，读回来虽然过得了校验，但跟默认值的类型对不上。
+    """
+    if isinstance(value, bool):  # 得排在 int 前面：bool 是 int 的子类
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(float(value))
+    text = str(value)
+    # 基本字符串里只有反斜杠和引号要转义；换行、回车这类控制字符直接去掉——
+    # 它们写进去就成了两个键值行，下次读回来整份配置都乱
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = "".join(ch for ch in escaped if ch == "\t" or ch >= " ")
+    return f'"{escaped}"'
+
+
+def _write_atomic(path, content):
+    if os.path.exists(path) and not os.path.exists(path + ".bak"):
+        try:
+            shutil.copy2(path, path + ".bak")
+        except OSError:
+            pass  # 备份失败不影响主流程
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(content)
+    os.replace(tmp_path, path)
 
 
 def _check_notify_pair(config, warnings):

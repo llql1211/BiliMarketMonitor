@@ -595,3 +595,149 @@ def test_notify_enabled_without_webhook_warns(data_files, enabled, webhook, expe
     cfg, warnings = config.load_config()
     assert any("notify_wecom_webhook" in w for w in warnings) is expected
     assert cfg["notify_enabled"] is (enabled == "true")
+
+
+# ---------------- 写回配置（设置窗口用） ----------------
+
+
+def _read(data_dir, filename="config.toml"):
+    return (data_dir / filename).read_text(encoding="utf-8")
+
+
+def test_save_config_replaces_only_the_given_keys(data_files):
+    """只动传进来的项：别的键、注释、用户自己排的顺序一个字都不改。"""
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", (
+        "# 我自己写的注释，别冲掉\n"
+        "poll_interval_seconds = 2\n"
+        'auto_poll_scope = "favorite"\n'
+    ))
+
+    written = config.save_config({"poll_interval_seconds": 5.0})
+
+    assert written == ["poll_interval_seconds"]
+    text = _read(data_files)
+    assert "# 我自己写的注释，别冲掉" in text
+    assert "poll_interval_seconds = 5.0" in text
+    assert 'auto_poll_scope = "favorite"' in text
+    assert "poll_interval_seconds = 2" not in text
+
+
+def test_save_config_appends_keys_the_file_lacks(data_files):
+    """文件里没有的项补在末尾，补上去的照样能被读回来。"""
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", "poll_interval_seconds = 2\n")
+
+    written = config.save_config({"notify_enabled": True, "auto_poll_scope": "sold_out"})
+
+    # 按 DEFAULTS 的顺序写，不是字典的插入顺序
+    assert written == ["auto_poll_scope", "notify_enabled"]
+    text = _read(data_files)
+    assert text.startswith("poll_interval_seconds = 2\n\n")  # 原有内容在最前，补的在后
+    cfg, _ = config.load_config()
+    assert cfg["notify_enabled"] is True
+    assert cfg["auto_poll_scope"] == "sold_out"
+    assert cfg["poll_interval_seconds"] == 2.0
+
+
+def test_save_config_leaves_commented_lines_alone(data_files):
+    """被注释掉的同名行不算数：那是用户自己留的记录，另起一行写新值。"""
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", "# poll_interval_seconds = 2\n")
+
+    config.save_config({"poll_interval_seconds": 5.0})
+
+    assert _read(data_files) == "# poll_interval_seconds = 2\n\npoll_interval_seconds = 5.0\n"
+
+
+def test_save_config_builds_on_the_example_file(data_files):
+    """没有 config.toml 时拿 example 当底稿：它的注释就是说明书。"""
+    _remove(data_files, "config.toml")
+    _write(data_files, "config.example.toml", (
+        "# 抓取间隔，秒\n"
+        "poll_interval_seconds = 2\n"
+    ))
+
+    config.save_config({"poll_interval_seconds": 5.0})
+
+    text = _read(data_files)
+    assert "# 抓取间隔，秒" in text
+    assert "poll_interval_seconds = 5.0" in text
+
+
+def test_save_config_works_without_any_base_file(data_files):
+    """两份文件都没有也能写：从零起一份。"""
+    _remove(data_files, "config.example.toml", "config.toml")
+
+    written = config.save_config({"auto_poll_enabled": True})
+
+    assert written == ["auto_poll_enabled"]
+    assert _read(data_files) == "auto_poll_enabled = true\n"
+
+
+def test_save_config_keeps_one_backup(data_files):
+    """写前留一份 .bak，只留第一次那份；之后再写不改它。"""
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", "poll_interval_seconds = 2\n")
+
+    config.save_config({"poll_interval_seconds": 5.0})
+    assert _read(data_files, "config.toml.bak") == "poll_interval_seconds = 2\n"
+
+    config.save_config({"poll_interval_seconds": 7.0})
+    assert _read(data_files, "config.toml.bak") == "poll_interval_seconds = 2\n"
+    assert "poll_interval_seconds = 7.0" in _read(data_files)
+
+
+def test_save_config_quotes_awkward_strings(data_files):
+    """引号、反斜杠、换行都得处理掉：写进去的必须还是一份能读的 TOML。"""
+    _remove(data_files, "config.example.toml", "config.toml")
+    value = 'https://x.test/p?q="a"\\b&clusterId={clusterId}\nnotify_enabled = true'
+
+    config.save_config({"detail_url_template": value})
+
+    cfg, warnings = config.load_config()
+    assert warnings == []
+    # 换行被去掉，其余原样；关键是没多写出一行配置来
+    assert "\n" not in cfg["detail_url_template"]
+    assert cfg["notify_enabled"] is False  # 没被那行假配置改掉
+    assert "\\" in cfg["detail_url_template"] and '"a"' in cfg["detail_url_template"]
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("poll_interval_seconds", 3.5),
+        ("auto_poll_interval_minutes", 15),
+        ("auto_poll_scope", "sold_out"),
+        ("notify_enabled", False),
+        ("notify_min_interval_seconds", 60),
+        ("deal_highlight_color", "#123456"),
+    ],
+)
+def test_save_config_round_trips(data_files, key, value):
+    """写下去再读回来是同一个值，且不惊动校验（没有警告）。"""
+    _remove(data_files, "config.example.toml")
+
+    config.save_config({key: value})
+
+    cfg, warnings = config.load_config()
+    assert cfg[key] == value
+    assert warnings == []  # config.toml 在，也没有被忽略的项
+
+
+def test_save_config_ignores_unknown_keys(data_files):
+    """不认识的键直接跳过：写进去也是下次启动被警告一遍。"""
+    _remove(data_files, "config.example.toml")
+
+    assert config.save_config({"nope": 1}) == []
+    assert not (data_files / "config.toml").exists()
+
+
+def test_save_config_with_no_changes_does_not_touch_the_file(data_files):
+    """没什么可写的就不落盘：连 .bak 都不该冒出来。"""
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", "poll_interval_seconds = 2")
+
+    assert config.save_config({}) == []
+    assert _read(data_files) == "poll_interval_seconds = 2"
+    assert not (data_files / "config.toml.bak").exists()
