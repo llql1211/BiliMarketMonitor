@@ -3614,22 +3614,6 @@ def test_switch_theme_persists_choice(window, qapp):
     assert w2.dark is w.dark
 
 
-def test_switch_theme_without_persist_only_changes_the_look(window, qapp):
-    """设置窗口里预览主题（persist=False）：界面换了，库里一个字没写。
-
-    不然「勾上深色 -> 取消」也会被记下来，下次启动就成了用户没选过的暗色。
-    """
-    w = window()
-    start = w.dark
-    assert w.store.get_setting("theme") is None
-
-    w.SwitchTheme(not start, persist=False)
-
-    assert w.dark is not start
-    assert w.store.get_setting("theme") is None
-    assert qapp.styleSheet() == (theme.DARK_QSS if w.dark else theme.LIGHT_QSS)
-
-
 def test_apply_theme_installs_tooltip_delay(window, qapp, monkeypatch):
     """应用主题时顺带拉长悬停提示的延时（样式表管不到，得走样式提示）。"""
     installed = []
@@ -3676,10 +3660,12 @@ def _accept(monkeypatch, edits=None, boxes=None):
 
 
 def _cancel(monkeypatch):
-    """让设置窗口返回「取消」，顺带勾一下主题——预览过的东西得被拨回去。"""
+    """让设置窗口返回「取消」，并照着真人的做法勾了一堆东西再取消。"""
     def _exec_(dialog):
         box = dialog.checkboxes[settings.THEME_KEY]
         box.setChecked(not box.isChecked())
+        dialog.editors["poll_interval_seconds"].setText("99")
+        dialog.checkboxes["auto_poll_enabled"].setChecked(True)
         return QDialog.Rejected
 
     monkeypatch.setattr(settings.SettingsDialog, "exec_", _exec_)
@@ -3742,23 +3728,27 @@ def test_settings_ok_with_nothing_changed_does_not_touch_the_file(
     assert w.progress_label.text() == "设置已保存：没有改动"
 
 
-def test_settings_cancel_changes_nothing(window, data_files, monkeypatch):
-    """取消：文件不动，只把预览过的主题拨回去（库里也不记）。"""
+def test_settings_cancel_changes_nothing(window, data_files, monkeypatch, qapp):
+    """取消：勾了主题也好、改了数也好，一样都不生效，文件也不动。"""
     original = "poll_interval_seconds = 2\n"
     w = window("10000008780\n", config_toml=original)
     start = w.dark
+    sheet = qapp.styleSheet()
     _cancel(monkeypatch)
 
     w.OnOpenSettings()
 
     assert (data_files / "config.toml").read_text(encoding="utf-8") == original
-    assert w.dark is start
-    assert w.store.get_setting("theme") is None
     assert w.config["poll_interval_seconds"] == 2.0
+    assert not w.auto_poll_timer.isActive()
+    assert w.dark is start
+    assert qapp.styleSheet() == sheet          # 界面颜色没被预览动过
+    assert w.store.get_setting("theme") is None
+    assert "设置已保存" not in w.progress_label.text()
 
 
-def test_settings_ok_records_the_theme(window, data_files, monkeypatch):
-    """主题也勾着改了：连同配置一起记下来，下次启动沿用。"""
+def test_settings_ok_records_the_theme(window, data_files, monkeypatch, qapp):
+    """主题也勾着改了：按确定才换，并连同配置一起记下来，下次启动沿用。"""
     w = window("10000008780\n", config_toml="poll_interval_seconds = 2\n")
     start = w.dark
     _accept(monkeypatch, edits={"poll_interval_seconds": "5"},
@@ -3767,6 +3757,7 @@ def test_settings_ok_records_the_theme(window, data_files, monkeypatch):
     w.OnOpenSettings()
 
     assert w.dark is not start
+    assert qapp.styleSheet() == (theme.DARK_QSS if w.dark else theme.LIGHT_QSS)
     assert w.store.get_setting("theme") == ("dark" if w.dark else "light")
     assert w.progress_label.text() == "设置已保存：1 项已写入 config.toml、主题已记下"
 
@@ -3827,12 +3818,16 @@ def test_settings_refresh_the_tooltips_that_quote_config(window, monkeypatch):
     )
 
 
-def test_settings_write_failure_changes_nothing(window, data_files, monkeypatch, msgboxes):
-    """写不进去（只读、盘满）：一份都别生效，主题也拨回去，并说明白怎么回事。"""
+def test_settings_write_failure_changes_nothing(
+    window, data_files, monkeypatch, msgboxes, qapp,
+):
+    """写不进去（只读、盘满）：一份都别生效，主题也不换，并说明白怎么回事。"""
     original = "poll_interval_seconds = 2\n"
     w = window("10000008780\n", config_toml=original)
     start = w.dark
-    _accept(monkeypatch, edits={"poll_interval_seconds": "5"})
+    sheet = qapp.styleSheet()
+    _accept(monkeypatch, edits={"poll_interval_seconds": "5"},
+            boxes={settings.THEME_KEY: not start})
 
     def _boom(changes, path=None):
         raise OSError("磁盘只读")
@@ -3842,6 +3837,7 @@ def test_settings_write_failure_changes_nothing(window, data_files, monkeypatch,
 
     assert w.config["poll_interval_seconds"] == 2.0
     assert w.dark is start
+    assert qapp.styleSheet() == sheet
     assert (data_files / "config.toml").read_text(encoding="utf-8") == original
     assert w.store.get_setting("theme") is None
     assert msgboxes[-1]["kind"] == "warning"

@@ -130,9 +130,8 @@ data/watchlist.txt
 ### 设置改完怎么生效
 
 ```text
-按「设置」──► settings.SettingsDialog(值, 主题, parent)    只摆、只收，不碰文件
-                    │  勾「深色模式」──► theme_previewed 信号 ──► SwitchTheme(dark, persist=False)
-                    │                                              只换外观，不进缓存库
+按「设置」──► settings.SettingsDialog(值, 主题, parent)    只摆、只收，不碰文件：窗口开着时
+                    │                                      改什么都不生效，取消就等于没开过
                     ▼  按「确定」（校验不过就停在窗口里，翻到出错那页）
               settings.changed_values(收上来的值, self.config)   只挑改过的项
                     │
@@ -140,21 +139,24 @@ data/watchlist.txt
                     │                                第一次写前留一份 config.toml.bak
                     ▼
               config.load_config()  ──►  MainWindow.ApplyConfig()
+                    │
+                    └► SwitchTheme(值里的主题)   只有勾了主题才走，换外观 + 记进缓存库
 ```
 
 - **两条腿生效**：多数项是"用到的时候现读 `self.config`"，重读一遍就是新值；
   只有启动时算好存下来的那几处要 `ApplyConfig` 重算——成交高亮的秒数与画刷、
   写在提示里的两个参数（抓取间隔、详情页模板）、自动抓取的定时器与顶部状态字。
   重画表格是为了让高亮的改动看得见，选中态按商品搬回去。
+- **窗口里不预览**：勾主题、改数字都只停在窗口里，等按下「确定」才由主窗口一次做完，
+  「取消」不用回滚任何东西。用户要的就是这个手感——勾一下就把整个界面先变一半太晃眼。
 - **正在跑的那一轮不动**：`PollerThread` 手里的任务在开跑时就定下了参数，改设置影响的是下一轮。
   这也是按钮提示里那句「正在跑的那一轮仍用它开始时的参数」的来由。
 - **主题记在缓存库、不在 config.toml**：`store` 的设置表里存 `theme`，所以它由
-  `SwitchTheme(..., persist=True)` 单独记一笔，`changed_values()` 永远不把主题写进配置文件。
-  设置窗口里勾主题只预览（`persist=False`），按「取消」拨回去，库里的记录不动。
+  `SwitchTheme()` 单独记一笔（换外观 + 存一行），`changed_values()` 永远不把主题写进配置文件。
 - **写回是"只改改过的"**：`config.save_config()` 是逐行替换，没动过的行（包括注释）原样留着。
   这样设置窗口不把 `config.example.toml` 的默认值抄进用户文件，也不改写用户自己的注释。
-- **写不进去就一样都不生效**：`save_config` 抛 `OSError`（只读、盘满）时弹一句提示、
-  把预览过的主题拨回去，内存里的配置不动——只改内存会让表格和文件对不上，
+- **写不进去就一样都不生效**：`save_config` 抛 `OSError`（只读、盘满）时弹一句提示就返回，
+  配置与主题都还停在原样——只改内存会让表格和文件对不上，
   和删清单/写清单失败时的回滚是同一个道理。
 
 ## 线程模型
@@ -385,7 +387,7 @@ data/watchlist.txt
 | 成交时间是认不出的格式（如绝对日期、错别字） | 照旧显示原文，只是不高亮 |
 | 配置里的高亮色认不出来（如 `orangejuice`） | 退回默认橙色并打印提示，不会静默变成「高亮没生效」 |
 | 设置窗口里填了不合格的值（数字框里写了别的、颜色名不存在、webhook 不是企业微信的地址） | 窗口不关，底部列出「页签：原因」并翻到出问题的那一页；一项不合格就整份不写，不留半新半旧的配置 |
-| 写 `config.toml` 失败（只读、盘满） | 弹一句提示，本次改的都不生效、预览过的主题拨回去；内存里的配置不动，省得跟文件对不上 |
+| 写 `config.toml` 失败（只读、盘满） | 弹一句提示，本次改的都不生效（主题也不换）；内存里的配置不动，省得跟文件对不上 |
 | 推送发不出去（网络、webhook 被删、地址填错） | 控制台打一行带原因，状态栏在后面接一句「企业微信推送失败：…」；**不弹窗**，抓取结果照旧 |
 
 留痕的路子是同一个：`store` 和 `links` 的公开操作都收一个 `notes` 列表（不传就只静默降级），
@@ -453,7 +455,7 @@ pixi run test           # 等价于 pixi run python -m pytest
 | [tests/test_links.py](../tests/test_links.py) | 清单解析、去重、规范化回写 |
 | [tests/test_notifier.py](../tests/test_notifier.py) | 企业微信报文、`errcode` 判定、地址校验与脱敏、发送线程回信号 |
 | [tests/test_parser.py](../tests/test_parser.py) | 响应解析与全路径判空 |
-| [tests/test_settings.py](../tests/test_settings.py) | 设置窗口：字段表覆盖了每一项配置、三页签、控件种类、收值与拦错、主题预览信号 |
+| [tests/test_settings.py](../tests/test_settings.py) | 设置窗口：字段表覆盖了每一项配置、三页签、控件种类与位置、收值与拦错、勾主题不预览 |
 | [tests/test_store.py](../tests/test_store.py) | 缓存随清单增删、设置项、损坏自愈 |
 | [tests/test_theme.py](../tests/test_theme.py) | 样式表、占位文字配色、系统深浅色判断 |
 

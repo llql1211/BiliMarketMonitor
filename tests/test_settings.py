@@ -1,10 +1,11 @@
-"""设置窗口的测试：字段表齐全、控件回填、收集与校验、主题预览。
+"""设置窗口的测试：字段表齐全、控件回填与位置、收集与校验。
 
 窗口只依赖 config 和 theme（不认识 MainWindow），所以这里直接造对话框就够，
 不用起主窗口。写文件那一步在 test_config.py，接进主窗口那步在 test_app.py。
 """
 
 import pytest
+from PyQt5.QtCore import QPoint, QRect
 from PyQt5.QtWidgets import QCheckBox, QComboBox, QLineEdit
 
 import config
@@ -122,6 +123,75 @@ def test_every_row_has_a_question_badge_with_a_tip(dialog):
     for badge in d.badges:
         assert badge.text() == "?"
         assert badge.toolTip().strip()
+
+
+def _shown(dialog, qapp, section):
+    """翻到某一页并让 Qt 真正摆一遍——没露过面的页签量不到位置。"""
+    d = dialog()
+    d.show()
+    d.tabs.setCurrentIndex(d.section_index[section])
+    qapp.processEvents()
+    return d
+
+
+def _rect(widget, parent):
+    """控件在 parent 坐标系里的位置（几个控件分属不同的布局，得挪到一起比）。"""
+    return QRect(widget.mapTo(parent, QPoint(0, 0)), widget.size())
+
+
+def test_the_question_badge_sits_left_of_the_control(dialog, qapp):
+    """圈「？」紧挨在控件的左边，并跟它在同一行。
+
+    这是用户点名要的位置（原来在右边）。摆错一眼看得出来，所以钉在测试里，
+    别哪天顺手又挪回去。
+    """
+    d = _shown(dialog, qapp, "basic")
+    badges = {field.key: d.badges[i] for i, field in enumerate(settings.FIELDS)}
+    rows = {
+        "basic": [("detail_url_template", d.editors["detail_url_template"])],  # 输入框
+        "auto": [("auto_poll_scope", d.editors["auto_poll_scope"])],           # 下拉框
+        "notify": [("notify_on_favorite_drop",
+                    d.checkboxes["notify_on_favorite_drop"])],                 # 复选框
+    }
+
+    for section, section_rows in rows.items():
+        d.tabs.setCurrentIndex(d.section_index[section])
+        qapp.processEvents()
+        for key, control in section_rows:
+            badge = _rect(badges[key], d)
+            cell = _rect(control, d)
+            assert badge.right() < cell.left(), f"{key} 的「？」不在控件左边"
+            # 同一行：竖直中线上对得上（差一两个像素是行高不同导致的）
+            assert abs(badge.center().y() - cell.center().y()) <= 2, (
+                f"{key} 的「？」不在同一行"
+            )
+            assert badge.left() >= settings.LABEL_WIDTH - 4, f"{key} 的「？」压到标签上了"
+
+
+def test_controls_of_a_page_line_up_in_one_column(dialog, qapp):
+    """同一页里输入框、下拉框、复选框都从同一处起头。
+
+    布尔项的标签本来就是复选框自己的文字，不是单独一格的 QLabel，所以只有
+    它们容易跟别的行错开——这里正是把「对齐」钉住的。
+    """
+    d = _shown(dialog, qapp, "auto")
+    pages = {
+        "auto": [
+            d.checkboxes["auto_poll_enabled"],
+            d.editors["auto_poll_interval_minutes"],
+            d.editors["auto_poll_scope"],
+        ],
+        "notify": [
+            d.checkboxes["notify_enabled"],
+            d.editors["notify_wecom_webhook"],
+            d.editors["notify_min_interval_seconds"],
+        ],
+    }
+
+    for section, row in pages.items():
+        d.tabs.setCurrentIndex(d.section_index[section])
+        qapp.processEvents()
+        assert len({_rect(widget, d).left() for widget in row}) == 1
 
 
 def test_number_text_drops_the_trailing_zero():
@@ -270,17 +340,19 @@ def test_a_webhook_that_is_not_wecom_is_refused(dialog):
 # ---------------- 主题与「改过哪些项」 ----------------
 
 
-def test_theme_checkbox_previews_and_recolors(dialog):
-    """勾上深色模式当场发信号（主窗口据此换主题），自己的自绘颜色也换掉。"""
+def test_toggling_the_theme_waits_for_ok(dialog):
+    """勾「深色模式」不预览：窗口还是原来那身颜色，值等按确定才交出去。
+
+    用户要的是「按下确定才生效」，所以勾一下不能把整个界面先变一半——
+    取消也就真等于没打开过。
+    """
     d = dialog()
-    seen = []
-    d.theme_previewed.connect(seen.append)
     before = d.badges[0].styleSheet()
 
     d.checkboxes[settings.THEME_KEY].setChecked(True)
 
-    assert seen == [True]
-    assert d.badges[0].styleSheet() != before  # 圈「？」跟着换色
+    assert d.badges[0].styleSheet() == before  # 圈「？」没跟着换色
+    assert d.Values() == {}                    # 还没按确定，什么都还没交出去
 
 
 def test_theme_is_carried_in_the_values(dialog):

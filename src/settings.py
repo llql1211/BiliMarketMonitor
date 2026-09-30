@@ -13,7 +13,7 @@
 代价是「加一项配置」要动两处，由 tests/test_settings.py 盯着别漏。
 """
 
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QCheckBox,
@@ -51,10 +51,9 @@ SECTIONS = (
     ("notify", "企业微信推送"),
 )
 
-FOOTER_TEXT = "点「确定」立即生效；只把改过的项写回 config.toml，那里的注释不会被动"
-
-# 标签列的宽度：够放下最长的「成交高亮时限（小时）」，再宽就是白占输入框的地
-LABEL_WIDTH = 150
+# 一行的三列：标签 / 圈「？」/ 控件。圈「？」紧挨在控件的左边（用户要求的），
+# 所以它自成一列，正好也把所有行的控件左边对齐
+LABEL_WIDTH = 150  # 标签列的起步宽度：够放下最长的「成交高亮时限（小时）」
 BADGE_SIZE = 16
 
 
@@ -84,7 +83,7 @@ FIELDS = (
     # 免得跟下面几项混成「配置项」
     Field(
         THEME_KEY, "深色模式", BOOL,
-        "勾上就是暗色主题，当场换；记在本地设置里，不写进 config.toml",
+        "勾上就是暗色主题，按确定后换；记在本地设置里，不写进 config.toml",
         "basic", group="界面",
     ),
     Field(
@@ -247,10 +246,10 @@ class SettingsDialog(QDialog):
     """三页签的设置窗口（模态，确定 / 取消）。
 
     只造不弹也能用：`Values()` 拿到的是校验后的值，主窗口拿它去写文件。
-    """
 
-    # 深色模式被勾上/取消：主窗口接这个信号当场换主题（取消时再回滚）
-    theme_previewed = pyqtSignal(bool)
+    窗口里改什么都不当场生效——包括主题在内，都要等按下「确定」由主窗口去做，
+    「取消」就等于什么都没发生过。
+    """
 
     def __init__(self, values, dark, parent=None):
         super().__init__(parent)
@@ -260,7 +259,7 @@ class SettingsDialog(QDialog):
         self.checkboxes = {}       # key -> QCheckBox（布尔项的取值都走它）
         self.editors = {}          # key -> QLineEdit / QComboBox
         self.badges = []
-        self.placeholder_editors = []  # 有占位文字的输入框，换主题要重上色
+        self.placeholder_editors = []  # 有占位文字的输入框，上色时要一起过一遍
         self.section_titles = {}       # 内部名 -> 页签标题（报错文案里要用）
         self.section_index = {}        # 内部名 -> 页签序号（出错时翻页要用）
 
@@ -278,9 +277,6 @@ class SettingsDialog(QDialog):
         self.error_label.setVisible(False)
         layout.addWidget(self.error_label)
 
-        self.footer = QLabel(FOOTER_TEXT)
-        layout.addWidget(self.footer)
-
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText("确定")
         buttons.button(QDialogButtonBox.Cancel).setText("取消")
@@ -294,6 +290,20 @@ class SettingsDialog(QDialog):
         self.resize(720, 560)
 
     # ---------------- 摆 ----------------
+
+    def _LabelColumnWidth(self) -> int:
+        """标签那一列统一多宽：按最长的那条标签量。
+
+        一页里的每组各是一个 QGridLayout，列宽只由自己那几行顶出来——哪组里
+        恰好有长标签，那组的控件就整体往右挪一截，跟别的组对不齐。统一按最长
+        的那条来（再兜个 LABEL_WIDTH 的下限），所有行就落在同一条竖线上。
+
+        量的是字宽而不是写死一个数：用户那边的字号、DPI 跟这里不一样，
+        写死的话标签会被裁掉半个字。
+        """
+        metrics = self.fontMetrics()
+        return max(LABEL_WIDTH,
+                   max(metrics.horizontalAdvance(field.label) for field in FIELDS))
 
     def _BuildSection(self, section):
         """一页：按 group 分组摆行，没写 group 的项直接铺在外层。"""
@@ -312,30 +322,33 @@ class SettingsDialog(QDialog):
                 else:
                     grid = QGridLayout()
                     outer.addLayout(grid)
-                grid.setColumnStretch(1, 1)  # 输入框吃掉多余宽度，标签和「？」各占一边
-                grid.setColumnMinimumWidth(0, LABEL_WIDTH)
+                grid.setColumnStretch(2, 1)  # 控件那列吃掉多余宽度
+                grid.setColumnMinimumWidth(0, self._LabelColumnWidth())
+                grid.setColumnMinimumWidth(1, BADGE_SIZE)
                 grids[field.group] = grid
             self._AddRow(grid, grid.rowCount(), field)
         outer.addStretch()
         return page
 
     def _AddRow(self, grid, row, field):
+        """一行摆三格：标签 / 圈「？」/ 控件。
+
+        圈「？」在控件左边，是用户点名要的位置；布尔项那边标签本来就是复选框
+        自己的文字，所以只摆后两格（第一格空着，控件照样跟别的行对齐）。
+        """
         if field.kind == BOOL:
             box = QCheckBox(field.label)
             box.setChecked(bool(self.current_values.get(field.key)))
             self.checkboxes[field.key] = box
-            # 主题这一项要当场预览，别的项等「确定」一起生效
-            if field.key == THEME_KEY:
-                box.toggled.connect(self._OnThemeToggled)
-            grid.addWidget(box, row, 0, 1, 2)
+            grid.addWidget(box, row, 2)
         else:
             grid.addWidget(QLabel(field.label), row, 0)
             editor = self._MakeEditor(field)
             self.editors[field.key] = editor
-            grid.addWidget(editor, row, 1)
+            grid.addWidget(editor, row, 2)
         badge = TipBadge(field.tip)
         self.badges.append(badge)
-        grid.addWidget(badge, row, 2)
+        grid.addWidget(badge, row, 1)
 
     def _MakeEditor(self, field):
         current = self.current_values.get(field.key)
@@ -421,15 +434,13 @@ class SettingsDialog(QDialog):
 
     # ---------------- 主题 ----------------
 
-    def _OnThemeToggled(self, checked):
-        # 自己这几个自绘的颜色先跟着换（圈「？」、占位灰、提示字），
-        # 整个程序的样式由主窗口去装——这里不认识主窗口，只发个信号
-        self.SetDark(checked)
-        self.theme_previewed.emit(checked)
-
     def SetDark(self, dark: bool):
+        """给窗口里自绘的那几处上色（圈「？」、占位灰、出错提示）。
+
+        窗口只在造出来时按当前主题上一次色：主题要等按下「确定」才换，换了窗口
+        也就关了，不会留一个半深半浅的窗口在屏幕上。
+        """
         self.error_label.setStyleSheet(f"color: {theme.error_color(dark).name()};")
-        self.footer.setStyleSheet(f"color: {theme.muted_color(dark).name()};")
         for editor in self.placeholder_editors:
             theme.style_placeholder(editor, dark)
         for badge in self.badges:

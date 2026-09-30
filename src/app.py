@@ -3176,15 +3176,9 @@ class MainWindow(QMainWindow):
         self.updated_label.setStyleSheet(f"color: {theme.muted_color(dark).name()};")
         self.auto_poll_label.setStyleSheet(f"color: {theme.muted_color(dark).name()};")
 
-    def SwitchTheme(self, dark: bool, persist: bool = True):
-        """换主题：装样式、重画表格。
-
-        persist 决定要不要把这次选择记进缓存库的设置表（下次启动沿用）。设置窗口
-        里勾「深色模式」走的是 persist=False：那会儿还没按确定，先让人看着效果，
-        取消的话主窗口再把主题拨回去，库里的记录一个字没动。
-        """
-        if persist:
-            self.store.set_setting("theme", "dark" if dark else "light")
+    def SwitchTheme(self, dark: bool):
+        """换主题：记进设置表（下次启动沿用）、装样式、重画表格。"""
+        self.store.set_setting("theme", "dark" if dark else "light")
         self.ApplyTheme(dark)
         # 单元格里的颜色（原价的弱化色、涨跌的红绿）都是按主题选的，换主题得
         # 重画一遍才换得掉；选中态按商品搬回去，免得切个主题就把选中的行丢了
@@ -3205,12 +3199,8 @@ class MainWindow(QMainWindow):
         """
         values = dict(self.config)
         values[settings.THEME_KEY] = self.dark  # 主题在缓存库里，不在 config 里
-        dialog = settings.SettingsDialog(values, self.dark, self)
-        # 勾主题当场预览：还没按确定，所以只换不记（见 SwitchTheme 的 persist）
-        dialog.theme_previewed.connect(
-            lambda dark: self.SwitchTheme(dark, persist=False)
-        )
-        return dialog
+        # 窗口只摆不生效：改什么、勾什么都在窗口里待着，按下「确定」才由这里动手
+        return settings.SettingsDialog(values, self.dark, self)
 
     def OnOpenSettings(self):
         """按下「设置」：弹出设置窗口，按确定后写回 config.toml 并立刻生效。
@@ -3218,24 +3208,20 @@ class MainWindow(QMainWindow):
         生效靠两条腿：多数配置项是用到的时候现读 self.config，重读一遍就是新值；
         剩下几处是启动时算好存下来的（成交高亮的秒数与画刷、两处写在提示里的
         参数、自动抓取的定时器），由 ApplyConfig 重算。
+
+        窗口在的时候什么都没动过，「取消」直接原地返回即可。
         """
-        before_dark = self.dark
         dialog = self.SettingsDialog()
         if dialog.exec_() != QDialog.Accepted:
-            # 取消：预览过的主题拨回去。别的都还没动过——写文件在确定之后
-            if self.dark != before_dark:
-                self.SwitchTheme(before_dark, persist=False)
-            return
+            return  # 取消：文件没动、界面没动，等于没打开过
 
         values = dialog.Values()
-        # self.config 还是弹窗前的值：只有下面写文件成功才会被重新读一遍
+        # self.config 和 self.dark 都还是弹窗前的值（窗口不预览）
         changes = settings.changed_values(values, self.config)
         try:
             written = config.save_config(changes)
         except OSError as error:
             # 一份都写不进去就一样都别生效，并说明白：只改内存会让表格和文件对不上
-            if self.dark != before_dark:
-                self.SwitchTheme(before_dark, persist=False)
             QMessageBox.warning(self, SETTINGS_FAIL_TITLE,
                                 SETTINGS_FAIL_TEXT.format(error=error))
             return
@@ -3252,11 +3238,11 @@ class MainWindow(QMainWindow):
                 if warning not in before_warnings:
                     print(f"[config] {warning}")
             self.ApplyConfig()
-        # 主题记在缓存库的设置表里，跟 config.toml 不是一处，单独记一笔
-        theme_changed = values[settings.THEME_KEY] != before_dark
+        # 主题记在缓存库的设置表里，跟 config.toml 不是一处，走 SwitchTheme 单独记
+        theme_changed = values[settings.THEME_KEY] != self.dark
         if theme_changed:
-            self.store.set_setting(settings.THEME_KEY,
-                                   "dark" if values[settings.THEME_KEY] else "light")
+            # 窗口不预览，这里是这次改动的第一次生效：换样式、重画表格，写回设置表
+            self.SwitchTheme(values[settings.THEME_KEY])
 
         parts = []
         if written:
