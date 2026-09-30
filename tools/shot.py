@@ -151,6 +151,33 @@ def seed_favorites(rows=(0, 2)):
     )
 
 
+def seed_auto_poll(minutes=30, scope="favorite"):
+    """在沙盒配置里打开自动抓取，好让出图时看得到顶部那截状态。
+
+    默认那份写着「自动：关」，五个字看不出开着时那截（「自动：30 分钟 / 收藏」）
+    跟左边的「上次更新时间」挤在同一行是什么样——那才是要眼看的那个状态。
+
+    沙盒里可能已经有一份从真实 data/ 复制来的 config.toml（那是用户的配置，
+    不去动它写好的取值），所以只在它没提过 auto_poll_enabled 时才追加几行。
+    重复的键会让整个 TOML 读不出来（配置一坏，出图看到的就不是平时的样子了），
+    所以这里必须先看一眼。
+
+    只动沙盒副本，真实 data/ 一个字都不改（跟 seed_expected_prices 同一个出发点）。
+    """
+    import config
+
+    path = Path(config.data_dir()) / "config.toml"
+    if path.exists() and "auto_poll_enabled" in path.read_text(encoding="utf-8"):
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(
+            "\n# shot 工具追加：让出图里能看到自动抓取那截状态\n"
+            "auto_poll_enabled = true\n"
+            f"auto_poll_interval_minutes = {minutes}\n"
+            f'auto_poll_scope = "{scope}"\n'
+        )
+
+
 def seed_lowest_prices(skip=3, count=4, factor=0.85):
     """往沙盒缓存里几行塞一条比现价低的史低价，好让表格场景看出这一列的样子。
 
@@ -522,6 +549,7 @@ def main(argv):
     seed_expected_prices()
     seed_lowest_prices()
     seed_favorites()
+    seed_auto_poll()
     out.mkdir(parents=True, exist_ok=True)
 
     for name in sorted(wanted):
