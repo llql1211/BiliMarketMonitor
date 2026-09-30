@@ -71,8 +71,8 @@ BiliMarketMonitor/
 - **网页地址（webhook）是敏感信息**：只在 `data/config.toml` 里出现（`config.example.toml` 给的是空串），
   不入库、不写进缓存；出错文案里可能夹着它（requests 的网络异常会把整条 URL 抄进去），
   所以 `notifier._redact_webhook` 会把 `key=` 后面那段先抹掉再往外说。
-- **测试面**：`parser` 和 `links` 是纯函数，最好测；`app` 有 3100 多行、逻辑最重，测试也最厚
-  （`tests/test_app.py` 5100 行）；改这两处时对应测试一起改。
+- **测试面**：`parser` 和 `links` 是纯函数，最好测；`app` 有 3200 多行、逻辑最重，测试也最厚
+  （`tests/test_app.py` 5300 行）；改这两处时对应测试一起改。
   `notifier` 的发送链路全 mock，测试一个字节都不出网。
 
 ## 数据流
@@ -108,7 +108,7 @@ data/watchlist.txt
 - **推送在 `OnPollFinished` 里发，但和「总结」不是一回事**：总结在用户中途「停止抓取」的那一轮
   不弹（半份数据容易让人误会），而已经观察到的补货、到价都是真的——所以 `FlushNotifications()`
   挂在 `poller_stopped` 那个分支**之前**，该推的照推。
-  `MainWindow.notify_queue` 只由触发逻辑填（见 `notify_on_*` 配置），本轮没攒下东西
+  `MainWindow.notify_queue` 只由触发逻辑填（判据见「几个关键判定 → 通知什么时候发」），本轮没攒下东西
   或总开关关着就一个线程都不起；`last_notify_at` 管限流，间隔之内不重新计时也不丢队列。
 - **清单是唯一的跟踪标准**，缓存只是加速层。所以缓存丢了、坏了都能重新抓回来，
   而清单里的东西是不可再生的（尤其是预期价，那是抓不回来的用户意图）。
@@ -298,6 +298,39 @@ data/watchlist.txt
 - 比较放在 `app` 而不是 `store`：`store` 只按 `COALESCE` 存递进来的值，不 import `parser`，
   维持「模块单向依赖、只有 `links` 借 `parser`」这条线（见「模块职责」）。
 
+**通知什么时候发**（`app.NotifyTags` / `FlushNotifications`）
+
+判定在 `OnResultReady` 里做（结果一到手就判，跟写缓存同一处），发送在 `OnPollFinished`
+收尾时做。五类触发各由一个 `notify_on_*` 开关控制：
+
+| 标签 | 判据 | 边的来源 |
+| --- | --- | --- |
+| `恢复在售` | `price_change` 的 `kind == CHANGE_ON_SALE` | 本身是边沿 |
+| `低于预期价` | `expected_reached` 且这次是**刚**跌破：拿 `previous` 里的价现算一次上一次是否到价，只在 `上次 False → 这次 True` 时算数 | 状态，需自己比 |
+| `创史低` | `updated_lowest()` 返回非 `None` 且收藏 | 本身是边沿 |
+| `降价 ↓6` | `price_change` 的 `kind == CHANGE_DOWN` 且收藏 | 本身是边沿 |
+| `低于预期价`（非收藏） | 同「到价」，只是商品没收藏 | 状态，需自己比 |
+
+到价那条的开关按收藏与否分成 `notify_on_favorite_target` / `notify_on_any_target` 两个：
+收藏的是你要盯的，没收藏的不该一样吵。
+
+- **判据只认边沿，不认状态**：`at_lowest`（现价等于史低价）每轮都成立——那才是常态——
+  拿它当触发就是每轮刷屏，所以创史低用 `updated_lowest`（只在刷新时返回非 `None`）。
+  「一直低于预期价」同理，只在跌破那一刻推一次。
+- **第一次观察不发通知**：缓存里没有上一轮的价格（`previous["price_text"]` 为空）时只记录状态。
+  否则刚打开程序、刚加进清单的商品，一抓就是一串「到价」——那是记基线，不是新闻。
+- **判定与写缓存共用一次计算**：`updated_lowest` 在 `OnResultReady` 里算一次，
+  既递给 `store.upsert_item` 又用来判创史低；因为要跟「这次抓取之前」那份比，
+  它必须排在 `upsert` 之前。
+- **合并分两层**：同一件商品一轮踩中几条，标签用 ` · ` 连成一行（`恢复在售 · 创史低`）；
+  一轮里多件商品在 `FlushNotifications` 里并成**一条**消息。一条消息装一轮的全部触发，
+  而不是一件一条——手机上一串单条消息比一条长消息更难读。
+- **节流靠 `last_notify_at`**：没到 `notify_min_interval_seconds` 就把队列留着，
+  等下一轮再判。留下的不是「过期的边沿」：消息写的是「恢复在售」，晚一轮发也仍然是真的。
+- **`last_notify_at` 初值是 `-inf` 不是 `0.0`**：`time.monotonic()` 是**开机以来的秒数**，
+  取 `0.0` 的话，开机头一分钟里启动程序，第一次推送会被自己的限流挡掉——而边沿只发生一次，
+  挡掉就是永远错过。测试 `test_first_push_is_not_throttled_by_uptime` 盯着这条。
+
 **画格子的时机**：抓取开始时把价格清成 `--`，刷到哪行填哪行，一眼能看出进度。
 `PENDING_TEXT`、`NO_DATA_TEXT`、`CLEARED_TEXT`、`FAILED_TEXT` 几个占位符在 `app.py` 顶部。
 
@@ -376,7 +409,7 @@ pixi run test           # 等价于 pixi run python -m pytest
 
 | 测试文件 | 覆盖 |
 | --- | --- |
-| [tests/test_app.py](../tests/test_app.py) | 主窗口渲染与按钮流程、`PollerThread`、缩略图线程、总结窗口 |
+| [tests/test_app.py](../tests/test_app.py) | 主窗口渲染与按钮流程、`PollerThread`、缩略图线程、总结窗口、通知触发与合并 |
 | [tests/test_client.py](../tests/test_client.py) | 请求形态与各类失败的统一出口 |
 | [tests/test_config.py](../tests/test_config.py) | 配置优先级与逐项校验 |
 | [tests/test_links.py](../tests/test_links.py) | 清单解析、去重、规范化回写 |
@@ -419,6 +452,7 @@ pixi run shot           # 出图在 tmp/out/，每个场景深色/浅色各一�
 | 自动抓取的间隔、范围与总结开关 | `data/config.toml` 的 `auto_poll_*` 四项，校验在 `config.py`；调度在 `app.ScheduleAutoPoll()` / `OnAutoPoll()` / `AutoPollTasks()` |
 | 企业微信推送的开关、地址、限流 | `data/config.toml` 的 `notify_*` 八项，校验在 `config.py`；正文在 `app.BuildNotifyMarkdown()`，发送在 `notifier.py` |
 | 推送消息长什么样 | `app.BuildNotifyMarkdown()`（分块与超长截断）+ `notifier._post_wecom()`（报文格式）；改完看 `status-notify*` 场景出图 |
+| 哪类变化才推（触发条件、边沿判据、合并口径） | `app.NotifyTags()`；开关是 `config.py` 里的 `notify_on_*` 五项；测试在 `tests/test_app.py` 的「触发判定」一节 |
 | 相对时间的单位表 | `parser._RELATIVE_UNITS` |
 
 ## 相关文档
