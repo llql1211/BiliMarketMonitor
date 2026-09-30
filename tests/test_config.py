@@ -741,3 +741,37 @@ def test_save_config_with_no_changes_does_not_touch_the_file(data_files):
     assert config.save_config({}) == []
     assert _read(data_files) == "poll_interval_seconds = 2"
     assert not (data_files / "config.toml.bak").exists()
+
+
+# ---------------- 单值校验（设置窗口用） ----------------
+
+
+@pytest.mark.parametrize(
+    "key, value, expected_reason",
+    [
+        ("poll_interval_seconds", 0, "必须大于 0"),
+        ("poll_interval_seconds", "2", "不是数字"),
+        ("poll_interval_seconds", float("inf"), "必须是有限数字"),
+        ("notify_on_restock", 1, "不是 true / false"),
+        ("auto_poll_scope", "favarite", "只能是 all / favorite / sold_out"),
+        ("deal_highlight_color", "#12345", "不是合法颜色（#rrggbb 或颜色名）"),
+    ],
+)
+def test_check_value_explains_what_is_wrong(key, value, expected_reason):
+    """拦下不合格的值并给一句原因，键名和「已忽略」不留——那是给文件看的话术。"""
+    checked, reason = config.check_value(key, value)
+
+    assert checked is None
+    assert reason == expected_reason
+
+
+def test_check_value_returns_the_validated_value():
+    """合格的值过一遍校验：数字归一成浮点，字符串去掉两头的空白。"""
+    assert config.check_value("poll_interval_seconds", 2) == (2.0, None)
+    assert config.check_value("auto_poll_scope", " favorite ") == ("favorite", None)
+    assert config.check_value("notify_wecom_webhook", "") == ("", None)
+
+
+def test_check_value_survives_an_unregistered_key():
+    """没登记校验规则的键也有一句话，不是空原因。"""
+    assert config.check_value("nope", 1) == (None, "没有校验规则")

@@ -381,3 +381,30 @@ def _validate(key, value, label, warnings):
         warnings.append(f"{label}配置的 {key} 没有校验规则，已忽略")
         return None
     return checker(value, key, label, warnings)
+
+
+def check_value(key, value):
+    """校验单独一个值，返回 (值, 原因)：原因非 None 时值不可用。
+
+    给设置窗口用：用户当场填错要立刻拦住，而规则仍然是上面这一份——界面不另写
+    一套判断，免得两边说法不一样。label 传空串，文案里就不会冒出「用户配置的」
+    这种给文件看的说法。
+    """
+    warnings = []
+    checked = _validate(key, value, "", warnings)
+    if checked is not None:
+        return checked, None
+    return None, _reason(warnings[-1] if warnings else "", key)
+
+
+def _reason(warning, key):
+    """把校验器的警告收成一句能给用户看的原因。
+
+    "配置的 poll_interval_seconds 必须大于 0，已忽略" -> "必须大于 0"：
+    设置窗口那一行左边就写着这项的名字，键名再重复一遍是噪音；「已忽略」也得
+    去掉——那儿根本没忽略，是拦住了没写。
+    """
+    text = warning[len("配置的 "):] if warning.startswith("配置的 ") else warning
+    if text.endswith("，已忽略"):
+        text = text[:-len("，已忽略")]
+    return text[len(key) + 1:] if text.startswith(key + " ") else text
