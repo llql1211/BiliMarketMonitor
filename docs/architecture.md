@@ -28,12 +28,13 @@ BiliMarketMonitor/
 ├── data/               # 数据文件（用户自己的那几个不入库）
 │   ├── config.example.toml     # 配置默认值兼格式参考（随仓库分发）
 │   ├── config.toml             # 个人配置（可选，不入库）
+│   ├── config.toml.bak         # 设置窗口第一次写配置前留的备份，只留那一份（不入库）
 │   ├── watchlist.example.txt   # 监视清单示例（模板）
 │   ├── watchlist.txt           # 监视清单（用户维护，程序会规范化写回，不入库）
 │   ├── watchlist.txt.bak       # 写回前留的备份，只留第一次那份（不入库）
 │   ├── cache.db                # 本地缓存（首次运行自动生成，不入库）
 │   └── cache.db.bad-<时间戳>    # 缓存损坏时的备份（自动改名留档，不入库）
-├── src/                # 应用代码，8 个模块（见下）
+├── src/                # 应用代码，9 个模块（见下）
 ├── tests/              # pytest 测试，界面走 offscreen（见「测试」）
 ├── tools/              # 开发/维护工具，不随程序分发（见 tools/README.md）
 ├── docs/               # 本文档，以及 README 用的截图
@@ -46,6 +47,8 @@ BiliMarketMonitor/
 
 模块之间是**单向**依赖：`app` 认识下面所有模块，下面谁都不认识 `app`。
 `links` 借了 `parser.price_number`，是唯一的横向依赖（判「最后一段是不是价格」得跟界面同一个口径）。
+`settings` 是 `app` 与 `config`/`theme` 之间的那一层 UI：窗口只管摆、收、校验，
+写文件和"改完怎么生效"都留在 `app` 里（见下面「设置改完怎么生效」），所以它能单独测、单独出图。
 
 | 模块 | 职责 | 主要出口 |
 | --- | --- | --- |
@@ -53,7 +56,8 @@ BiliMarketMonitor/
 | [src/client.py](../src/client.py) | 调用接口，失败统一成一个出口 | `fetch_cluster(cluster_id, timeout)`、`ApiError` |
 | [src/parser.py](../src/parser.py) | 解析响应：名称/价格/均价/成交/图片，相对时间换算 | `parse_cluster(resp)`、`parse_error(err)`、`age_bounds(text)` |
 | [src/links.py](../src/links.py) | 监视清单读写：解析各种写法、清洗、规范化回写 | `load_links(path)`、`save_watchlist(path, items)`、`build_detail_url(...)` |
-| [src/config.py](../src/config.py) | 配置读取与逐项校验 | `load_config()`、`data_dir()`、`DEFAULTS` |
+| [src/config.py](../src/config.py) | 配置读取、逐项校验与写回 | `load_config()`、`save_config(changes)`、`check_value(key, value)`、`data_dir()`、`DEFAULTS` |
+| [src/settings.py](../src/settings.py) | 设置窗口：把配置项摆成三页表单，收值与校验 | `SettingsDialog`、`FIELDS`、`changed_values(values, original)` |
 | [src/store.py](../src/store.py) | SQLite 缓存：随清单增删、损坏自愈 | `Store`（`sync` / `upsert_item` / `get_all` / `cached_deals`）、`default_db_path()` |
 | [src/theme.py](../src/theme.py) | 深浅两套 QSS、系统深浅色判断、各处配色 | `apply_theme(app, dark)`、`qss_for(dark)`、`system_uses_dark()` |
 | [src/notifier.py](../src/notifier.py) | 企业微信群机器人推送：只管把一条 markdown 发出去 | `Notifier`（`send` / `sent` / `failed`）、`_post_wecom(...)` |
@@ -71,9 +75,11 @@ BiliMarketMonitor/
 - **网页地址（webhook）是敏感信息**：只在 `data/config.toml` 里出现（`config.example.toml` 给的是空串），
   不入库、不写进缓存；出错文案里可能夹着它（requests 的网络异常会把整条 URL 抄进去），
   所以 `notifier._redact_webhook` 会把 `key=` 后面那段先抹掉再往外说。
-- **测试面**：`parser` 和 `links` 是纯函数，最好测；`app` 有 3200 多行、逻辑最重，测试也最厚
-  （`tests/test_app.py` 5300 行）；改这两处时对应测试一起改。
+- **测试面**：`parser` 和 `links` 是纯函数，最好测；`app` 有 3300 多行、逻辑最重，测试也最厚
+  （`tests/test_app.py` 5500 行）；改这两处时对应测试一起改。
   `notifier` 的发送链路全 mock，测试一个字节都不出网。
+  `settings` 只摆表单、不认识 `app`、不碰文件，所以能单独造出来测（`tests/test_settings.py`），
+  也能被出图工具直接当控件渲染。
 
 ## 数据流
 
@@ -98,9 +104,9 @@ data/watchlist.txt
                          └► FlushNotifications()  攒下的通知合成一条，交给 notifier
 ```
 
-- **配置只在启动时读一次**（`MainWindow.__init__` 里的 `config.load_config()`），
-  之后拼详情页链接、轮询间隔、重试间隔、超时、高亮阈值与颜色都以它为准。
-  改配置要重启程序。自动抓取那四项（`auto_poll_*`）也一样，改完必须重启。
+- **配置读一次就存在 `MainWindow.config` 里**（`__init__` 里的 `config.load_config()`），
+  之后拼详情页链接、轮询间隔、重试间隔、超时、高亮阈值与颜色都现读它。
+  手改 `config.toml` 要重启程序才读得到；走设置窗口则当场重读一遍，见下面一条。
 - **自动抓取和手动抓取走同一条路**：`OnAutoPoll` 只是按 `auto_poll_scope` 从 `self.rows`
   里挑出一批任务，然后调**同一个** `StartFetch`，之后的事（线程、进度、写缓存、回写清单）
   完全没有分叉。唯一的区别是 `MainWindow.fetch_source` 记着这轮是谁发起的，
@@ -120,6 +126,36 @@ data/watchlist.txt
 - **「刷新列表」兼管清单的规范化**：它先重读文件、再按规范格式写回，所以手工编辑
   完点它就够了，不需要一个单独的「整理清单」。但只在**全部行都认得出**时才写——
   写回是按解析结果重排的，有一行认不出就会被写没，判据是 `MainWindow.last_unparsed`。
+
+### 设置改完怎么生效
+
+```text
+按「设置」──► settings.SettingsDialog(值, 主题, parent)    只摆、只收，不碰文件
+                    │  勾「深色模式」──► theme_previewed 信号 ──► SwitchTheme(dark, persist=False)
+                    │                                              只换外观，不进缓存库
+                    ▼  按「确定」（校验不过就停在窗口里，翻到出错那页）
+              settings.changed_values(收上来的值, self.config)   只挑改过的项
+                    │
+                    ├► config.save_config(changes)   原地改那几行，注释与排版不动；
+                    │                                第一次写前留一份 config.toml.bak
+                    ▼
+              config.load_config()  ──►  MainWindow.ApplyConfig()
+```
+
+- **两条腿生效**：多数项是"用到的时候现读 `self.config`"，重读一遍就是新值；
+  只有启动时算好存下来的那几处要 `ApplyConfig` 重算——成交高亮的秒数与画刷、
+  写在提示里的两个参数（抓取间隔、详情页模板）、自动抓取的定时器与顶部状态字。
+  重画表格是为了让高亮的改动看得见，选中态按商品搬回去。
+- **正在跑的那一轮不动**：`PollerThread` 手里的任务在开跑时就定下了参数，改设置影响的是下一轮。
+  这也是按钮提示里那句「正在跑的那一轮仍用它开始时的参数」的来由。
+- **主题记在缓存库、不在 config.toml**：`store` 的设置表里存 `theme`，所以它由
+  `SwitchTheme(..., persist=True)` 单独记一笔，`changed_values()` 永远不把主题写进配置文件。
+  设置窗口里勾主题只预览（`persist=False`），按「取消」拨回去，库里的记录不动。
+- **写回是"只改改过的"**：`config.save_config()` 是逐行替换，没动过的行（包括注释）原样留着。
+  这样设置窗口不把 `config.example.toml` 的默认值抄进用户文件，也不改写用户自己的注释。
+- **写不进去就一样都不生效**：`save_config` 抛 `OSError`（只读、盘满）时弹一句提示、
+  把预览过的主题拨回去，内存里的配置不动——只改内存会让表格和文件对不上，
+  和删清单/写清单失败时的回滚是同一个道理。
 
 ## 线程模型
 
@@ -348,6 +384,8 @@ data/watchlist.txt
 | 配置里写了 `inf` / `nan`、模板不是 http(s) 链接 | 该项退回默认值并打印一条警告，其他配置照常生效 |
 | 成交时间是认不出的格式（如绝对日期、错别字） | 照旧显示原文，只是不高亮 |
 | 配置里的高亮色认不出来（如 `orangejuice`） | 退回默认橙色并打印提示，不会静默变成「高亮没生效」 |
+| 设置窗口里填了不合格的值（数字框里写了别的、颜色名不存在、webhook 不是企业微信的地址） | 窗口不关，底部列出「页签：原因」并翻到出问题的那一页；一项不合格就整份不写，不留半新半旧的配置 |
+| 写 `config.toml` 失败（只读、盘满） | 弹一句提示，本次改的都不生效、预览过的主题拨回去；内存里的配置不动，省得跟文件对不上 |
 | 推送发不出去（网络、webhook 被删、地址填错） | 控制台打一行带原因，状态栏在后面接一句「企业微信推送失败：…」；**不弹窗**，抓取结果照旧 |
 
 留痕的路子是同一个：`store` 和 `links` 的公开操作都收一个 `notes` 列表（不传就只静默降级），
@@ -409,12 +447,13 @@ pixi run test           # 等价于 pixi run python -m pytest
 
 | 测试文件 | 覆盖 |
 | --- | --- |
-| [tests/test_app.py](../tests/test_app.py) | 主窗口渲染与按钮流程、`PollerThread`、缩略图线程、总结窗口、通知触发与合并 |
+| [tests/test_app.py](../tests/test_app.py) | 主窗口渲染与按钮流程、`PollerThread`、缩略图线程、总结窗口、通知触发与合并、设置窗口的保存与即时生效 |
 | [tests/test_client.py](../tests/test_client.py) | 请求形态与各类失败的统一出口 |
-| [tests/test_config.py](../tests/test_config.py) | 配置优先级与逐项校验 |
+| [tests/test_config.py](../tests/test_config.py) | 配置优先级、逐项校验、单值校验与写回（只改传进来的项、保留注释） |
 | [tests/test_links.py](../tests/test_links.py) | 清单解析、去重、规范化回写 |
 | [tests/test_notifier.py](../tests/test_notifier.py) | 企业微信报文、`errcode` 判定、地址校验与脱敏、发送线程回信号 |
 | [tests/test_parser.py](../tests/test_parser.py) | 响应解析与全路径判空 |
+| [tests/test_settings.py](../tests/test_settings.py) | 设置窗口：字段表覆盖了每一项配置、三页签、控件种类、收值与拦错、主题预览信号 |
 | [tests/test_store.py](../tests/test_store.py) | 缓存随清单增删、设置项、损坏自愈 |
 | [tests/test_theme.py](../tests/test_theme.py) | 样式表、占位文字配色、系统深浅色判断 |
 
@@ -443,7 +482,10 @@ pixi run shot           # 出图在 tmp/out/，每个场景深色/浅色各一�
 | 接口响应结构变了 | `parser.parse_cluster()` 的取值路径与 `_dig()` |
 | 增删一列、改列宽 | `app.py` 顶部的 `COL_*` 常量与 `HEADERS`，以及 `FillRow` / `SetPriceCells` 等填格函数 |
 | 表格、对话框的外观 | 控件在 `app.py`，配色与 QSS 在 `theme.py`；改完 `pixi run shot` 看图 |
-| 抓取节奏、超时、重试、高亮阈值与颜色 | `data/config.toml`（格式见 `data/config.example.toml`，代码兜底在 `config.DEFAULTS`） |
+| 抓取节奏、超时、重试、高亮阈值与颜色 | 在程序里走「设置」窗口，或手改 `data/config.toml`（格式见 `data/config.example.toml`，代码兜底在 `config.DEFAULTS`） |
+| 加一项配置（带上设置窗口里那一行） | 四处：`config.DEFAULTS`（默认值）、`config._validate`（校验）、`settings.FIELDS`（标签/提示/归哪一页）、`data/config.example.toml`（给用户看的注释）；漏了字段表 `tests/test_settings.py` 会报出来 |
+| 设置窗口的排版、标签、提示语 | `settings.FIELDS` / `settings.SECTIONS`；改完 `pixi run shot settings` 出图看一眼 |
+| 设置改完"当场生效"的范围 | `app.ApplyConfig()`：启动时算好存下来的那几处都在里头（高亮秒数与画刷、两处提示、自动抓取定时器） |
 | 缓存要多存一个字段 | `store.ITEM_COLUMNS`，老库由 `_ensure_item_columns()` 自动补列 |
 | 成交判「新增」的算法 | `app.new_deals()` / `_aged_from()` |
 | 史低价的只降不升规则 | `app.updated_lowest()` / `at_lowest()`；存的那一列在 `store.ITEM_COLUMNS` |
