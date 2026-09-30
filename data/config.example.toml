@@ -37,3 +37,33 @@ auto_poll_scope = "all"
 # 自动抓取跑完是否弹总结窗口。默认不弹——自动抓取是没人看着的时候跑的，
 # 每轮都弹会把桌面糊满；手动抓取无论这一项怎么设都会弹
 auto_poll_show_summary = false
+
+# ---------------- 企业微信推送 ----------------
+
+# 是否启用推送。默认关闭时下面这些项一个都不起作用
+notify_enabled = false
+
+# 企业微信群机器人的 webhook 地址，形如：
+# https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxx-xxxx-xxxx
+#
+# 群里点「…」→ 添加群机器人就能拿到。这个地址等同于发消息的权限，别外传、
+# 别提交进仓库（所以这份示例里留空）；一旦泄漏只能把机器人删了重建。
+# 留空表示「推送开着但还没配好」，程序会在状态栏提醒一句
+notify_wecom_webhook = ""
+
+# 两次推送之间的最小间隔（秒）。一次抓取里可能有好几件商品同时到价，攒成
+# 一条消息发出去；要是一轮里分几批触发，也至少隔这么久才发下一批
+notify_min_interval_seconds = 60
+
+# 通知类型，各自独立开关。前两项默认开着（补货和收藏到价是要盯着的事），
+# 后三项默认关掉（消息太密就没人看了，觉得需要再打开）
+# 售罄→在售（任何商品）
+notify_on_restock = true
+# 收藏的商品低于预期价
+notify_on_favorite_target = true
+# 收藏的商品创史低
+notify_on_favorite_lowest = false
+# 收藏的商品降价
+notify_on_favorite_drop = false
+# 非收藏的商品低于预期价
+notify_on_any_target = false

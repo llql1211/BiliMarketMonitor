@@ -431,3 +431,167 @@ def test_auto_poll_bool_accepted(data_files, key, raw_value, expected):
     _write(data_files, "config.toml", f"{key} = {raw_value}\n")
     cfg, _ = config.load_config()
     assert cfg[key] is expected
+
+
+# ---------------- 企业微信推送 ----------------
+#
+# 默认推不出去：没配 webhook 就不该有任何一条消息发出去。webhook 是敏感信息，
+# 这里的用例都拿假地址，别把真的写进仓库。
+
+WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc-123"
+
+NOTIFY_BOOL_KEYS = [
+    "notify_on_restock",
+    "notify_on_favorite_target",
+    "notify_on_favorite_lowest",
+    "notify_on_favorite_drop",
+    "notify_on_any_target",
+]
+
+
+def test_notify_defaults(data_files):
+    """两份配置都没写时的默认值：推送关着、没地址、限流 60 秒。"""
+    _remove(data_files, "config.example.toml", "config.toml")
+    cfg, _ = config.load_config()
+    assert cfg["notify_enabled"] is False
+    assert cfg["notify_wecom_webhook"] == ""
+    assert cfg["notify_min_interval_seconds"] == 60.0
+    # 补货和收藏到价默认开着（这两件事是要盯的），其余三种默认关掉
+    assert cfg["notify_on_restock"] is True
+    assert cfg["notify_on_favorite_target"] is True
+    assert cfg["notify_on_favorite_lowest"] is False
+    assert cfg["notify_on_favorite_drop"] is False
+    assert cfg["notify_on_any_target"] is False
+
+
+def test_notify_user_config_overrides_example(data_files):
+    """八项都能被 config.toml 覆盖，且压过 example 里的值。"""
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", (
+        "notify_enabled = true\n"
+        f'notify_wecom_webhook = "{WEBHOOK}"\n'
+        "notify_min_interval_seconds = 300\n"
+        "notify_on_restock = false\n"
+        "notify_on_favorite_target = false\n"
+        "notify_on_favorite_lowest = true\n"
+        "notify_on_favorite_drop = true\n"
+        "notify_on_any_target = true\n"
+    ))
+    cfg, warnings = config.load_config()
+    assert cfg["notify_enabled"] is True
+    assert cfg["notify_wecom_webhook"] == WEBHOOK
+    assert cfg["notify_min_interval_seconds"] == 300.0
+    assert cfg["notify_on_restock"] is False
+    assert cfg["notify_on_favorite_target"] is False
+    assert cfg["notify_on_favorite_lowest"] is True
+    assert cfg["notify_on_favorite_drop"] is True
+    assert cfg["notify_on_any_target"] is True
+    assert not [w for w in warnings if "notify" in w]
+
+
+def test_notify_webhook_empty_is_allowed(data_files):
+    """空串放行：表示「推送开着但地址还没填」，不能当错误拒掉。"""
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", 'notify_wecom_webhook = ""\n')
+    cfg, warnings = config.load_config()
+    assert cfg["notify_wecom_webhook"] == ""
+    assert not [w for w in warnings if "notify_wecom_webhook" in w]
+
+
+def test_notify_webhook_is_stripped(data_files):
+    """地址两头的手写空格自己剪掉。"""
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", f'notify_wecom_webhook = "  {WEBHOOK}  "\n')
+    cfg, _ = config.load_config()
+    assert cfg["notify_wecom_webhook"] == WEBHOOK
+
+
+@pytest.mark.parametrize(
+    "raw_value",
+    [
+        "123",                                       # 不是字符串
+        "true",
+        '"http://qyapi.weixin.qq.com/hook?key=x"',    # 不是 https
+        '"https://example.com/hook?key=x"',           # 别的域名
+        '"https://qyapi.weixin.qq.com.evil.test/h"',  # 前缀看着像，域名不是
+        '"qyapi.weixin.qq.com/cgi-bin/webhook"',      # 漏了协议头
+    ],
+)
+def test_notify_webhook_rejected(data_files, raw_value):
+    """只认企业微信机器人的地址：推给别人的群比不推糟糕得多。"""
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", f"notify_wecom_webhook = {raw_value}\n")
+    cfg, warnings = config.load_config()
+    assert cfg["notify_wecom_webhook"] == ""
+    assert any("notify_wecom_webhook" in w for w in warnings)
+
+
+@pytest.mark.parametrize(
+    "raw_value, expected_keyword",
+    [
+        ("0", "必须大于 0"),
+        ("-5", "必须大于 0"),
+        ("inf", "必须是有限数字"),
+        ("nan", "必须是有限数字"),
+        ('"60"', "不是数字"),
+        ("true", "不是数字"),
+    ],
+)
+def test_notify_min_interval_rejected(data_files, raw_value, expected_keyword):
+    """限流间隔的非法值退回 60 秒：0 或 nan 等于没有限流，一轮能轰出好多条。"""
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", f"notify_min_interval_seconds = {raw_value}\n")
+    cfg, warnings = config.load_config()
+    assert cfg["notify_min_interval_seconds"] == 60.0
+    assert any(
+        expected_keyword in w and "notify_min_interval_seconds" in w for w in warnings
+    )
+
+
+@pytest.mark.parametrize("key", NOTIFY_BOOL_KEYS)
+@pytest.mark.parametrize("raw_value", ["1", "0", '"true"', '"false"', '"yes"'])
+def test_notify_bool_rejected(data_files, key, raw_value):
+    """五个触发开关跟其他布尔项一个待遇：只认真布尔。
+
+    `"false"` 必须拒掉——非空字符串是真值，照它走会把「别推这个」读成「推」。
+    """
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", f"{key} = {raw_value}\n")
+    cfg, warnings = config.load_config()
+    assert cfg[key] is config.DEFAULTS[key]  # 退回默认值（默认值本身可能是 true）
+    assert any(key in w and "true / false" in w for w in warnings)
+
+
+@pytest.mark.parametrize("key", NOTIFY_BOOL_KEYS)
+@pytest.mark.parametrize("raw_value, expected", [("true", True), ("false", False)])
+def test_notify_bool_accepted(data_files, key, raw_value, expected):
+    """真布尔照收：五个开关各自独立，改一个不影响别的。"""
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", f"{key} = {raw_value}\n")
+    cfg, _ = config.load_config()
+    assert cfg[key] is expected
+
+
+@pytest.mark.parametrize(
+    "enabled, webhook, expected",
+    [
+        ("true", '""', True),      # 开了推送却没地址：这条最该提醒
+        ("true", f'"{WEBHOOK}"', False),
+        ("false", '""', False),    # 没开推送、没填地址，本来就该是常态
+        ("false", f'"{WEBHOOK}"', False),
+    ],
+)
+def test_notify_enabled_without_webhook_warns(data_files, enabled, webhook, expected):
+    """「开了推送但没填地址」要单独提醒一句。
+
+    逐键校验够不着这个状态（单看哪一项都合法），合起来才是「一条也发不出去」。
+    提醒归提醒，配置照收——用户可能正打算回头填。
+    """
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", (
+        f"notify_enabled = {enabled}\n"
+        f"notify_wecom_webhook = {webhook}\n"
+    ))
+    cfg, warnings = config.load_config()
+    assert any("notify_wecom_webhook" in w for w in warnings) is expected
+    assert cfg["notify_enabled"] is (enabled == "true")

@@ -34,6 +34,16 @@ DEFAULTS = {
     "auto_poll_interval_minutes": 30.0,
     "auto_poll_scope": "all",
     "auto_poll_show_summary": False,
+    # 企业微信推送：webhook 由用户自建的企业微信群机器人提供（地址格式见 notifier.py）。
+    # 头三项是总开关、地址和限流，后面五项是各自的触发类型，互相独立
+    "notify_enabled": False,
+    "notify_wecom_webhook": "",
+    "notify_min_interval_seconds": 60.0,
+    "notify_on_restock": True,
+    "notify_on_favorite_target": True,
+    "notify_on_favorite_lowest": False,
+    "notify_on_favorite_drop": False,
+    "notify_on_any_target": False,
 }
 
 
@@ -71,7 +81,21 @@ def load_config():
         warnings.append(
             f"未找到 {CONFIG_FILENAME}，当前使用 {EXAMPLE_FILENAME} 的默认配置"
         )
+    _check_notify_pair(config, warnings)
     return config, warnings
+
+
+def _check_notify_pair(config, warnings):
+    """「开了推送却没填 webhook」单独说一声。
+
+    逐键校验够不着这个状态：单看 notify_wecom_webhook，空串是合法的（表示还没配）；
+    单看 notify_enabled，true 也合法。合起来才是「推送开着、但一条也发不出去」，
+    多半是漏填了一行。提醒归提醒，配置照收——用户可能正打算回头填。
+    """
+    if config["notify_enabled"] and not config["notify_wecom_webhook"]:
+        warnings.append(
+            "已启用企业微信推送，但没填 notify_wecom_webhook，推送发不出去"
+        )
 
 
 def _read_toml(path):
@@ -165,6 +189,33 @@ def _check_enum(*allowed):
     return _check
 
 
+# 企业微信机器人的地址前缀。notifier.WECOM_API_PREFIX 是同一件事的另一份：
+# 本模块不依赖 Qt（notifier 依赖），notifier 又不依赖项目模块，只好各留一份，
+# 由 tests/test_config.py 的用例盯着两边别写岔
+_WECOM_PREFIX = "https://qyapi.weixin.qq.com/"
+
+
+def _check_webhook_url(value, key, label, warnings):
+    """webhook 只认企业微信机器人的地址；空串放行，表示「还没配」。
+
+    空串既是默认值，也是「先把推送开着、地址回头再填」的中间状态，不能当错误
+    拒掉。非空就必须落在企业微信的域名下——地址写岔了就是把消息推给别人。
+    """
+    if not isinstance(value, str):
+        warnings.append(f"{label}配置的 {key} 不是字符串，已忽略")
+        return None
+    value = value.strip()
+    if not value:
+        return ""
+    if not value.startswith(_WECOM_PREFIX):
+        warnings.append(
+            f"{label}配置的 {key} 不是企业微信机器人的地址"
+            f"（应以 {_WECOM_PREFIX} 开头），已忽略"
+        )
+        return None
+    return value
+
+
 def _check_positive_number(value, key, label, warnings):
     return _check_number(value, key, label, warnings, allow_zero=False)
 
@@ -201,6 +252,14 @@ _VALIDATORS = {
     "auto_poll_interval_minutes": _check_positive_number,
     "auto_poll_scope": _check_enum("all", "favorite", "sold_out"),
     "auto_poll_show_summary": _check_bool,
+    "notify_enabled": _check_bool,
+    "notify_wecom_webhook": _check_webhook_url,
+    "notify_min_interval_seconds": _check_positive_number,
+    "notify_on_restock": _check_bool,
+    "notify_on_favorite_target": _check_bool,
+    "notify_on_favorite_lowest": _check_bool,
+    "notify_on_favorite_drop": _check_bool,
+    "notify_on_any_target": _check_bool,
 }
 
 
