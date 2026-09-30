@@ -34,6 +34,7 @@ from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QDialog,
+    QLabel,
     QMessageBox,
     QStyleOptionViewItem,
     QTableWidgetSelectionRange,
@@ -42,6 +43,7 @@ from PyQt5.QtWidgets import (
 import app as app_module
 import client
 import links
+import notifier
 import parser
 import theme
 
@@ -2303,6 +2305,463 @@ def test_close_event_stops_the_timer(window):
     assert w.auto_poll_timer.isActive()
     w.close()
     assert not w.auto_poll_timer.isActive()
+
+
+# ---------------- 状态栏 ----------------
+
+
+def _status(w):
+    """状态栏标签（StatusLabel），省得每行都写一遍。"""
+    return w.progress_label
+
+
+def _painted(label):
+    """标签实际画出来的那行字。
+
+    StatusLabel.text() 故意返回全文（程序自己还要在它后面接着拼字），
+    所以想看省略号得绕过它，问基类的实现。
+    """
+    return QLabel.text(label)
+
+
+def test_status_shows_short_text_as_is(window, qapp):
+    """放得下就一个字不动，不画蛇添足地加省略号。"""
+    w = window("10000008780 | 甲\n")
+    w.show()
+    qapp.processEvents()
+
+    _status(w).setText("完成")
+
+    assert _status(w).text() == "完成"
+    assert _status(w).toolTip() == "完成"
+
+
+def test_status_elides_what_does_not_fit(window, qapp):
+    """放不下就省略号收尾：QLabel 自己只会把字裁掉半截，看不出还有下文。"""
+    w = window("10000008780 | 甲\n")
+    w.show()
+    qapp.processEvents()
+    long_text = "失败原因" * 100
+
+    _status(w).setText(long_text)
+
+    assert _status(w).text() == long_text  # 程序自己读到的还是全文
+    assert _status(w).toolTip() == long_text
+    shown = _painted(_status(w))
+    assert shown.endswith("…") and len(shown) < len(long_text)
+
+
+def test_status_text_does_not_widen_the_window(window):
+    """状态栏文案再长，窗口的最小宽度也不动。
+
+    这是这条状态栏当初的真实毛病：它的文字宽度就是窗口的最小宽度，一条几百
+    字符的推送失败原因能把最小宽度顶到 1700 多，1366 的笔记本上直接超出屏幕。
+    """
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    before = w.minimumSizeHint().width()
+
+    _status(w).setText("网络请求失败: " + "很长的一串" * 40)
+
+    assert w.minimumSizeHint().width() == before
+    assert before <= w.width()
+
+
+def test_status_size_hint_is_capped(window):
+    """想要的宽度：短文案按实际需要，长文案封顶——不能由着它想多宽就多宽。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    label = _status(w)
+
+    label.setText("完成")
+    assert label.sizeHint().width() == QFontMetrics(label.font()).width("完成")
+
+    label.setText("很长" * 200)
+    assert label.sizeHint().width() == app_module.STATUS_PREFERRED_WIDTH
+
+
+def test_status_minimum_width_does_not_follow_the_text(window):
+    """最小宽度是个常数：布局算窗口最小宽度时取的是它，跟着文字走就白改了。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    label = _status(w)
+
+    for text in ("完成", "很长" * 200):
+        label.setText(text)
+        assert label.minimumSizeHint().width() == app_module.STATUS_MIN_WIDTH
+
+
+def test_status_preferred_width_fits_the_usual_messages(window):
+    """封顶的那个宽度得够现有的文案用，否则常用提示都会平白多出省略号。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    label = _status(w)
+    metrics = QFontMetrics(label.font())
+
+    # 载入清单那句是目前最长的一条
+    assert metrics.width("共 1 件商品（缓存新增 1，删除 0），点「开始抓取」开始查询") <= (
+        app_module.STATUS_PREFERRED_WIDTH
+    )
+
+
+def test_status_updates_on_resize(window, qapp):
+    """窗口变大后能多显示几个字：省略的位置跟着控件宽度走。"""
+    w = window("10000008780 | 甲\n")
+    w.show()
+    qapp.processEvents()
+    _status(w).setText("很长的失败原因" * 40)
+    narrow = len(_painted(_status(w)))
+
+    _status(w).resize(1000, _status(w).height())
+
+    assert len(_painted(_status(w))) > narrow
+
+
+# ---------------- 企业微信推送 ----------------
+
+
+WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc-123"
+
+
+def _notify_toml(**overrides):
+    """推送的 config.toml 内容，默认开着、地址齐、限流 60 秒。"""
+    values = {
+        "notify_enabled": "true",
+        "notify_wecom_webhook": f'"{WEBHOOK}"',
+        "notify_min_interval_seconds": "60",
+    }
+    values.update(overrides)
+    return "".join(f"{k} = {v}\n" for k, v in values.items())
+
+
+def _sent_notifications(w):
+    """把 notifier.send 换成记录器，返回记录下来的 (地址, 内容) 列表。
+
+    发送本身（起线程、发请求、回信号）在 tests/test_notifier.py 里测，
+    这里只关心「app 有没有在合适的时候把合适的内容交出去」。
+    """
+    sent = []
+    w.notifier.send = lambda url, text: sent.append((url, text))
+    return sent
+
+
+def _item(name="甲", price=44.0, tags="低于预期价", url="https://example.test/d/1001"):
+    """一条待推送的商品，字段就是触发那侧会递进来的那几个。"""
+    return {"name": name, "price": price, "tags": tags, "url": url}
+
+
+# ---- 状态栏 ----
+
+def test_notify_sent_reports_on_the_status_bar(window):
+    """推送成功在状态栏说一声。"""
+    w = window("10000008780 | 甲\n")
+    w.last_note = ""
+
+    w.OnNotifySent("企业微信推送成功")
+
+    assert w.progress_label.text() == "企业微信推送成功"
+
+
+def test_notify_sent_keeps_the_pending_note(window):
+    """那行字后面还挂着降级提示时，别把它冲掉。"""
+    w = window("10000008780 | 甲\n")
+    w.last_note = "；已把商品名写回 watchlist.txt"
+
+    w.OnNotifySent("企业微信推送成功")
+
+    assert w.progress_label.text().endswith("已把商品名写回 watchlist.txt")
+
+
+def test_notify_failed_appends_to_the_status_bar(window, capsys):
+    """推送失败降级到状态栏，并且打印留痕。"""
+    w = window("10000008780 | 甲\n")
+    w.progress_label.setText("完成")
+
+    w.OnNotifyFailed("webhook 为空")
+
+    assert w.progress_label.text() == "完成；企业微信推送失败：webhook 为空"
+    assert w.last_note == "企业微信推送失败：webhook 为空"
+    assert "[notify] webhook 为空" in capsys.readouterr().out
+
+
+def test_notify_failed_keeps_the_full_reason_on_hover(window, qapp, capsys):
+    """原因太长时画面上收成省略号，但一个字都没丢：悬停能看全，控制台也有一份。"""
+    w = window("10000008780 | 甲\n")
+    w.show()
+    qapp.processEvents()
+    reason = "网络请求失败: HTTPSConnectionPool(host='qyapi.weixin.qq.com', port=443): " * 3
+
+    w.OnNotifyFailed(reason)
+
+    assert w.last_note == app_module.NOTIFY_FAIL_PREFIX + reason
+    assert w.progress_label.text().endswith(reason)
+    assert w.progress_label.toolTip() == w.progress_label.text()
+    assert reason.strip() in capsys.readouterr().out
+
+
+def test_notify_failed_does_not_pop_a_dialog(window, msgboxes):
+    """失败不弹窗：推送是后台的事，弹窗只会打断手上正在干的。"""
+    w = window("10000008780 | 甲\n")
+
+    w.OnNotifyFailed("HTTP 500")
+
+    assert msgboxes == []
+
+
+def test_enabled_without_webhook_is_reported_at_startup(window, capsys):
+    """开了推送却没填地址，启动时留一行痕。
+
+    逐键校验看不出这个状态（单看哪一项都合法），不说一声的话用户只会觉得
+    「开着推送，怎么一条都没收到」。
+    """
+    w = window("10000008780 | 甲\n", config_toml=_notify_toml(notify_wecom_webhook='""'))
+
+    w.ReportStartupNotes()
+
+    assert "notify_wecom_webhook" in capsys.readouterr().out
+
+
+# ---- FlushNotifications ----
+
+def test_flush_does_nothing_when_disabled(window):
+    """推送关着就一条都不发，队列也清掉——配置运行中不会中途打开，攒着没意义。"""
+    w = window("10000008780 | 甲\n", config_toml=_notify_toml(notify_enabled="false"))
+    sent = _sent_notifications(w)
+    w.notify_queue.append(_item())
+
+    w.FlushNotifications()
+
+    assert sent == []
+    assert w.notify_queue == []
+
+
+def test_flush_does_nothing_when_queue_is_empty(window):
+    """没东西可推时连线程都不该起（notifier 那边「不发就不起线程」）。"""
+    w = window("10000008780 | 甲\n", config_toml=_notify_toml())
+    sent = _sent_notifications(w)
+
+    w.FlushNotifications()
+
+    assert sent == []
+
+
+def test_flush_sends_and_clears_the_queue(window):
+    """该发的时候：把攒下的拼成一条消息发给配置里的地址，队列清空。"""
+    w = window("10000008780 | 甲\n", config_toml=_notify_toml())
+    sent = _sent_notifications(w)
+    w.notify_queue.append(_item(name="洛天依"))
+
+    w.FlushNotifications()
+
+    assert len(sent) == 1
+    url, text = sent[0]
+    assert url == WEBHOOK
+    assert "洛天依" in text and "¥44" in text
+    assert w.notify_queue == []
+    assert w.last_notify_at > 0
+
+
+def test_flush_merges_the_whole_queue_into_one_message(window):
+    """一轮里好几件商品同时触发，只发一条消息，不是一件一条。"""
+    w = window("10000008780 | 甲\n", config_toml=_notify_toml())
+    sent = _sent_notifications(w)
+    w.notify_queue.extend([_item(name="甲"), _item(name="乙"), _item(name="丙")])
+
+    w.FlushNotifications()
+
+    assert len(sent) == 1
+    assert all(name in sent[0][1] for name in ("甲", "乙", "丙"))
+
+
+def test_flush_throttles_but_keeps_the_queue(window):
+    """离上次推送还不够间隔就先不发——但消息留在队列里，下一轮凑上再发。"""
+    w = window("10000008780 | 甲\n", config_toml=_notify_toml())
+    sent = _sent_notifications(w)
+    w.notify_queue.append(_item(name="甲"))
+    w.FlushNotifications()
+    assert len(sent) == 1
+
+    w.notify_queue.append(_item(name="乙"))
+    w.FlushNotifications()
+
+    assert len(sent) == 1, "限流没生效，第二批紧跟着又发了一条"
+    assert [item["name"] for item in w.notify_queue] == ["乙"]
+
+
+def test_flush_sends_again_after_the_interval(window):
+    """过了间隔就再发一条：限流只压「发得太密」，不是发过一次就封顶。"""
+    w = window("10000008780 | 甲\n", config_toml=_notify_toml())
+    sent = _sent_notifications(w)
+    w.notify_queue.append(_item(name="甲"))
+    w.FlushNotifications()
+    w.last_notify_at -= 61  # 把上次发送拨回 61 秒前
+
+    w.notify_queue.append(_item(name="乙"))
+    w.FlushNotifications()
+
+    assert len(sent) == 2
+    assert "乙" in sent[1][1]
+
+
+def test_flush_uses_the_configured_interval(window):
+    """间隔认配置：调到 0.5 秒，同一秒内再攒一条也发得出去。"""
+    w = window("10000008780 | 甲\n", config_toml=_notify_toml(notify_min_interval_seconds="0.5"))
+    sent = _sent_notifications(w)
+    w.notify_queue.append(_item(name="甲"))
+    w.FlushNotifications()
+    w.last_notify_at -= 1
+
+    w.notify_queue.append(_item(name="乙"))
+    w.FlushNotifications()
+
+    assert len(sent) == 2
+
+
+# ---- BuildNotifyMarkdown ----
+
+def test_build_markdown_shape(window):
+    """一条消息的形状：标题 + 商品行 + 详情链接，段之间空一行。"""
+    w = window("10000008780 | 甲\n")
+
+    text = w.BuildNotifyMarkdown([_item(name="洛天依", price=44.0, url="https://x/y")])
+
+    assert text == (
+        "**B站市集提醒**\n"
+        "\n"
+        "> 洛天依 | ¥44 | 低于预期价\n"
+        "> [打开详情](https://x/y)"
+    )
+
+
+def test_build_markdown_without_url(window):
+    """没有链接那段就不写，不留一行空的。"""
+    w = window("10000008780 | 甲\n")
+
+    text = w.BuildNotifyMarkdown([_item(url="")])
+
+    assert "打开详情" not in text
+    assert text.count("\n") == 2
+
+
+def test_build_markdown_survives_missing_fields(window):
+    """缺字段、传进来的不是 dict，都按占位文字走，不让整条通知发不出去。"""
+    w = window("10000008780 | 甲\n")
+
+    text = w.BuildNotifyMarkdown([{}, "不是 dict", {"name": "甲"}])
+
+    assert "未命名商品" in text and "价格未知" in text
+    assert "不是 dict" not in text
+    assert "甲 | ¥" not in text  # 没给价的那条也写着「价格未知」
+
+
+def test_build_markdown_without_any_item(window):
+    """一条都拼不出来时返回空串，调用方（FlushNotifications）据此不发。"""
+    w = window("10000008780 | 甲\n")
+
+    assert w.BuildNotifyMarkdown([]) == ""
+    assert w.BuildNotifyMarkdown(["不是 dict"]) == ""
+
+
+def test_build_markdown_truncates_by_bytes(window):
+    """超长时按字节截断，且只截整块商品，不留半条。
+
+    企业微信的上限是 4096 字节。中文一个字三字节，按字数截会截出一万多字节，
+    照样被接口拒收——所以这里断言的是字节数，不是字符数。
+    """
+    w = window("10000008780 | 甲\n")
+    items = [
+        _item(name=f"商品{i:03d}" + "超长的商品名" * 20, price=44.0)
+        for i in range(50)
+    ]
+
+    text = w.BuildNotifyMarkdown(items)
+
+    assert len(text.encode("utf-8")) <= notifier.WECOM_MAX_BYTES
+    assert text.endswith("…还有更多商品")
+    assert "商品000" in text  # 前面的留着
+    assert "商品049" not in text  # 后面的整块砍掉
+    # 砍在块与块之间：每一行都是完整的商品行，没有截成半句的
+    for line in text.splitlines():
+        assert line == "**B站市集提醒**" or line == "…还有更多商品" or line == "" or line.startswith("> ")
+
+
+def test_build_markdown_no_tail_when_it_fits(window):
+    """放得下就一个字不截。"""
+    w = window("10000008780 | 甲\n")
+
+    text = w.BuildNotifyMarkdown([_item()])
+
+    assert "还有更多商品" not in text
+
+
+def test_notify_price_text(window):
+    """价格那一截：数字标 ¥ 且不带小数点，现成的文案原样用。"""
+    w = window("10000008780 | 甲\n")
+
+    assert w.NotifyPriceText(44.0) == "¥44"
+    assert w.NotifyPriceText(44.5) == "¥44.5"
+    assert w.NotifyPriceText(0) == "¥0"
+    assert w.NotifyPriceText("已售罄") == "已售罄"
+    assert w.NotifyPriceText(None) == "价格未知"
+    assert w.NotifyPriceText("") == "价格未知"
+
+
+# ---- 接在抓取收尾上 ----
+
+def test_poll_finished_flushes_notifications(window, monkeypatch, wait_until):
+    """一轮抓完把攒下的通知发出去。"""
+    w = window("10000008780 | 甲\n", config_toml=_notify_toml())
+    w.LoadWatchlist(w.watchlist_path)
+    sent = _sent_notifications(w)
+    monkeypatch.setattr(
+        client, "fetch_cluster", _fetch_by_id({"10000008780": raw_ok(name="甲")})
+    )
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
+    w.notify_queue.append(_item(name="甲"))
+
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+
+    assert len(sent) == 1
+    assert "甲" in sent[0][1]
+
+
+def test_poll_finished_flushes_even_after_a_manual_stop(window):
+    """中途「停止抓取」那一轮也要发。
+
+    这跟「弹不弹总结」是两回事：总结是半份数据的概括，而通知说的是已经真真切切
+    观察到的结果（某件补货了、某件到价了），不会因为用户停了后面几件就不算数。
+    （走的是 OnPollFinished 里 stop 那条早退路径，跟 test_poll_finished_after_stop
+    一个口径：直接摆好状态再收尾，不真去跑线程。）
+    """
+    w = window("10000008780 | 甲\n", config_toml=_notify_toml())
+    w.SetBusy(True)
+    w.poller_stopped = True
+    sent = _sent_notifications(w)
+    w.notify_queue.append(_item(name="甲"))
+
+    w.OnPollFinished()
+
+    assert w.progress_label.text() == "已停止抓取，已抓到的结果保留"
+    assert len(sent) == 1
+    assert "甲" in sent[0][1]
+
+
+def test_poll_finished_does_not_flush_when_disabled(window, monkeypatch, wait_until):
+    """推送关着时，抓完一轮也不该有任何发送动作。"""
+    w = window("10000008780 | 甲\n", config_toml=_notify_toml(notify_enabled="false"))
+    w.LoadWatchlist(w.watchlist_path)
+    sent = _sent_notifications(w)
+    monkeypatch.setattr(
+        client, "fetch_cluster", _fetch_by_id({"10000008780": raw_ok(name="甲")})
+    )
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
+    w.notify_queue.append(_item(name="甲"))
+
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+
+    assert sent == []
 
 
 # ---------------- 添加 / 删除 / 整理 ----------------

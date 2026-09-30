@@ -71,6 +71,7 @@ from PyQt5.QtWidgets import (
 import client
 import config
 import links
+import notifier
 import parser
 import store
 import theme
@@ -150,6 +151,19 @@ AUTO_POLL_LABEL_TIP = (
     "关掉时显示「自动：关」，改完配置要重启程序"
 )
 AUTO_POLL_EMPTY_TEXT = "自动抓取：本次范围内没有商品，已跳过"
+
+# 企业微信推送（配置项见 config.DEFAULTS 的 notify_* 八项）
+# 成功那句文案由 notifier 自己发过来（见 Notifier._work），这里只管显示
+NOTIFY_FAIL_PREFIX = "企业微信推送失败："
+
+# 状态栏那行字的两个宽度（见 StatusLabel）：
+#   想要的宽度封顶 700——按钮行在默认窗口（1500）下正好空出这么多，量过：现有
+#   最长的那条文案（「共 N 件商品（缓存新增 x，删除 y），点「开始抓取」开始
+#   查询」495px）照原样显示，再加一句推送失败的回执也还看得见开头；
+#   最小宽度 120——挤到这个程度还能读出几个字，再长的文案靠省略号收尾。
+# 两者都不跟文字长短走，所以文案再长也不会把窗口的最小宽度顶上去。
+STATUS_PREFERRED_WIDTH = 700
+STATUS_MIN_WIDTH = 120
 
 # 「史低价」列
 LOWEST_HEADER_TIP = (
@@ -907,6 +921,69 @@ class PollerThread(QThread):
             remaining -= step
 
 
+class StatusLabel(QLabel):
+    """状态栏那一行字：文案再长也不撑宽窗口，放不下就收成省略号，完整内容进悬停。
+
+    QLabel 默认「想要多宽就有多宽」——sizeHint 等于整行文字的宽度，而布局会拿它
+    当窗口的最小宽度。状态栏的文案长短全看运行时（推送失败的原因能有几百个字符，
+    带 URL、带重试细节），一条这样的消息就能把窗口的最小宽度顶到 1700 多，
+    在 1366 的笔记本上直接超出屏幕，而且缩不回去。
+
+    所以这里两头都收住，而且都跟文字长短无关：想要的宽度封顶在
+    STATUS_PREFERRED_WIDTH，最小宽度由 STATUS_MIN_WIDTH 兜底（不覆写
+    minimumSizeHint 的话，它会跟着当前文字走，照样能顶宽窗口）。画出来的
+    文字按控件实际宽度省略——QLabel 自己不会省略，只会把字裁掉半截。
+    `text()` 返回的仍是完整文案：程序自己还要在它后面接着拼字
+    （见 OnNotifyFailed），省略只发生在画面上。
+    """
+
+    def __init__(self, text="", parent=None):
+        self._full_text = ""
+        super().__init__("", parent)
+        self.setText(text)
+
+    def setText(self, text):
+        self._full_text = "" if text is None else str(text)
+        self.setToolTip(self._full_text)  # 省略掉的那截在悬停里能看全
+        self._refresh()
+
+    def text(self):
+        return self._full_text
+
+    def sizeHint(self):
+        """想要的宽度：文字自然宽度封顶。
+
+        短文案只要它够用的那点地方——状态栏跟七个按钮挤在同一行，白白要
+        700px 会去挤按钮。
+        """
+        metrics = QFontMetrics(self.font())
+        width = min(metrics.width(self._full_text), STATUS_PREFERRED_WIDTH)
+        return QSize(width, metrics.height())
+
+    def minimumSizeHint(self):
+        """最小宽度固定，这是"文案不顶宽窗口"真正管用的那一处。
+
+        QSizePolicy 是 Preferred，布局算窗口最小宽度时取的就是
+        minimumSizeHint（而不是 sizeHint）；不覆写它的话，它会跟着当前
+        文字走，一条长文案照样能把窗口的最小宽度顶上去。
+        """
+        return QSize(STATUS_MIN_WIDTH, QFontMetrics(self.font()).height())
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh()
+
+    def changeEvent(self, event):
+        # 换主题会换字体，字宽跟着变，省略的位置得重算（否则省略号的位置对不上）
+        if event.type() in (QEvent.FontChange, QEvent.StyleChange):
+            self._refresh()
+        super().changeEvent(event)
+
+    def _refresh(self):
+        metrics = QFontMetrics(self.font())
+        super().setText(metrics.elidedText(self._full_text, Qt.ElideRight, self.width()))
+
+
 class ImageFetcher(QObject):
     """在普通子线程里拉图，通过信号回传 QPixmap（避免卡界面）。
 
@@ -1497,6 +1574,14 @@ class MainWindow(QMainWindow):
         self.auto_poll_timer = QTimer(self)
         self.auto_poll_timer.setSingleShot(True)
         self.auto_poll_timer.timeout.connect(self.OnAutoPoll)
+        # 企业微信推送（见 notifier.py）：要发的轮次里每条通知起一个小线程就完事，
+        # 不发通知的轮次一个线程都不起。notify_queue 由「通知」那一节填，
+        # last_notify_at 管限流——一轮里十件商品同时到价，只该收到一条消息
+        self.notifier = notifier.Notifier()
+        self.notifier.sent.connect(self.OnNotifySent)
+        self.notifier.failed.connect(self.OnNotifyFailed)
+        self.notify_queue = []  # List[dict]：待推送的商品，字段见 BuildNotifyMarkdown
+        self.last_notify_at = 0.0
         self.InitUI()
         self.ApplyTheme(self.InitialDark())
         self.ScheduleAutoPoll()  # 开了自动抓取就挂上第一拍；没开就什么都不做
@@ -1578,7 +1663,8 @@ class MainWindow(QMainWindow):
         self.shortcut_fetch.activated.connect(self.OnFetchPrices)
 
         btn_bar.addStretch()
-        self.progress_label = QLabel("就绪")
+        # 状态栏：文案长短全看运行时，用 StatusLabel 免得它把窗口顶宽
+        self.progress_label = StatusLabel("就绪")
         self.btn_theme = QPushButton()
         self.btn_theme.clicked.connect(self.OnToggleTheme)
         btn_bar.addWidget(self.progress_label)
@@ -2797,6 +2883,10 @@ class MainWindow(QMainWindow):
         # 就空了，漏挂一次自动抓取就悄悄停了——尤其是用户中途「停止抓取」那次，
         # 他只是不想要这一轮，不是要把自动抓取关掉
         self.ScheduleAutoPoll()
+        # 通知也在这儿发：它的内容来自这一轮真抓到的结果，跟「总结」不是一回事——
+        # 中途「停止抓取」那一轮不弹总结，但已经观察到的补货、到价都是真的，
+        # 该推的还是推
+        self.FlushNotifications()
         if self.poller_stopped:
             self.progress_label.setText("已停止抓取，已抓到的结果保留")
             return
@@ -2853,6 +2943,113 @@ class MainWindow(QMainWindow):
                 webbrowser.open(url)
         elif col == COL_FAVORITE:
             self.ToggleFavorite(row)
+
+    # ---------------- 通知 ----------------
+
+    def FlushNotifications(self):
+        """把这一轮攒下的通知发出去。
+
+        「要不要发、发什么」都在主线程判，只有那一次 HTTP POST 进子线程
+        （见 notifier.Notifier）。三种情况直接不发：
+
+        - 推送没开：顺手把队列清掉。配置只在启动时读一次，运行中不会中途打开，
+          攒着的东西永远等不到发出去的那天，白占内存；
+        - 队列空着：这一轮没什么可通知的；
+        - 离上次推送还不够 notify_min_interval_seconds：限流只压「发得太密」，
+          不算丢消息——队列不动，下一轮凑上再发。
+        """
+        if not self.config["notify_enabled"]:
+            self.notify_queue.clear()
+            return
+        if not self.notify_queue:
+            return
+        now = time.monotonic()
+        if now - self.last_notify_at < self.config["notify_min_interval_seconds"]:
+            return
+        content = self.BuildNotifyMarkdown(self.notify_queue)
+        self.notify_queue.clear()
+        self.last_notify_at = now
+        self.notifier.send(self.config["notify_wecom_webhook"], content)
+
+    def BuildNotifyMarkdown(self, items):
+        """把待推送的商品拼成一条 markdown 消息。
+
+        items 里每项是个 dict：name / price / tags 看着都给，url 可选。这几个键
+        由触发判定那侧填。这一层的本分是「无论递进来什么都能拼出一条发得出去的
+        消息」，所以缺键、空值都按占位文字走，绝不因为一个字段没填就把整条通知
+        吞掉——通知发不出去比内容糙一点糟糕得多。
+        """
+        blocks = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            # 只带「冒号后面那截非空」的段，免得出现「名字 | ¥44 | 」这种空尾巴
+            parts = [
+                str(item.get("name") or "未命名商品"),
+                self.NotifyPriceText(item.get("price")),
+            ]
+            if item.get("tags"):
+                parts.append(str(item["tags"]))
+            lines = ["> " + " | ".join(parts)]
+            if item.get("url"):
+                lines.append(f"> [打开详情]({item['url']})")
+            blocks.append("\n".join(lines))
+        if not blocks:
+            return ""
+        return self.JoinNotifyBlocks(blocks)
+
+    @staticmethod
+    def NotifyPriceText(price) -> str:
+        """价格那一截的写法：数字标上 ¥ 且整数不带小数点，字符串原样用。
+
+        触发那侧递过来的是接口里的原始数字（44.0），照拼出去就是「44.0」；字符串
+        则可能是「已售罄」这类现成的文案，不动它。字段缺了写「价格未知」——
+        比留个空格强，至少看得出是没取到数而不是价格为零。
+        """
+        if isinstance(price, bool) or not isinstance(price, (int, float)):
+            return str(price) if price else "价格未知"
+        return f"¥{price:g}"
+
+    @staticmethod
+    def JoinNotifyBlocks(blocks):
+        """把一条条商品拼接成消息体，超了企业微信的字节上限就截断。
+
+        上限按**字节**算：中文一个字三字节，按字数截（text[:4000]）能截出
+        一万多字节，照样被接口拒收。整块整块地留，宁可少发两件商品，
+        也不要把最后一条截成半句话——半条链接点不开，还看不出是坏的。
+        """
+        head = "**B站市集提醒**"
+        tail = "\n\n…还有更多商品"
+        room = notifier.WECOM_MAX_BYTES - len(tail.encode("utf-8"))
+        kept = []
+        used = len(head.encode("utf-8"))
+        for block in blocks:
+            cost = len(block.encode("utf-8")) + 2  # 块与块之间空一行
+            if used + cost > room:
+                break
+            kept.append(block)
+            used += cost
+        if not kept:  # 一件都放不下（正常不会），至少把标题发出去
+            return head
+        text = "\n\n".join([head, *kept])
+        if len(kept) < len(blocks):
+            text += tail
+        return text
+
+    def OnNotifySent(self, summary):
+        """推送成功：状态栏那一行报一声，跟抓取进度共用（这一行本来就是滚动提示）。"""
+        self.progress_label.setText(summary + self.last_note)
+
+    def OnNotifyFailed(self, reason):
+        """推送失败：降级到状态栏并打印留痕，不弹窗打断（跟子模块降级一个待遇）。
+
+        重试在「通知」这一层没有意义——推送晚到一分钟就白推了，用户看到这行字
+        自己决定是改配置还是不管。原因照原样写进去：状态栏太长了会自己收成省略号
+        （见 StatusLabel），完整的那份在悬停和控制台里。
+        """
+        self.last_note = NOTIFY_FAIL_PREFIX + str(reason)
+        print(f"[notify] {reason}")
+        self.progress_label.setText(self.progress_label.text() + "；" + self.last_note)
 
     # ---------------- 主题 ----------------
 
