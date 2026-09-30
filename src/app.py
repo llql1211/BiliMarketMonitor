@@ -73,6 +73,7 @@ import config
 import links
 import notifier
 import parser
+import settings
 import store
 import theme
 
@@ -148,7 +149,7 @@ AUTO_POLL_OFF_TEXT = "自动：关"
 AUTO_POLL_LABEL_TIP = (
     "自动抓取的状态，由 config.toml 里的 auto_poll_* 四项决定\n"
     "间隔从上一轮结束算起，所以不会因为某轮抓得慢就把下一轮叠上来\n"
-    "关掉时显示「自动：关」，改完配置要重启程序"
+    "关掉时显示「自动：关」；这几项在「设置」窗口里改，改完就重挂定时器"
 )
 AUTO_POLL_EMPTY_TEXT = "自动抓取：本次范围内没有商品，已跳过"
 
@@ -161,6 +162,20 @@ NOTIFY_FAIL_PREFIX = "企业微信推送失败："
 NOTIFY_TAG_RESTOCK = "恢复在售"
 NOTIFY_TAG_TARGET = "低于预期价"
 NOTIFY_TAG_LOWEST = "创史低"
+
+# 设置窗口（内容在 settings.py 里）：按钮行最右边那个按钮。主题开关也并进了这个
+# 窗口，所以按钮行上不再单留一个「暗色模式 / 浅色模式」
+SETTINGS_TEXT = "设置"
+SETTINGS_TIP = (
+    "基本设置 / 定时抓取 / 企业微信推送三页都在这里改\n"
+    "按「确定」立即生效；只把改过的项写回 config.toml，注释不会被动\n"
+    "正在跑的那一轮仍用它开始时的参数"
+)
+# 写 config.toml 失败（文件只读、盘满）：一样都不生效，也别只改内存——
+# 那样表格里的和文件里的就对不上了
+SETTINGS_FAIL_TITLE = "设置没存住"
+SETTINGS_FAIL_TEXT = "写 config.toml 失败，这次改的都没生效：\n{error}"
+SETTINGS_NO_CHANGE_TEXT = "没有改动"
 
 # 状态栏那行字的两个宽度（见 StatusLabel）：
 #   想要的宽度封顶 700——按钮行在默认窗口（1500）下正好空出这么多，量过：现有
@@ -1597,8 +1612,17 @@ class MainWindow(QMainWindow):
 
     # ---------------- 界面 ----------------
 
+    def FetchTip(self) -> str:
+        """「开始抓取」的提示：里头写着抓取间隔，改了设置要重拼一遍。"""
+        return (f"逐个抓取价格，间隔 {self.config['poll_interval_seconds']:g} 秒\n"
+                f"快捷键 {FETCH_SHORTCUT}")
+
+    def LinkHeaderTip(self) -> str:
+        """「链接」列头上的说明：里头写着详情页模板，改了设置要重拼一遍。"""
+        return ("点击「打开」用浏览器访问商品详情页\n"
+                f"链接由配置里的模板拼出：\n{self.config['detail_url_template']}")
+
     def InitUI(self):
-        template = self.config["detail_url_template"]
         self.setWindowTitle("市集商品价格监视器")
         self.resize(1500, 900)
 
@@ -1644,9 +1668,7 @@ class MainWindow(QMainWindow):
             (self.btn_refresh_list, self.OnRefreshList,
              "重新读取 watchlist.txt（手工改动后点这里同步）\n"
              "全部行都认得出时，会顺手按规范格式重写一遍"), 
-            (self.btn_fetch, self.OnFetchPrices,
-             f"逐个抓取价格，间隔 {self.config['poll_interval_seconds']:g} 秒\n"
-             f"快捷键 {FETCH_SHORTCUT}"),
+            (self.btn_fetch, self.OnFetchPrices, self.FetchTip()),
             (self.btn_fetch_new, self.OnFetchNew,
              "只抓还没有价格的商品（新添加的，以及一直没抓成功的），\n"
              "其他行的价格不动"),
@@ -1674,10 +1696,13 @@ class MainWindow(QMainWindow):
         btn_bar.addStretch()
         # 状态栏：文案长短全看运行时，用 StatusLabel 免得它把窗口顶宽
         self.progress_label = StatusLabel("就绪")
-        self.btn_theme = QPushButton()
-        self.btn_theme.clicked.connect(self.OnToggleTheme)
+        # 设置钉在按钮行最右边：它弹的窗口是"改参数"的去处，跟左边那排"做事"的
+        # 按钮不是一类，隔在最后一眼能找到
+        self.btn_settings = QPushButton(SETTINGS_TEXT)
+        self.btn_settings.setToolTip(SETTINGS_TIP)
+        self.btn_settings.clicked.connect(self.OnOpenSettings)
         btn_bar.addWidget(self.progress_label)
-        btn_bar.addWidget(self.btn_theme)
+        btn_bar.addWidget(self.btn_settings)
         layout.addLayout(btn_bar)
 
         # 表格
@@ -1722,9 +1747,7 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(COL_NAME, QHeaderView.Stretch)
         # 模板说明挂在「链接」列头上。以前是挂在主窗口上的，但 Qt 找 tooltip 会沿
         # 父链上溯，于是每个没设自己 tooltip 的单元格都会弹它。
-        self.table.horizontalHeaderItem(COL_LINK).setToolTip(
-            f"点击「打开」用浏览器访问商品详情页\n链接由配置里的模板拼出：\n{template}"
-        )
+        self.table.horizontalHeaderItem(COL_LINK).setToolTip(self.LinkHeaderTip())
         self.table.horizontalHeaderItem(COL_FAVORITE).setToolTip(FAVORITE_HEADER_TIP)
         self.table.horizontalHeaderItem(COL_LOW).setToolTip(LOWEST_HEADER_TIP)
         self.table.horizontalHeaderItem(COL_EXPECT).setToolTip(EXPECTED_HEADER_TIP)
@@ -3152,14 +3175,16 @@ class MainWindow(QMainWindow):
         # 次要信息跟着主题弱化（跟「原价」那格同一个色），别跟按钮抢眼
         self.updated_label.setStyleSheet(f"color: {theme.muted_color(dark).name()};")
         self.auto_poll_label.setStyleSheet(f"color: {theme.muted_color(dark).name()};")
-        self.btn_theme.setText("浅色模式" if dark else "暗色模式")
-        self.btn_theme.setToolTip(
-            "当前是暗色主题，点击切换为浅色" if dark else "当前是浅色主题，点击切换为暗色"
-        )
 
-    def OnToggleTheme(self):
-        dark = not self.dark
-        self.store.set_setting("theme", "dark" if dark else "light")
+    def SwitchTheme(self, dark: bool, persist: bool = True):
+        """换主题：装样式、重画表格。
+
+        persist 决定要不要把这次选择记进缓存库的设置表（下次启动沿用）。设置窗口
+        里勾「深色模式」走的是 persist=False：那会儿还没按确定，先让人看着效果，
+        取消的话主窗口再把主题拨回去，库里的记录一个字没动。
+        """
+        if persist:
+            self.store.set_setting("theme", "dark" if dark else "light")
         self.ApplyTheme(dark)
         # 单元格里的颜色（原价的弱化色、涨跌的红绿）都是按主题选的，换主题得
         # 重画一遍才换得掉；选中态按商品搬回去，免得切个主题就把选中的行丢了
@@ -3169,6 +3194,100 @@ class MainWindow(QMainWindow):
         # 总结窗口还没关的话，涨跌那几格的颜色也得跟着换（它不在表格的重画范围内）
         if self.summary_dialog is not None and self.summary_dialog.isVisible():
             self.summary_dialog.SetDark(self.dark)
+
+    # ---------------- 设置 ----------------
+
+    def SettingsDialog(self):
+        """构造设置窗口（只造不弹），当前值现从 self.config 取。
+
+        跟 exec_ 拆开是为了让测试和截图工具能直接拿到它（同 ExpectedPriceDialog）：
+        模态窗口得有人点，那两个地方都不该被卡住。
+        """
+        values = dict(self.config)
+        values[settings.THEME_KEY] = self.dark  # 主题在缓存库里，不在 config 里
+        dialog = settings.SettingsDialog(values, self.dark, self)
+        # 勾主题当场预览：还没按确定，所以只换不记（见 SwitchTheme 的 persist）
+        dialog.theme_previewed.connect(
+            lambda dark: self.SwitchTheme(dark, persist=False)
+        )
+        return dialog
+
+    def OnOpenSettings(self):
+        """按下「设置」：弹出设置窗口，按确定后写回 config.toml 并立刻生效。
+
+        生效靠两条腿：多数配置项是用到的时候现读 self.config，重读一遍就是新值；
+        剩下几处是启动时算好存下来的（成交高亮的秒数与画刷、两处写在提示里的
+        参数、自动抓取的定时器），由 ApplyConfig 重算。
+        """
+        before_dark = self.dark
+        dialog = self.SettingsDialog()
+        if dialog.exec_() != QDialog.Accepted:
+            # 取消：预览过的主题拨回去。别的都还没动过——写文件在确定之后
+            if self.dark != before_dark:
+                self.SwitchTheme(before_dark, persist=False)
+            return
+
+        values = dialog.Values()
+        # self.config 还是弹窗前的值：只有下面写文件成功才会被重新读一遍
+        changes = settings.changed_values(values, self.config)
+        try:
+            written = config.save_config(changes)
+        except OSError as error:
+            # 一份都写不进去就一样都别生效，并说明白：只改内存会让表格和文件对不上
+            if self.dark != before_dark:
+                self.SwitchTheme(before_dark, persist=False)
+            QMessageBox.warning(self, SETTINGS_FAIL_TITLE,
+                                SETTINGS_FAIL_TEXT.format(error=error))
+            return
+
+        if written:
+            # 重新读一遍而不是把窗口里的值直接塞进去：写回文件是经过校验的，
+            # 而校验可能把值调成"它认可的写法"（数字归一、字符串去空白），
+            # 读回来才能保证内存里生效的和文件里存的是同一个东西
+            before_warnings = self.config_warnings
+            self.config, self.config_warnings = config.load_config()
+            for warning in self.config_warnings:
+                # 正常情况下跟启动时报过的一样，不会重复刷屏；文件被别的编辑器
+                # 改出问题的话，这里能把新冒出来的那条留在控制台上
+                if warning not in before_warnings:
+                    print(f"[config] {warning}")
+            self.ApplyConfig()
+        # 主题记在缓存库的设置表里，跟 config.toml 不是一处，单独记一笔
+        theme_changed = values[settings.THEME_KEY] != before_dark
+        if theme_changed:
+            self.store.set_setting(settings.THEME_KEY,
+                                   "dark" if values[settings.THEME_KEY] else "light")
+
+        parts = []
+        if written:
+            parts.append(f"{len(written)} 项已写入 config.toml")
+        if theme_changed:
+            parts.append("主题已记下")
+        note = "、".join(parts) if parts else SETTINGS_NO_CHANGE_TEXT
+        self.progress_label.setText(f"设置已保存：{note}")
+
+    def ApplyConfig(self):
+        """把重读进来的配置摊到界面上——改完设置不用重启。
+
+        只管启动时算好存下来的那几处：成交高亮的秒数与画刷、两处提示里的参数、
+        自动抓取的定时器与状态字。其余项（间隔、超时、模板、notify_* 那一串）
+        本来就是用到时现读 self.config，重读一遍就生效了。
+        正在跑的那一轮仍用它启动时的参数：PollerThread 手里的任务在开跑时就定下了。
+        """
+        self.deal_highlight_seconds = self.config["deal_highlight_within_hours"] * 3600
+        self.deal_highlight_brush = QBrush(
+            theme.deal_highlight_color(self.config["deal_highlight_color"])
+        )
+        self.btn_fetch.setToolTip(self.FetchTip())
+        self.table.horizontalHeaderItem(COL_LINK).setToolTip(self.LinkHeaderTip())
+        # 定时器上挂着的那一拍是按旧间隔排的，摘掉重挂；关掉了就空着
+        self.auto_poll_timer.stop()
+        self.UpdateAutoPollLabel()
+        self.ScheduleAutoPoll()
+        # 高亮的那几格要重画才看得出来（阈值、颜色都可能刚变过）
+        selected = self.SelectedClusterIds()
+        self.RenderTable()
+        self.SelectItems(selected)
 
     # ---------------- 收尾 ----------------
 

@@ -42,9 +42,11 @@ from PyQt5.QtWidgets import (
 
 import app as app_module
 import client
+import config
 import links
 import notifier
 import parser
+import settings
 import theme
 
 
@@ -441,7 +443,7 @@ def test_reference_column_follows_the_theme(window):
     w.OnResultReady(0, result_ok(reference="110"))
 
     before = w.table.item(0, app_module.COL_REF).foreground().color().name()
-    w.OnToggleTheme()
+    w.SwitchTheme(not w.dark)
     after = w.table.item(0, app_module.COL_REF).foreground().color().name()
 
     assert after == theme.muted_color(w.dark).name()
@@ -455,7 +457,7 @@ def test_theme_toggle_keeps_rows_and_selection(window):
     last_col = w.table.columnCount() - 1
     w.table.setRangeSelected(QTableWidgetSelectionRange(1, 0, 1, last_col), True)
 
-    w.OnToggleTheme()
+    w.SwitchTheme(not w.dark)
 
     assert [item["entry"].cluster_id for item in w.rows] == [
         "10000008780", "10000000002",
@@ -535,7 +537,7 @@ def test_expected_cell_follows_theme(window):
     w.OnResultReady(0, result_ok(price="¥44"))
 
     before = _expected_cell(w).foreground().color().name()
-    w.OnToggleTheme()
+    w.SwitchTheme(not w.dark)
     after = _expected_cell(w).foreground().color().name()
 
     assert after == theme.expected_reached_color(w.dark).name()
@@ -767,7 +769,7 @@ def test_favorite_cell_follows_theme(window):
 
     before = (_favorite_cell(w, 0).foreground().color().name(),
               _favorite_cell(w, 1).foreground().color().name())
-    w.OnToggleTheme()
+    w.SwitchTheme(not w.dark)
     after = (_favorite_cell(w, 0).foreground().color().name(),
              _favorite_cell(w, 1).foreground().color().name())
 
@@ -977,7 +979,7 @@ def test_avg_cell_follows_theme(window):
     w.OnResultReady(0, result_ok(price="¥44", avg=205))
 
     before = _avg_cell(w).foreground().color().name()
-    w.OnToggleTheme()
+    w.SwitchTheme(not w.dark)
     after = _avg_cell(w).foreground().color().name()
 
     assert after == theme.below_average_color(w.dark).name()
@@ -1091,7 +1093,7 @@ def test_lowest_cell_follows_theme(window):
     w.OnResultReady(0, result_ok(price="¥44"))
 
     before = _low_cell(w).foreground().color().name()
-    w.OnToggleTheme()
+    w.SwitchTheme(not w.dark)
     after = _low_cell(w).foreground().color().name()
 
     assert after == theme.lowest_color(w.dark).name()
@@ -1258,7 +1260,7 @@ def test_delta_color_follows_the_theme(window):
     before = color().name()
     assert before == theme.price_delta_color(-6, w.dark).name()
 
-    w.OnToggleTheme()
+    w.SwitchTheme(not w.dark)
 
     assert color().name() == theme.price_delta_color(-6, w.dark).name()
     assert color().name() != before
@@ -2043,7 +2045,7 @@ def test_summary_keeps_its_colors_when_the_theme_toggles(window):
     w.ShowSummary()
     assert theme.PRICE_DOWN_COLOR_LIGHT in w.summary_dialog.detail.toHtml().lower()
 
-    w.OnToggleTheme()
+    w.SwitchTheme(not w.dark)
 
     assert w.dark is True
     assert theme.PRICE_DOWN_COLOR_DARK in w.summary_dialog.detail.toHtml().lower()
@@ -3598,31 +3600,34 @@ def test_row_number_width_grows_with_the_digits(window):
 # ---------------- 主题 ----------------
 
 
-def test_toggle_theme_persists_choice(window, qapp):
+def test_switch_theme_persists_choice(window, qapp):
     """切主题：立即生效、写进设置，下次启动沿用（不再跟随系统）。"""
     w = window()
     start = w.dark
 
-    w.OnToggleTheme()
+    w.SwitchTheme(not w.dark)
     assert w.dark is not start
     assert w.store.get_setting("theme") == ("dark" if w.dark else "light")
-    assert w.btn_theme.text() == ("浅色模式" if w.dark else "暗色模式")
     assert qapp.styleSheet() == (theme.DARK_QSS if w.dark else theme.LIGHT_QSS)
 
     w2 = window()  # 同一个临时库：新窗口应当沿用刚才的选择
     assert w2.dark is w.dark
 
 
-def test_apply_theme_updates_button_label(window):
-    """直接应用主题时，按钮文案与 tooltip 也要跟着变。"""
-    w = window()
-    w.ApplyTheme(True)
-    assert w.btn_theme.text() == "浅色模式"
-    assert "暗色主题" in w.btn_theme.toolTip()
+def test_switch_theme_without_persist_only_changes_the_look(window, qapp):
+    """设置窗口里预览主题（persist=False）：界面换了，库里一个字没写。
 
-    w.ApplyTheme(False)
-    assert w.btn_theme.text() == "暗色模式"
-    assert "浅色主题" in w.btn_theme.toolTip()
+    不然「勾上深色 -> 取消」也会被记下来，下次启动就成了用户没选过的暗色。
+    """
+    w = window()
+    start = w.dark
+    assert w.store.get_setting("theme") is None
+
+    w.SwitchTheme(not start, persist=False)
+
+    assert w.dark is not start
+    assert w.store.get_setting("theme") is None
+    assert qapp.styleSheet() == (theme.DARK_QSS if w.dark else theme.LIGHT_QSS)
 
 
 def test_apply_theme_installs_tooltip_delay(window, qapp, monkeypatch):
@@ -3633,8 +3638,214 @@ def test_apply_theme_installs_tooltip_delay(window, qapp, monkeypatch):
     w = window()
     assert installed[-1] is qapp  # 建窗口时就装上了
 
-    w.OnToggleTheme()
+    w.SwitchTheme(not w.dark)
     assert installed[-1] is qapp  # 切主题时再装一次也无妨（装过就跳过）
+
+
+# ---------------- 设置窗口 ----------------
+
+
+def _button_row(window):
+    """按钮行那个 QHBoxLayout：设置按钮就在这一排里。"""
+    layout = window.centralWidget().layout()
+    for index in range(layout.count()):
+        bar = layout.itemAt(index).layout()
+        if bar is not None and bar.indexOf(window.btn_settings) >= 0:
+            return bar
+    raise AssertionError("按钮行里没找到设置按钮")
+
+
+def _accept(monkeypatch, edits=None, boxes=None):
+    """让设置窗口的「确定」直接兑现：改完这几个控件就返回 Accepted。
+
+    模态窗口在测试里没人点，所以拦下 exec_（办法同 QMessageBox 那一组）。
+    edits 是输入框（键 -> 文本），boxes 是复选框（键 -> 勾没勾）。
+    """
+    edits = edits or {}
+    boxes = boxes or {}
+
+    def _exec_(dialog):
+        for key, text in edits.items():
+            dialog.editors[key].setText(text)
+        for key, checked in boxes.items():
+            dialog.checkboxes[key].setChecked(checked)
+        dialog.OnAccept()        # 真按「确定」时按钮走的就是它（校验也在里头）
+        return dialog.result()   # 有不合格的项就停在「取消」上，跟真弹窗一个结果
+
+    monkeypatch.setattr(settings.SettingsDialog, "exec_", _exec_)
+
+
+def _cancel(monkeypatch):
+    """让设置窗口返回「取消」，顺带勾一下主题——预览过的东西得被拨回去。"""
+    def _exec_(dialog):
+        box = dialog.checkboxes[settings.THEME_KEY]
+        box.setChecked(not box.isChecked())
+        return QDialog.Rejected
+
+    monkeypatch.setattr(settings.SettingsDialog, "exec_", _exec_)
+
+
+def test_settings_button_sits_at_the_right_end_of_the_button_row(window):
+    """设置按钮在按钮行最右边：状态栏那截字紧挨着它左边。"""
+    w = window()
+    row = _button_row(w)
+    widgets = [row.itemAt(i).widget() for i in range(row.count())]
+
+    assert w.btn_settings.text() == "设置"
+    assert widgets[-1] is w.btn_settings
+    assert widgets[-2] is w.progress_label  # 状态栏就在它前面，隔着的只有伸缩位
+
+
+def test_settings_button_drops_the_old_theme_button(window):
+    """主题按钮并进设置窗口了，按钮行上不再单留一个。"""
+    w = window()
+    labels = [
+        widget.text()
+        for widget in (w.btn_add, w.btn_delete, w.btn_refresh_list, w.btn_fetch,
+                       w.btn_fetch_new, w.btn_pause, w.btn_stop, w.btn_settings)
+    ]
+
+    assert not hasattr(w, "btn_theme")
+    assert "暗色模式" not in labels and "浅色模式" not in labels
+
+
+def test_settings_ok_writes_only_the_changed_keys(window, data_files, monkeypatch):
+    """按确定：只把改过的项写回 config.toml，没碰的项连行都不重写一遍。"""
+    original = ("# 这是我自己的注释\n"
+                "poll_interval_seconds = 2\n"
+                "request_timeout_seconds = 8\n")
+    w = window("10000008780\n", config_toml=original)
+    _accept(monkeypatch, edits={"poll_interval_seconds": "5"})
+
+    w.OnOpenSettings()
+
+    written = (data_files / "config.toml").read_text(encoding="utf-8")
+    assert "poll_interval_seconds = 5" in written
+    assert "request_timeout_seconds = 8" in written
+    assert "# 这是我自己的注释" in written
+    assert w.config["poll_interval_seconds"] == 5.0
+    assert w.config["request_timeout_seconds"] == 8.0
+    assert w.progress_label.text() == "设置已保存：1 项已写入 config.toml"
+
+
+def test_settings_ok_with_nothing_changed_does_not_touch_the_file(
+    window, data_files, monkeypatch,
+):
+    """什么都没改就按确定：文件一个字节都不动，状态栏说一声没改动。"""
+    original = "poll_interval_seconds = 2\n"
+    w = window("10000008780\n", config_toml=original)
+    _accept(monkeypatch)
+
+    w.OnOpenSettings()
+
+    assert (data_files / "config.toml").read_text(encoding="utf-8") == original
+    assert w.progress_label.text() == "设置已保存：没有改动"
+
+
+def test_settings_cancel_changes_nothing(window, data_files, monkeypatch):
+    """取消：文件不动，只把预览过的主题拨回去（库里也不记）。"""
+    original = "poll_interval_seconds = 2\n"
+    w = window("10000008780\n", config_toml=original)
+    start = w.dark
+    _cancel(monkeypatch)
+
+    w.OnOpenSettings()
+
+    assert (data_files / "config.toml").read_text(encoding="utf-8") == original
+    assert w.dark is start
+    assert w.store.get_setting("theme") is None
+    assert w.config["poll_interval_seconds"] == 2.0
+
+
+def test_settings_ok_records_the_theme(window, data_files, monkeypatch):
+    """主题也勾着改了：连同配置一起记下来，下次启动沿用。"""
+    w = window("10000008780\n", config_toml="poll_interval_seconds = 2\n")
+    start = w.dark
+    _accept(monkeypatch, edits={"poll_interval_seconds": "5"},
+            boxes={settings.THEME_KEY: not start})
+
+    w.OnOpenSettings()
+
+    assert w.dark is not start
+    assert w.store.get_setting("theme") == ("dark" if w.dark else "light")
+    assert w.progress_label.text() == "设置已保存：1 项已写入 config.toml、主题已记下"
+
+
+def test_settings_apply_the_highlight_at_once(window, monkeypatch):
+    """成交高亮那两处是启动时算好存下来的：改完当场重算，不用重启。"""
+    w = window("10000008780\n", config_toml="deal_highlight_within_hours = 24\n")
+    _accept(monkeypatch, edits={"deal_highlight_within_hours": "0",
+                                "deal_highlight_color": "#123456"})
+
+    w.OnOpenSettings()
+
+    assert w.deal_highlight_seconds == 0
+    assert w.deal_highlight_brush.color().name() == theme.deal_highlight_color(
+        "#123456"
+    ).name()
+
+
+def test_settings_reschedule_the_auto_poll_timer(window, monkeypatch):
+    """自动抓取的开关和间隔：定时器当场重挂，状态字跟着换。"""
+    w = window("10000008780\n", config_toml="auto_poll_enabled = false\n")
+    assert not w.auto_poll_timer.isActive()
+    _accept(monkeypatch, edits={"auto_poll_interval_minutes": "15"},
+            boxes={"auto_poll_enabled": True})
+
+    w.OnOpenSettings()
+
+    assert w.auto_poll_timer.isActive()
+    assert w.auto_poll_timer.interval() == 15 * 60_000
+    assert w.auto_poll_label.text() == "自动：15 分钟 / 全部"
+
+
+def test_settings_stops_the_auto_poll_timer_when_switched_off(window, monkeypatch):
+    """本来是开着的，改完关掉：挂着的那一拍要摘掉，别让它再跑一轮。"""
+    w = window("10000008780\n",
+               config_toml="auto_poll_enabled = true\nauto_poll_interval_minutes = 30\n")
+    assert w.auto_poll_timer.isActive()
+    _accept(monkeypatch, boxes={"auto_poll_enabled": False})
+
+    w.OnOpenSettings()
+
+    assert not w.auto_poll_timer.isActive()
+    assert w.auto_poll_label.text() == app_module.AUTO_POLL_OFF_TEXT
+
+
+def test_settings_refresh_the_tooltips_that_quote_config(window, monkeypatch):
+    """提示文字里写着配置的，改完要重拼——不然按钮上还是老间隔。"""
+    w = window("10000008780\n", config_toml="poll_interval_seconds = 2\n")
+    _accept(monkeypatch,
+            edits={"poll_interval_seconds": "7",
+                   "detail_url_template": "https://example.test/new?clusterId={clusterId}"})
+
+    w.OnOpenSettings()
+
+    assert "7 秒" in w.btn_fetch.toolTip()
+    assert "https://example.test/new?clusterId={clusterId}" in (
+        w.table.horizontalHeaderItem(app_module.COL_LINK).toolTip()
+    )
+
+
+def test_settings_write_failure_changes_nothing(window, data_files, monkeypatch, msgboxes):
+    """写不进去（只读、盘满）：一份都别生效，主题也拨回去，并说明白怎么回事。"""
+    original = "poll_interval_seconds = 2\n"
+    w = window("10000008780\n", config_toml=original)
+    start = w.dark
+    _accept(monkeypatch, edits={"poll_interval_seconds": "5"})
+
+    def _boom(changes, path=None):
+        raise OSError("磁盘只读")
+
+    monkeypatch.setattr(config, "save_config", _boom)
+    w.OnOpenSettings()
+
+    assert w.config["poll_interval_seconds"] == 2.0
+    assert w.dark is start
+    assert (data_files / "config.toml").read_text(encoding="utf-8") == original
+    assert w.store.get_setting("theme") is None
+    assert msgboxes[-1]["kind"] == "warning"
+    assert "磁盘只读" in msgboxes[-1]["text"]
 
 
 # ---------------- 缩略图 ----------------
