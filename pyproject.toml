@@ -1,5 +1,5 @@
 [project]
-name = "bili-market-price-watcher"
+name = "BiliMarketMonitor"
 version = "0.1.0"
 description = "Bilibili 市集商品价格监视器"
 requires-python = ">=3.11"  # tomllib 需要 3.11+
@@ -19,20 +19,23 @@ test = ["pytest>=8"]
 channels = ["conda-forge"]
 platforms = ["win-64"]
 
+# 默认 feature 下的任务（属于 default 环境）
 [tool.pixi.tasks]
-start = { cmd = "python src/app.py", cwd = "." }
-shot = { cmd = "python tools/shot.py", cwd = "." }
+start = "python src/app.py"
+shot = "python tools/shot.py"
 
 # pixi 不认 [project.optional-dependencies]，同一份依赖得在这里再写一次；
 # 把 test feature 并进默认环境，`pixi run test` 和 `pixi run start` 共用一个环境。
 [tool.pixi.feature.test.pypi-dependencies]
 pytest = ">=8"
 
-[tool.pixi.environments]
-default = { features = ["test"], solve-group = "default" }
-
 [tool.pixi.feature.test.tasks]
-test = { cmd = "python -m pytest", cwd = "." }
+test = "python -m pytest"
+
+# 关键修正：显式定义 default 环境时，必须包含 "default" feature，
+# 否则定义在 [tool.pixi.tasks] 下的 default / shot 任务不会进入该环境。
+[tool.pixi.environments]
+default = { features = ["default", "test"], solve-group = "default" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
