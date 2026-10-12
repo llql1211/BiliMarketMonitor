@@ -243,6 +243,27 @@ CHANGE_LABELS = {
 # 分类在头一句话里的排列顺序：先跌后涨，再状态变化
 CHANGE_KINDS = (CHANGE_DOWN, CHANGE_UP, CHANGE_SOLD_OUT, CHANGE_ON_SALE)
 
+# 累积确认（见 OnAcknowledge / BuildAckSummary）：报告里多出来的第四块，
+# 攒的是"自上次确认以来"的所有变化，跨多少轮都在，直到用户点一次确认
+ACK_HEADING = "自上次确认以来"
+ACK_SINCE_PREFIX = "上次确认："
+ACK_BUTTON_TEXT = "确认（标记已读）"
+ACK_BUTTON_TIP = (
+    "把这一屏当作已读：每件商品的当前状态都记成新基线\n"
+    "报告里那块「自上次确认以来」随即清零\n"
+    "只改缓存里的基线，不动清单，也不影响企业微信推送"
+)
+# 顶部那句累积状态（见 UpdateAckLabel）。只有「有基线、还没确认过、且攒到了变化」
+# 和「确认过、之后又攒到了变化」两种情况会说件数
+ACK_NONE_TEXT = "尚未确认"
+ACK_DONE_PREFIX = "已确认"
+ACK_COUNT_TEXT = "未确认 {count} 项变化"
+ACK_LABEL_TIP = (
+    "自上次确认以来攒下的变化：报告里会多一块「自上次确认以来」\n"
+    "没点确认就一直攒着，跨多少轮都在（轮次报告本身只覆盖那一轮）\n"
+    "确认状态记在缓存库 data/cache.db 里，删掉缓存会一并丢失"
+)
+
 # 总结窗口里那三块明细的小标题（见 summary_sections）
 CHANGES_HEADING = "价格变动"
 DEALS_HEADING = "新增成交"
@@ -446,6 +467,69 @@ def price_change(previous, result):
     }
 
 
+def ack_change(record):
+    """当前状态相对「上次确认」的变化，返回跟 price_change 同结构的 dict；没变化给 None。
+
+    跟 price_change 是一对：那边比的是上一轮，这边比的是上次确认。判据一个字不
+    改（售罄不参与价格比较、认不出数字就不比、状态变了单独报），所以直接把 ack_*
+    那几列拼成一份「当时的记录」交给它——两边口径永远一致，将来改一处也就够了。
+
+    基准一直停在"确认那一刻"：ack_* 是用户意图，抓取不碰它（见 store.ITEM_COLUMNS），
+    用户不点确认就不动，跨多少轮都是拿它比。没确认过、或首次观察时压根没抓到价格
+    （ack_price_text 为空）时给 None——首次观察只是记基线，不算一条变化。
+    """
+    record = record or {}
+    return price_change(
+        {"price_text": record.get("ack_price_text"), "sold_out": record.get("ack_sold_out")},
+        {"price": record.get("price_text"), "sold_out": record.get("sold_out")},
+    )
+
+
+def ack_new_deals(record):
+    """自上次确认以来新出现的成交（基准是确认那一刻存下的那份快照）。
+
+    判定整条复用 new_deals：把 previous 换成 ack_deals_json、elapsed 换成
+    ack_at 到现在，_aged_from 一个字不用改。这份基线跟 ack_at 一起存在缓存里，
+    关掉程序再开还接着算——累积能跨轮就是靠它落了库。
+
+    三种情况一条都不报（跟 new_deals 的"没有基准就不报"同一条规矩）：没确认过、
+    确认时没存下成交、或认不出那份基线是什么时候记的（elapsed 认不出来时
+    _elapsed_since 给 None，这里就闭嘴——宁可漏报，也不要把几条老成交说成"新增"）。
+    """
+    record = record or {}
+    # 借用 cached_deals_of 的读取路径：它认的就是 deals_json + 它的抓取时刻这两格，
+    # 而 ack 那组基线是同样的形状（见 store._snapshot_json）
+    baseline, anchor = store.cached_deals_of(
+        {"deals_json": record.get("ack_deals_json"),
+         "deals_updated_at": record.get("ack_at")}
+    )
+    if not baseline:
+        return []
+    elapsed = _elapsed_since(anchor)
+    if elapsed is None:
+        return []
+    current, _ = store.cached_deals_of(record)  # 当前这组（它的时刻用不上）
+    return new_deals(current, baseline, elapsed)
+
+
+def ack_reached(entry, record) -> bool:
+    """这件商品是不是「刚跌破预期价」：现在低于，而上次确认时不低。
+
+    到价（expected_reached）每轮都报，累积这块只该报**新跌破的**——累积说的是
+    "这段时间里发生了哪些事"，一件三个月前就跌破了的商品每轮都报一遍，那块清单
+    就没法看了。
+
+    预期价用**当前**那个（不存 ack_expected_price）：改了预期价等于重新设了目标，
+    之前"没到价"的历史不该反过来冤枉它。确认基线没记下价格时（首次观察那次没抓到）
+    expected_reached 判不出来，按"确认时不低"处理——多报一条，好过让它从此不吭声。
+    """
+    record = record or {}
+    expected = entry.expected_price
+    if not expected_reached(expected, record.get("price_text"), record.get("sold_out")):
+        return False  # 现在都没到价（没设预期价也走这条）
+    return not expected_reached(expected, record.get("ack_price_text"), record.get("ack_sold_out"))
+
+
 def split_price_text(text, delta, stock=""):
     """把「¥44 ↓6 · 2件」拆成现价 / 涨跌 / 剩余件数三截（现价那截留着分隔的空格）。
 
@@ -512,6 +596,15 @@ def _parse_stamp(value):
 def _format_stamp(stamp) -> str:
     """datetime →「2026-09-16 10:30:00」。跟缓存里存的格式差在中间那个 T 上。"""
     return stamp.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _now_iso() -> str:
+    """此刻的 ISO 时刻串，跟缓存里那些时间戳同一个格式（见 store._now）。
+
+    确认要记下"用户是什么时候点的"，拿它跟 _parse_stamp / _elapsed_since 对得上，
+    所以别处怎么存这里就怎么写。
+    """
+    return datetime.now().isoformat(timespec="seconds")
 
 
 def _display_time(value) -> str:
@@ -769,6 +862,34 @@ def summary_sections(changes, deals, targets, dark) -> str:
         targets_html(targets, dark),
     ]
     return SECTION_SEPARATOR.join(block for block in blocks if block)
+
+
+def ack_html(ack, dark) -> str:
+    """累积那块的正文：一句小标题（自上次确认以来 N 项）+ 三张明细表；没有就回空串。
+
+    三张表直接复用 summary_sections()——它本来就是"三个可选块拼起来"的结构，
+    累积这块的 changes / deals / targets 跟本轮那三块形状完全一样（见 BuildAckSummary），
+    没必要另写一套渲染，改了配色或版式也是两边一起动。
+
+    小标题比里头那三行大字高一层，所以单独拼一张表——但只用 QTextEdit 认得的
+    table / td / span（见 _section_html）。"上次确认"那个时刻跟着列一行弱化小字：
+    这堆变化是从哪儿攒起的，是这块里最容易被问的一句。
+    """
+    ack = ack if isinstance(ack, dict) else {}
+    body = summary_sections(ack.get("changes"), ack.get("deals"), ack.get("targets"), dark)
+    if not body:
+        return ""  # 没有明细就整块省掉（标题也不留），窗口那边据此不显示这一块
+    muted = theme.muted_color(dark).name()
+    cells = [f"<tr><td><b>{_esc(f'{ACK_HEADING}（{ack.get('count', 0)} 项）')}</b></td></tr>"]
+    if ack.get("since"):
+        cells.append(
+            f'<tr><td><span style="color:{muted}">'
+            f"{_esc(ACK_SINCE_PREFIX + str(ack['since']))}</span></td></tr>"
+        )
+    title = (
+        f'<table cellspacing="0" cellpadding="6" width="100%">{"".join(cells)}</table>'
+    )
+    return title + SECTION_SEPARATOR + body
 
 
 def _section_html(heading, titles, rows, muted) -> str:
@@ -1333,7 +1454,11 @@ class SummaryDialog(QDialog):
     再分块列出明细。
 
     明细有三块（各一张小表，见 summary_sections）：价格变动、新增成交、
-    低于预期价格。
+    低于预期价格；有累积时后面再接一块「自上次确认以来」（见 ack_html）。
+
+    底部除了「关闭」还有「确认（标记已读）」：按下只把事报出去（acknowledged），
+    自己既不关窗、也不改任何状态——累积那块刷新成什么样，由主窗口算好再塞回来
+    （见 SetAck）。跟项目里"窗口只管摆、收，不认识 MainWindow"的规矩一致。
 
     不开模态（和看图那个窗口同理）：总结是"看一眼"的东西，读的时候顺手点点
     表格、打开个详情页都很自然，没必要把主窗口锁住。
@@ -1341,16 +1466,22 @@ class SummaryDialog(QDialog):
     什么都没有时也照样弹（用户要的是每轮都有个收尾交代），此时藏掉明细那块空框。
     """
 
+    acknowledged = pyqtSignal()
+
     def __init__(
-        self, changes, deals, targets, total, failures, elapsed, dark, parent=None
+        self, changes, deals, targets, total, failures, elapsed, dark,
+        ack=None, parent=None,
     ):
         super().__init__(parent)
         self.changes = _dicts(changes)
         self.deals = _dicts(deals)
         self.targets = _dicts(targets)
+        # 累积那块：count 为 0 等于"自上次确认以来什么都没发生"，跟没传一样处理
+        self.ack = ack if isinstance(ack, dict) and ack.get("count") else None
         self.total = total
         self.failures = failures
         self.elapsed = elapsed  # 本轮实际耗时（秒，刨掉暂停），见 MainWindow.RunElapsed
+        self.dark = dark  # SetAck 之后要按同一个主题重渲染
         self.setWindowTitle(SUMMARY_TITLE)
         self.setMinimumWidth(360)  # 没有明细时窗口会收得很窄，别让按钮挤成一团
 
@@ -1372,6 +1503,11 @@ class SummaryDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.button(QDialogButtonBox.Close).setText("关闭")
         buttons.rejected.connect(self.reject)
+        # 确认是个动作按钮，不是收尾按钮，所以不进 Close/Reject 那一套：
+        # 按了之后窗口留着，用户可能还想接着看本轮的明细
+        self.btn_ack = buttons.addButton(ACK_BUTTON_TEXT, QDialogButtonBox.ActionRole)
+        self.btn_ack.setToolTip(ACK_BUTTON_TIP)
+        self.btn_ack.clicked.connect(self.acknowledged)
         layout.addWidget(buttons)
 
         self.SetDark(dark)
@@ -1383,8 +1519,21 @@ class SummaryDialog(QDialog):
             self.resize(460, 180)  # 没有明细，矮一点就够
 
     def HasDetail(self) -> bool:
-        """有没有要列的明细（决定正文区露不露、窗口开多大）。"""
-        return bool(self.changes or self.deals or self.targets)
+        """有没有要列的明细（决定正文区露不露、窗口开多大）。
+
+        累积那块也算：本轮什么都可能没有，而攒了几轮没看的时候恰恰只有它有内容。
+        """
+        return bool(self.changes or self.deals or self.targets or self.ack)
+
+    def SetAck(self, ack):
+        """换掉累积那块（主窗口在用户点了确认之后叫一次）。
+
+        窗口自己不去算新内容：它不知道缓存里有什么，也不认识 MainWindow。
+        传 None（或 count 为 0）就是"清零了"，那块随即消失——那正是用户按完
+        确认该看到的：屏幕上只剩本轮的明细。
+        """
+        self.ack = ack if isinstance(ack, dict) and ack.get("count") else None
+        self.SetDark(self.dark)
 
     def SetDark(self, dark):
         """按主题重新渲染文案与配色（主窗口切换主题时再叫一次）。
@@ -1392,13 +1541,16 @@ class SummaryDialog(QDialog):
         文案本来跟主题无关，但一起重渲染最省事——改动只有一处，
         不会出现"换了主题、数字还是旧的"这种对不上的情况。
         """
+        self.dark = dark
         self.headline.setText(summary_headline(self.changes, self.deals, self.targets))
         self.subtitle.setText(
             summary_subtitle(self.total, self.failures, self.elapsed)
         )
-        self.detail.setHtml(
-            summary_sections(self.changes, self.deals, self.targets, dark)
-        )
+        blocks = [
+            summary_sections(self.changes, self.deals, self.targets, dark),
+            ack_html(self.ack, dark),
+        ]
+        self.detail.setHtml(SECTION_SEPARATOR.join(block for block in blocks if block))
         self.detail.setVisible(self.HasDetail())  # 没有明细就别摆个空框
 
 
@@ -1663,10 +1815,17 @@ class MainWindow(QMainWindow):
         self.btn_last_summary.setToolTip(LAST_SUMMARY_TIP)
         self.btn_last_summary.setEnabled(False)  # 有快照才点亮，见 ShowSummary
         self.btn_last_summary.clicked.connect(self.OnShowLastSummary)
+        # 「未确认 N 项变化」/「已确认 · 3 小时前」也搁这一行：它说的是"总结里那块
+        # 累积攒了多少"，跟旁边那个总结按钮是一回事，放一起才看得出关联。
+        # 只是提示，动不了它——清零点在总结窗口里那个「确认」按钮上
+        self.ack_label = QLabel()
+        self.ack_label.setToolTip(ACK_LABEL_TIP)
+        self.UpdateAckLabel()
         info_bar = QHBoxLayout()
         info_bar.addWidget(self.updated_label)
         info_bar.addStretch()
         info_bar.addWidget(self.auto_poll_label)
+        info_bar.addWidget(self.ack_label)
         info_bar.addWidget(self.btn_last_summary)
         layout.addLayout(info_bar)
 
@@ -1887,6 +2046,9 @@ class MainWindow(QMainWindow):
         for row, item in enumerate(self.rows):
             self.FillRow(row, item)
         self.UpdateUpdatedLabel()
+        # 顶部那句累积状态跟着重画一起刷新（增删、排序、刷新清单、确认之后都会走到
+        # 这儿）：它数的是"清单里这些商品攒了多少变化"，商品没了就得跟着变
+        self.UpdateAckLabel()
 
     def UpdateUpdatedLabel(self):
         """刷新顶部那行「上次更新时间」。
@@ -1904,6 +2066,43 @@ class MainWindow(QMainWindow):
         self.updated_label.setText(
             f"{LAST_UPDATE_PREFIX}{_format_stamp(newest)}" if newest else NO_UPDATE_TEXT
         )
+
+    def UpdateAckLabel(self):
+        """刷新顶部那句累积确认状态，四种情况见 ACK_* 那几个常量。
+
+        「未确认 N 项变化」里的 N 是**件数**（一件商品算一项，跟总结窗口头一句话
+        同一个口径，见 summary_headline）：光数条数的话，一件商品新增三条成交
+        会报成三件，对着明细看就总是对不上。
+
+        "确认过没有"看的是缓存里那个全局时刻（见 store.ACK_AT_SETTING），不是
+        各行的 ack_at——按「添加」新加进来的商品会自己记一份首次观察的基线
+        （见 OnResultReady），那不是用户确认过的意思。
+
+        攒着的变化为 0 时不说「未确认 0 项变化」：没变化就没什么未确认的，
+        只报"上次确认是多久以前"。
+        """
+        summary = self.BuildAckSummary()
+        count = summary["count"] if summary else 0
+        if count:
+            self.ack_label.setText(ACK_COUNT_TEXT.format(count=count))
+            return
+        at = self.AckAt()
+        if at is None:
+            self.ack_label.setText(ACK_NONE_TEXT)
+            return
+        elapsed = max(0.0, (datetime.now() - at).total_seconds())
+        self.ack_label.setText(f"{ACK_DONE_PREFIX} · {format_duration(elapsed)}前")
+
+    def AckAt(self):
+        """缓存里记着的「上次确认时刻」（datetime）；没确认过、认不出、缓存已关都是 None。
+
+        末一种不是防御性代码：抓取线程的最后一句回包可能在窗口关掉、缓存连接也关了
+        之后才送到（conftest 收尾那一段说的就是这件事）。那时还去读设置会当场抛
+        「缓存已关闭」，而槽里抛异常在 PyQt 下是直接 abort 进程——连测试报告都留不下。
+        """
+        if self.store.conn is None:
+            return None
+        return _parse_stamp(self.store.get_setting(store.ACK_AT_SETTING))
 
     def SetThumbnail(self, row, image_url):
         """给某行配缩略图：缓存里有就直接贴，没有才后台下载。
@@ -2443,6 +2642,11 @@ class MainWindow(QMainWindow):
         self.btn_pause.setEnabled(busy)
         self.btn_stop.setEnabled(busy)
         self.btn_pause.setText(PAUSE_TEXT)  # 每次进出都复位成「暂停抓取」
+        # 抓取中也不许确认：这一轮正一件件往缓存里写，此刻把基线刷成"当前值"，
+        # 等于把还没跑完的那一半也算作已读（见 OnAcknowledge 开头那道同样的闸）。
+        # 窗口没开着就没什么可灰的——那个按钮只长在总结窗口上
+        if self.summary_dialog is not None:
+            self.summary_dialog.btn_ack.setEnabled(not busy)
         # 抓取中也不许拖拽排序：轮询任务记的是"第几行"，
         # 中途插队会让已经发出的结果填到别的商品上
         self.table.setDragDropMode(
@@ -2861,6 +3065,24 @@ class MainWindow(QMainWindow):
                 lowest_price=new_lowest,
                 deals=result["deals"],
             )
+            # 这件商品还没有确认基线（新加进来的，或者库里从没确认过）：把这次抓到的
+            # 样子记成基线，往后累积才有"相对什么"可比。这一笔不算确认——全局那个
+            # 确认时刻不动，顶部该停在「尚未确认」（见 store.init_ack_if_empty）。
+            # 判据取 previous（抓取前那份）：它就是"这次抓之前有没有基线"
+            if not (previous or {}).get("ack_at"):
+                self.store.init_ack_if_empty(
+                    cluster_id,
+                    result["price"],
+                    parser.price_number(result["price"]),
+                    result["sold_out"],
+                    # 史低价的口径跟 upsert_item 一致：这轮刷了新记录就用新的，
+                    # 没刷（售罄、认不出数字、不比现存的低）就用上一个记录里的
+                    new_lowest if new_lowest is not None else previous.get("lowest_price"),
+                    result["deals"],
+                )
+            # 写完再回读一遍：既拿到刚写进去的价格，也把可能刚记下的基线一起带回来。
+            # 累积判定看的是内存里这份 record（见 BuildAckSummary），不回读的话，
+            # 这一轮就会以为"还没有基线"——首次观察那轮看不出区别，第二轮照样报空
             item["record"] = self.store.get_item(cluster_id)
             if result["name"] and result["name"] != item["entry"].name:
                 self.names_learned = True
@@ -2873,8 +3095,10 @@ class MainWindow(QMainWindow):
 
         self.SetPriceCells(row, item)
         self.SetDealCells(row, item)
-        # 这一行的价格刚写进缓存，顶部那个时间得跟着往前走
+        # 这一行的价格刚写进缓存，顶部那个时间得跟着往前走；累积那件也是同一回事
+        # ——它比的就是"这行的现价相对确认那一刻"，每来一条结果它就该跟着变
         self.UpdateUpdatedLabel()
+        self.UpdateAckLabel()
 
         # 名称：接口返回的才是最新的；失败时如果原本没有名字，标出来而不是留个"…"
         name_item = self.table.item(row, COL_NAME)
@@ -2954,6 +3178,11 @@ class MainWindow(QMainWindow):
         # 中途「停止抓取」那一轮不弹总结，但已经观察到的补货、到价都是真的，
         # 该推的还是推
         self.FlushNotifications()
+        # 顶部那句累积状态也该跟着这一轮往前挪了。搁在这儿（三条收尾路径都过）而不是
+        # 弹总结那两处：中途「停止抓取」那一轮也算数——它抓到的变化照旧留在 ack_*
+        # 之外，下一轮正常跑完时会一起报上来（见 dev_notes 边界情况 5），
+        # 这儿那句「未确认 N 项」得先说得出这件事
+        self.UpdateAckLabel()
         if self.poller_stopped:
             self.progress_label.setText("已停止抓取，已抓到的结果保留")
             return
@@ -3012,6 +3241,10 @@ class MainWindow(QMainWindow):
         只造窗口，不录快照——录快照是 ShowSummary 的事。两件事拆开是为了让
         「查看上次总结」不顺手把自己又写成一份新快照：内容虽然一样，但那样
         「最近一份」就有了两个来源，往后谁覆盖谁就得靠人去推。
+
+        累积那块（ack）却是每次现算，不跟着快照走：它说的是"此刻攒了多少"，
+        不是"那轮报告长什么样"——快照里存一份的话，「查看上次总结」弹出来的就是
+        一份过时的累积，而它下面还挂着个能按的「确认」按钮。
         """
         if self.summary_dialog is not None:
             self.summary_dialog.close()
@@ -3025,9 +3258,90 @@ class MainWindow(QMainWindow):
             snapshot["failures"],
             snapshot["elapsed"],
             self.dark,
-            self,
+            ack=self.BuildAckSummary(),
+            parent=self,
         )
+        # 抓取中开的窗口（上一轮那份还开着）也照 SetBusy 的规矩灰上
+        self.summary_dialog.btn_ack.setEnabled(not self.IsPolling())
+        # 确认按钮的动作归主窗口：窗口只发信号，谁该变什么由这边统一做
+        self.summary_dialog.acknowledged.connect(self.OnAcknowledge)
         self.summary_dialog.show()
+
+    def BuildAckSummary(self):
+        """自上次确认以来的全部变化；一件都没有时返回 None。
+
+        跟本轮那份报告（run_changes 那组）是两份东西：那份只记这一轮，这份从上次
+        确认起一直攒着。累积不需要任何合并逻辑——基线不动，下一轮自然是拿同一份
+        基线比出来的，上一轮的内容就自动带上了（见 dev_notes 的方案概要）。
+
+        逐行跑那三个判定（ack_change / ack_new_deals / ack_reached），拼出来的
+        changes / deals / targets 跟本轮那三份同结构，总结窗口那边一套渲染两处用。
+        """
+        changes, deals, targets = [], [], []
+        for item in self.rows:
+            record = item["record"] or {}
+            name = record.get("name") or item["entry"].name or item["entry"].cluster_id
+            change = ack_change(record)
+            if change is not None:
+                change["name"] = name
+                changes.append(change)
+            fresh = ack_new_deals(record)
+            if fresh:
+                deals.append({"name": name, "deals": fresh})
+            if ack_reached(item["entry"], record):
+                targets.append(
+                    {
+                        "name": name,
+                        "price": record.get("price_text"),
+                        "expected_price": item["entry"].expected_price,
+                    }
+                )
+        if not (changes or deals or targets):
+            return None
+        # 上次确认是什么时候：没确认过就留空（那块只报基线之后攒的，不假装有个起点）
+        at = self.AckAt()
+        return {
+            "changes": changes,
+            "deals": deals,
+            "targets": targets,
+            "since": _format_stamp(at) if at else None,
+            "count": len(changes) + len(deals) + len(targets),
+        }
+
+    def OnAcknowledge(self):
+        """把所有商品的确认基线刷成当前值，并记下确认时刻（见 SummaryDialog 那个按钮）。
+
+        一次刷全部，不做逐件确认：按钮叫「确认」，语义就是"这一屏我都看过了"。
+
+        没抓到的行也照样记一笔（基线是空的）：它们的 ack_at 跟着往前走，下一轮
+        才抓到时不会因为"这行的基线还是三天前那个"而把中间的空档报成变化。
+        """
+        if self.IsPolling():
+            return  # 抓取中不给确认，理由见 SetBusy
+        at = _now_iso()
+        entries = []
+        for item in self.rows:
+            record = item["record"] or {}
+            entries.append(
+                (
+                    item["entry"].cluster_id,
+                    record.get("price_text"),
+                    parser.price_number(record.get("price_text")),
+                    bool(record.get("sold_out")),
+                    record.get("lowest_price"),
+                    record.get("deals_json"),
+                )
+            )
+        self.store.acknowledge(entries, at)
+        # 内存里的 record 还带着旧 ack，重读一遍；选中态按商品搬回去。
+        # 顶部那句跟着 RebuildRows 一起刷新（见 RenderTable）
+        selected = self.SelectedClusterIds()
+        self.RebuildRows()
+        self.SelectItems(selected)
+        # 开着的总结窗口里那块累积也得跟着清掉——按钮就在那个窗口上，
+        # 按完还挂着满满一块"未确认的变化"就成了自相矛盾的画面
+        if self.summary_dialog is not None and self.summary_dialog.isVisible():
+            self.summary_dialog.SetAck(self.BuildAckSummary())
 
     def OnCellClick(self, row, col):
         """单击：收藏格切换收藏，「链接」格开浏览器，其余格子（选中、拖拽）不理会。"""
@@ -3221,6 +3535,7 @@ class MainWindow(QMainWindow):
         # 次要信息跟着主题弱化（跟「原价」那格同一个色），别跟按钮抢眼
         self.updated_label.setStyleSheet(f"color: {theme.muted_color(dark).name()};")
         self.auto_poll_label.setStyleSheet(f"color: {theme.muted_color(dark).name()};")
+        self.ack_label.setStyleSheet(f"color: {theme.muted_color(dark).name()};")
 
     def SwitchTheme(self, dark: bool):
         """换主题：记进设置表（下次启动沿用）、装样式、重画表格。"""
@@ -3338,6 +3653,10 @@ class MainWindow(QMainWindow):
         """退出前把自动抓取停掉、缓存连接关掉：SQLite 的写入要落盘，文件句柄也别留着。"""
         self.auto_poll_timer.stop()
         self.store.close()
+        # 那份总结窗口的父窗口就是它，主窗口一关就跟着走。引用留着只会指着一个
+        # 迟早被销毁的对象，而收尾之后才送到的那句回包（见 conftest 收尾那段）
+        # 还会去摸它——槽里抛异常在 PyQt 下是直接 abort 进程的（同 AckAt）
+        self.summary_dialog = None
         super().closeEvent(event)
 
 

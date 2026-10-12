@@ -4,6 +4,7 @@
 网络请求与浏览器一律被替换，见 tests/conftest.py。
 """
 
+import json
 import time
 from datetime import datetime, timedelta
 
@@ -47,6 +48,7 @@ import links
 import notifier
 import parser
 import settings
+import store
 import theme
 
 
@@ -2134,6 +2136,371 @@ def test_last_summary_button_does_not_widen_the_window(window):
     without_button = w.minimumSizeHint().width()
 
     assert with_button == without_button
+
+
+# ---------------- 累积确认 ----------------
+#
+# 报告里多出来的第四块：自上次确认以来攒下的变化（见 app.BuildAckSummary）。
+# 基准是 ack_* 那几列，用户不点「确认」就不动，所以攒的内容跨轮、跨重启都在。
+
+
+def _row(price=None, sold_out=0, ack=None, deals=None, ack_deals=None, ack_at=CACHED_AT):
+    """一条缓存记录（只摆判定用到的那几格）。
+
+    ack 给确认基线那组的现价 (price_text, sold_out)，跟 store 里那两格同名同义；
+    ack 为 None 表示还没确认过（新商品、或老库补列留下的空基线）。
+    """
+    record = {
+        "price_text": price,
+        "sold_out": sold_out,
+        "deals_json": json.dumps(deals) if deals is not None else None,
+        "deals_updated_at": ack_at,
+    }
+    ack_price, ack_sold_out = ack if ack else (None, 0)
+    record["ack_price_text"] = ack_price
+    record["ack_price_value"] = parser.price_number(ack_price)
+    record["ack_sold_out"] = ack_sold_out
+    record["ack_deals_json"] = json.dumps(ack_deals) if ack_deals is not None else None
+    record["ack_at"] = ack_at if ack else None
+    return record
+
+
+@pytest.mark.parametrize(
+    "ack, current, kind",
+    [
+        (("¥50", 0), ("¥44", 0), "down"),     # 确认之后降了
+        (("¥44", 0), ("¥50", 0), "up"),       # 涨了
+        (("¥44", 0), ("¥44", 0), None),       # 没动
+        (("¥44", 0), ("¥44", 1), "sold_out"), # 售罄了：价格不比，状态单独报
+        (("¥44", 1), ("¥44", 0), "on_sale"),  # 又上架了
+        (("¥44", 1), ("¥38", 1), None),       # 两边都售罄：那格的"现价"是原价，不比
+        (("¥44", 0), ("面议", 0), None),      # 认不出数字就不比
+        (("¥44", 0), (None, 0), None),        # 这次没抓到价格
+        (None, ("¥44", 0), None),             # 确认时没抓到价格：没有基准可比
+    ],
+)
+def test_ack_change(ack, current, kind):
+    """累积的价格变动跟本轮同一套判据，只是基准换成"上次确认那一刻"。"""
+    change = app_module.ack_change(_row(current[0], current[1], ack=ack))
+
+    if kind is None:
+        assert change is None
+        return
+    assert change["kind"] == kind
+    if kind in ("down", "up"):
+        assert (change["old_price"], change["new_price"]) == (ack[0], current[0])
+
+
+def test_ack_new_deals_uses_the_confirmation_as_the_baseline():
+    """成交也拿确认那一刻当基准：确认之后才挤进来的那条才算新增。"""
+    at = datetime.now().isoformat(timespec="seconds")
+    baseline = [{"price": "¥205", "time": "1000000秒前"}]
+    current = [{"price": "¥205", "time": "978400秒前"}, {"price": "¥205", "time": "1000000秒前"}]
+
+    fresh = app_module.ack_new_deals(
+        _row("¥44", ack=("¥44", 0), deals=current, ack_deals=baseline, ack_at=at)
+    )
+
+    assert [deal["time"] for deal in fresh] == ["978400秒前"]
+
+
+def test_ack_new_deals_without_a_moment_reports_nothing():
+    """确认时刻认不出来就没有"隔了多久"（老库补列的空值也走这条）：宁可不报。"""
+    record = _row(
+        "¥44", deals=[{"price": "¥205", "time": "刚刚"}],
+        ack=("¥44", 0), ack_deals=[{"price": "¥205", "time": "刚刚"}], ack_at="上周三",
+    )
+
+    assert app_module.ack_new_deals(record) == []
+
+
+def test_ack_new_deals_without_a_confirmed_baseline_reports_nothing():
+    """确认时压根没记过成交：没有基准可比，宁可不报。"""
+    record = _row("¥44", deals=[{"price": "¥205", "time": "刚刚"}], ack=None)
+
+    assert app_module.ack_new_deals(record) == []
+
+
+@pytest.mark.parametrize(
+    "ack, current, expected, reached",
+    [
+        (("¥50", 0), ("¥44", 0), "45", True),   # 确认时没到，现在到了：刚跌破
+        (("¥44", 0), ("¥44", 0), "45", False),  # 确认时就低了，不是这一轮才跌破的
+        (("¥50", 0), ("¥50", 0), "45", False),  # 现在也没到
+        (("¥50", 1), ("¥44", 0), "45", True),   # 确认时售罄（不比），现在到价了
+        (("¥50", 0), ("¥44", 1), "45", False),  # 现在售罄：那格的"现价"是原价
+        (("面议", 0), ("¥44", 0), "45", True),  # 确认时认不出数字：也算"刚跌破"，别漏报
+        (("¥50", 0), ("面议", 0), "45", False), # 现在认不出数字
+        (None, ("¥44", 0), "45", True),         # 首次观察没抓到确认价：同样别漏报
+        (("¥44", 0), ("¥44", 0), "", False),    # 没设预期价
+    ],
+)
+def test_ack_reached_only_reports_the_fresh_break(ack, current, expected, reached):
+    """到价判定：只在"确认时没到、现在到了"那一刻报，跟通知那边同一条边沿规则。"""
+    entry = links.LinkEntry("10000008780", "甲", expected)
+
+    assert app_module.ack_reached(entry, _row(current[0], current[1], ack=ack)) is reached
+
+
+def test_first_round_only_records_the_baseline(window, monkeypatch, wait_until):
+    """第一轮只是记基线：那件商品第一次被抓到，没有"之前"可比，累积是空的。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
+    monkeypatch.setattr(
+        client, "fetch_cluster", _fetch_by_id({"10000008780": raw_ok(name="甲", price="¥50")})
+    )
+
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+
+    dialog = w.summary_dialog
+    assert dialog.ack is None                 # 第四块没内容就不摆
+    assert app_module.ACK_HEADING not in dialog.detail.toPlainText()
+    assert w.ack_label.text() == app_module.ACK_NONE_TEXT
+    assert w.rows[0]["record"]["ack_price_text"] == "¥50"  # 基线记下了
+
+
+def test_second_round_accumulates_against_the_recorded_baseline(window, monkeypatch, wait_until):
+    """第二轮就报"相对第一次抓到的变化"，且这条一直攒着——用户不确认就不清。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
+
+    monkeypatch.setattr(
+        client, "fetch_cluster", _fetch_by_id({"10000008780": raw_ok(name="甲", price="¥50")})
+    )
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+    assert w.summary_dialog.ack is None
+
+    monkeypatch.setattr(
+        client, "fetch_cluster", _fetch_by_id({"10000008780": raw_ok(name="甲", price="¥44")})
+    )
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+
+    dialog = w.summary_dialog
+    assert dialog.ack["count"] == 1
+    assert dialog.ack["since"] is None  # 还没确认过，不假装有个起点
+    assert w.ack_label.text() == app_module.ACK_COUNT_TEXT.format(count=1)
+    tail = dialog.detail.toPlainText().split(app_module.ACK_HEADING)[-1]
+    assert "甲" in tail and "¥50 → ¥44" in tail and "↓6" in tail
+
+
+def test_unconfirmed_change_stays_in_the_block_across_rounds(window, monkeypatch, wait_until):
+    """跨几轮都一样：基线不动，上一轮的内容自然还挂着，不需要任何合并逻辑。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
+    first = raw_ok(name="甲", price="¥50")
+    later = raw_ok(name="甲", price="¥44")
+
+    monkeypatch.setattr(client, "fetch_cluster", _fetch_by_id({"10000008780": first}))
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+
+    monkeypatch.setattr(client, "fetch_cluster", _fetch_by_id({"10000008780": later}))
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+    assert w.summary_dialog.ack["count"] == 1
+
+    # 第三轮价格也没再动、成交还是那几条：但因为没人确认，这条依然在块里
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+    assert w.summary_dialog.ack["count"] == 1
+    assert w.ack_label.text() == app_module.ACK_COUNT_TEXT.format(count=1)
+
+
+def test_accumulated_block_collects_the_new_deals_too(window, monkeypatch, wait_until):
+    """成交也一起攒：第四块里该有两个栏目，价格那条和成交那条各算一项。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
+    first = raw_ok(name="甲", price="¥50", deal_times=["8天前", "8天前", "8天前"])
+    later = raw_ok(name="甲", price="¥44", deal_times=["2小时前", "8天前", "8天前"])
+
+    monkeypatch.setattr(client, "fetch_cluster", _fetch_by_id({"10000008780": first}))
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+
+    monkeypatch.setattr(client, "fetch_cluster", _fetch_by_id({"10000008780": later}))
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+
+    tail = w.summary_dialog.detail.toPlainText().split(app_module.ACK_HEADING)[-1]
+    assert w.summary_dialog.ack["count"] == 2  # 降价 1 + 新增成交 1
+    assert app_module.CHANGES_HEADING in tail and "¥50 → ¥44" in tail
+    assert app_module.DEALS_HEADING in tail and "2小时前" in tail
+
+
+def test_confirming_clears_the_block_and_flips_the_label(window, monkeypatch, wait_until):
+    """点「确认（标记已读）」：基线刷成当前、块清掉、窗口留着，顶部换成「已确认」。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
+    monkeypatch.setattr(
+        client, "fetch_cluster", _fetch_by_id({"10000008780": raw_ok(name="甲", price="¥44")})
+    )
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+    monkeypatch.setattr(
+        client, "fetch_cluster", _fetch_by_id({"10000008780": raw_ok(name="甲", price="¥50")})
+    )
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+    assert w.summary_dialog.ack["count"] == 1
+
+    dialog = w.summary_dialog
+    dialog.btn_ack.click()
+
+    assert dialog.isVisible()  # 确认是动作按钮，不关窗
+    assert dialog.ack is None
+    assert app_module.ACK_HEADING not in dialog.detail.toPlainText()
+    assert "¥44 → ¥50" in dialog.detail.toPlainText()  # 本轮明细还在
+    assert w.ack_label.text() == f"{app_module.ACK_DONE_PREFIX} · 1 秒前"
+    assert w.store.get_setting(store.ACK_AT_SETTING)  # 全局时刻落库了
+
+
+def test_confirmation_survives_a_restart(window, monkeypatch, wait_until):
+    """确认状态跟基线都在缓存里：关掉再开，那句话和"已确认"的起点都还在。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
+    monkeypatch.setattr(
+        client, "fetch_cluster", _fetch_by_id({"10000008780": raw_ok(name="甲", price="¥50")})
+    )
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+    w.OnAcknowledge()
+    w.close()
+
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    assert w.BuildAckSummary() is None
+    assert w.ack_label.text().startswith(app_module.ACK_DONE_PREFIX)
+
+    # 重启之后又降了：报的正是"相对确认那一刻"的这条，说明基线没被重启抹掉
+    monkeypatch.setattr(
+        client, "fetch_cluster", _fetch_by_id({"10000008780": raw_ok(name="甲", price="¥44")})
+    )
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+
+    assert w.summary_dialog.ack["count"] == 1
+
+
+def test_confirming_does_not_change_the_notification_judgment(window):
+    """回归：确认只刷 ack_*，企业微信推送那边仍走上一轮（previous）。
+
+    确认之后涨上去再跌下来，通知按"上一轮 ¥66 → 这一轮 ¥50"判降价；要是误拿
+    确认基线（¥44）当基准，这轮就会看成"涨回 50"，该推的就不推了。
+    """
+    w = window(
+        "10000008780 | 甲 | *\n",
+        config_toml=_notify_toml(notify_on_favorite_drop="true"),
+    )
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, _fetched("¥44"))
+    w.OnAcknowledge()
+    w.notify_queue.clear()
+
+    w.OnResultReady(0, _fetched("¥66"))  # 涨上去：不推
+    assert w.notify_queue == []
+
+    w.OnResultReady(0, _fetched("¥50"))  # 相对上一轮是降价
+
+    assert _queue_names(w) == ["甲 | 降价 ↓16"]
+    assert w.ack_label.text() == app_module.ACK_COUNT_TEXT.format(count=1)  # 累积各算各的
+
+
+def test_acknowledge_button_is_greyed_while_polling(window):
+    """抓取中不给确认：基线正被这一轮的写入推着走，这时候清零会把中间的变化吞掉。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.ShowSummary()
+    assert w.summary_dialog.btn_ack.isEnabled()
+
+    w.SetBusy(True)
+    assert not w.summary_dialog.btn_ack.isEnabled()
+
+    w.SetBusy(False)
+    assert w.summary_dialog.btn_ack.isEnabled()
+
+
+def test_summary_opened_while_polling_has_the_button_greyed(window):
+    """抓取中弹出来的总结窗口同样不给确认——按钮从打开那一刻就该是灰的。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.poller = FakePoller()
+
+    w.ShowSummary()
+
+    assert not w.summary_dialog.btn_ack.isEnabled()
+
+
+def test_acknowledge_is_refused_while_polling(window):
+    """就算按钮被绕过去（快捷键之类），抓取中的确认也一律不受理。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.poller = FakePoller()
+
+    w.OnAcknowledge()
+
+    assert w.store.get_setting(store.ACK_AT_SETTING) is None
+
+
+def test_ack_label_uses_the_muted_colour(window):
+    """次要信息，跟「原价」那格同一个弱化色，别跟按钮抢眼。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+    for dark in (False, True):
+        w.ApplyTheme(dark)
+        assert theme.muted_color(dark).name() in w.ack_label.styleSheet()
+
+
+def test_ack_block_follows_the_theme_too(window):
+    """切主题时第四块跟着重画：它在 SetDark 里跟另外三块一起拼进同一份 HTML。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.ApplyTheme(False)
+    w.ShowSummary()
+    w.summary_dialog.SetAck(
+        {
+            "changes": [
+                {"kind": "down", "name": "甲", "old_price": "¥50", "new_price": "¥44",
+                 "delta": "↓6", "change": -6}
+            ],
+            "deals": [],
+            "targets": [],
+            "since": "2026-10-11 09:15:00",
+            "count": 1,
+        }
+    )
+    assert theme.PRICE_DOWN_COLOR_LIGHT in w.summary_dialog.detail.toHtml().lower()
+
+    w.SwitchTheme(not w.dark)
+
+    assert w.dark is True
+    assert theme.PRICE_DOWN_COLOR_DARK in w.summary_dialog.detail.toHtml().lower()
+
+
+def test_ack_label_does_not_widen_the_window(window):
+    """那句累积提示加在顶部信息栏，不该把窗口的最小宽度顶上去（同 updated_label 那条规矩）。
+
+    要拿它最长的样子试：「未确认 99 项变化」比默认那句「尚未确认」长得多——
+    挤不下时多出来的那截会落到最小宽度上，所以比"有提示"和"没提示"的差。
+    """
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.ack_label.setText(app_module.ACK_COUNT_TEXT.format(count=99))
+    with_label = w.minimumSizeHint().width()
+
+    w.ack_label.setVisible(False)
+    without_label = w.minimumSizeHint().width()
+
+    assert with_label == without_label
 
 
 # ---------------- 自动抓取 ----------------
