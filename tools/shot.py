@@ -590,20 +590,51 @@ def _settings_auto(dark):
     return _settings_dialog(dark, "auto")
 
 
+# 编的 webhook 地址：真地址等于往群里发消息的权限，绝不能进 PNG（见 _settings_dialog）
+FAKE_WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=示例地址-别用真的"
+
+
+def _notify_dialog(dark, **overrides):
+    """「企业微信推送」那页，webhook 填的是编的地址。"""
+    values = {"notify_wecom_webhook": FAKE_WEBHOOK, "notify_on_favorite_lowest": True}
+    values.update(overrides)
+    return _settings_dialog(dark, "notify", **values)
+
+
 @scene("settings-notify")
 def _settings_notify(dark):
     """「企业微信推送」页：长地址的输入框 + 底下那组「通知内容设置」。
 
     webhook 里填的是编的地址，只是为了看清框有多宽——真地址不会出现在这里。
     """
-    return _settings_dialog(
-        dark,
-        "notify",
-        notify_wecom_webhook=(
-            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=示例地址-别用真的"
-        ),
-        notify_on_favorite_lowest=True,
+    return _notify_dialog(dark)
+
+
+@scene("settings-notify-test")
+def _settings_notify_test(dark):
+    """按下「测试 Webhook」、消息发出去之后：按钮底下那行小字（绿的那版）。
+
+    要看的是那颗按钮跟输入框挤在同一格里合不合适，以及结果那行有没有把输入框
+    挤窄——它是这一行里多出来的东西，别的东西得原样不动。
+    """
+    import notifier
+
+    dialog = _notify_dialog(dark)
+    dialog.ShowWebhookTestResult(notifier.NOTIFY_OK_TEXT, ok=True)
+    return dialog
+
+
+@scene("settings-notify-test-failed")
+def _settings_notify_test_failed(dark):
+    """测试没发出去、原因还挺长：那行小字该自己换行，别把窗口顶宽。"""
+    dialog = _notify_dialog(dark)
+    dialog.ShowWebhookTestResult(
+        "发不出去：网络请求失败: HTTPSConnectionPool(host='qyapi.weixin.qq.com', "
+        "port=443): Max retries exceeded with url: /cgi-bin/webhook/send?key=*** "
+        "(Caused by ConnectTimeoutError(...: Read timed out. (read timeout=10)))",
+        ok=False,
     )
+    return dialog
 
 
 # ---------------- 渲染 ----------------

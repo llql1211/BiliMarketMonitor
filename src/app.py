@@ -1861,6 +1861,13 @@ class MainWindow(QMainWindow):
         self.notifier = notifier.Notifier()
         self.notifier.sent.connect(self.OnNotifySent)
         self.notifier.failed.connect(self.OnNotifyFailed)
+        # 设置窗口里那颗「测试 Webhook」单独走一个 Notifier：测试结果只该回到
+        # 设置窗口上（见 OnTestWebhook），落进状态栏的话，那一行滚动提示里就会
+        # 多出一句不知道哪轮留下的「推送成功」
+        self.test_notifier = notifier.Notifier()
+        self.test_notifier.sent.connect(self.OnWebhookTestSent)
+        self.test_notifier.failed.connect(self.OnWebhookTestFailed)
+        self.settings_dialog = None  # 开着的那份设置窗口，测试结果要写回它上面
         self.notify_queue = []  # List[dict]：待推送的商品，字段见 BuildNotifyMarkdown
         # 限流的基准是「上次推送的时刻」，初值取负无穷表示「还没发过」。
         # 不能用 0.0：monotonic 走的是开机以来的秒数，开机头一分钟里启动程序，
@@ -3715,6 +3722,37 @@ class MainWindow(QMainWindow):
         print(f"[notify] {reason}")
         self.progress_label.setText(self.progress_label.text() + "；" + self.last_note)
 
+    # ---------------- 测试 webhook（设置窗口里那颗按钮） ----------------
+
+    def OnTestWebhook(self, url):
+        """设置窗口里按下「测试 Webhook」：真往群里发一条测试消息。
+
+        地址是窗口那边校验过的（含空串），这里只管道出去。发的是 notifier 里写好的
+        那条测试文案——设置窗口改的是地址，不是消息格式，测试要是自拟一段内容，
+        就变成了在测另一条消息。
+
+        发送中途窗口被关掉也没关系：结果回来时 self.settings_dialog 已经是 None，
+        下面那三个方法什么都不做（失败的还会在控制台留一份）。
+        """
+        self.test_notifier.send(url, notifier.TEST_MESSAGE)
+
+    def OnWebhookTestSent(self, summary):
+        self.FinishWebhookTest(summary, True)
+
+    def OnWebhookTestFailed(self, reason):
+        """测试失败：报回设置窗口，控制台也留一份（窗口可能已经关了）。
+
+        跟正经推送失败一个考虑：不弹窗，原因原样写出来——多半是地址抄错或者机器人
+        被停用，用户得看到原话才知道该改哪儿。
+        """
+        print(f"[notify] webhook 测试失败：{reason}")
+        self.FinishWebhookTest(f"发不出去：{reason}", False)
+
+    def FinishWebhookTest(self, text, ok):
+        """一次测试收尾：结果写回开着的设置窗口（没开着就算了）。"""
+        if self.settings_dialog is not None:
+            self.settings_dialog.ShowWebhookTestResult(text, ok)
+
     # ---------------- 主题 ----------------
 
     def InitialDark(self) -> bool:
@@ -3774,7 +3812,15 @@ class MainWindow(QMainWindow):
         窗口在的时候什么都没动过，「取消」直接原地返回即可。
         """
         dialog = self.SettingsDialog()
-        if dialog.exec_() != QDialog.Accepted:
+        # 那颗「测试 Webhook」按钮的活儿归主窗口：窗口不碰网络，只管把地址交出来，
+        # 结果再写回它上面。记下引用，结果回来时才知道往哪儿写
+        dialog.test_webhook_requested.connect(self.OnTestWebhook)
+        self.settings_dialog = dialog
+        accepted = dialog.exec_() == QDialog.Accepted
+        # 窗口这会儿已经关了：测试要是还在路上，结果就别再往它上面写了
+        # （清掉在 exec_ 之后而不是 finally 里，是因为下面还有一大段保存逻辑）
+        self.settings_dialog = None
+        if not accepted:
             return  # 取消：文件没动、界面没动，等于没打开过
 
         values = dialog.Values()
@@ -3862,6 +3908,9 @@ class MainWindow(QMainWindow):
         # 迟早被销毁的对象，而收尾之后才送到的那句回包（见 conftest 收尾那段）
         # 还会去摸它——槽里抛异常在 PyQt 下是直接 abort 进程的（同 AckAt）
         self.summary_dialog = None
+        # 设置窗口同理：测试 webhook 的那趟请求还在路上时关窗退出，它回来还要
+        # 往设置窗口里写一行字（见 FinishWebhookTest），得先把引用摘掉
+        self.settings_dialog = None
         super().closeEvent(event)
 
 

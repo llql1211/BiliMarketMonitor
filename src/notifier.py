@@ -26,6 +26,13 @@ WECOM_API_PREFIX = "https://qyapi.weixin.qq.com/"
 # 成功时回给界面的一句话。文案归这儿定，app 只管显示（见 app.OnNotifySent）。
 NOTIFY_OK_TEXT = "企业微信推送成功"
 
+# 设置窗口里按「测试 Webhook」发的那条。跟 NOTIFY_OK_TEXT 一个规矩：文案归这儿定。
+# 写明白是测试，群里看到就知道是在配机器人，不会当成真的提醒
+TEST_MESSAGE = (
+    "**B站市集提醒 · 测试**\n\n"
+    "> 收到这条说明 webhook 配好了，商品提醒会像这样发到群里。"
+)
+
 # 企业微信 markdown 消息体上限约 4096 字节，超了接口直接报错拒收
 WECOM_MAX_BYTES = 4096
 

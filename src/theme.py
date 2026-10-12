@@ -337,6 +337,15 @@ def error_color(dark: bool) -> QColor:
     return price_delta_color(1, dark)
 
 
+def success_color(dark: bool) -> QColor:
+    """「成了」那一句的颜色：跟「跌」同一个绿（见设置窗口里的 webhook 测试结果）。
+
+    与 lowest_color 一个路子：单写一个函数只是让调用处读的是「成功」而不是「跌了」
+    ——颜色本身仍然只有 PRICE_DOWN_COLOR 一处定义。
+    """
+    return price_delta_color(-1, dark)
+
+
 def style_placeholder(widget, dark: bool):
     """给输入框的占位文字（灰字）上色。
 

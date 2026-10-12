@@ -342,6 +342,123 @@ def test_a_webhook_that_is_not_wecom_is_refused(dialog):
     assert "不是企业微信机器人的地址" in d.error_label.text()
 
 
+# ---------------- 测试 webhook 按钮 ----------------
+
+# 编的地址（跟 tools/shot.py 里一个规矩）：真地址等于往群里发消息的权限，
+# 测试文件里也不留
+WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc-123"
+
+
+def _press_test(d):
+    """按下「测试 Webhook」，返回这一按交出去的地址（一个都没交就是空的）。
+
+    信号连到列表上而不是连主窗口：这里测的是窗口这一侧——地址收得对不对、
+    该不该往外发；真发消息那一段在 tests/test_app.py 里测（见 OnTestWebhook）。
+    """
+    sent = []
+    d.test_webhook_requested.connect(sent.append)
+    d.test_button.click()
+    return sent
+
+
+def test_the_webhook_row_has_a_test_button(dialog):
+    """那颗按钮挂在 webhook 那一行上，挂着说明它会真的往群里发；结果那行先藏着。"""
+    d = dialog()
+
+    assert d.test_button.text() == settings.TEST_BUTTON_TEXT
+    assert d.test_button.toolTip().strip()
+    assert d.test_label.isHidden()  # 没按过就不占地方
+
+
+def test_the_test_button_sends_what_is_typed_in(dialog):
+    """按下就交给外层去发：地址去掉两头的空白，按钮先灰上（发着的时候别连点）。"""
+    d = dialog()
+    d.editors[settings.WEBHOOK_KEY].setText(f"  {WEBHOOK}  ")
+
+    sent = _press_test(d)
+
+    assert sent == [WEBHOOK]
+    assert d.test_label.text() == "正在发送…"
+    assert not d.test_label.isHidden()
+    assert not d.test_button.isEnabled()
+
+
+def test_the_test_button_refuses_an_address_that_is_not_wecom(dialog):
+    """不是企业微信的地址：一个字节都不往外发，就地报在按钮底下。"""
+    d = dialog()
+    d.editors[settings.WEBHOOK_KEY].setText("https://example.test/hook?key=abc")
+
+    sent = _press_test(d)
+
+    assert sent == []
+    assert "发不出去" in d.test_label.text()
+    assert d.test_button.isEnabled()  # 拦下来不等于在发，按钮还能再按
+
+
+def test_the_test_button_wants_an_address_first(dialog):
+    """空着就按：得说一声，不能真拿空地址去发。
+
+    「空串合法」是配置那边的规矩（表示还没配，见 config._check_webhook_url），
+    按下测试按钮却是另一回事——空着按它没有意义。
+    """
+    d = dialog()
+    d.editors[settings.WEBHOOK_KEY].setText("")
+
+    sent = _press_test(d)
+
+    assert sent == []
+    assert "地址" in d.test_label.text()
+
+
+def test_the_result_line_takes_the_result_colour(dialog):
+    """成了绿、没成红、发送中是灰的：一行小字也得看得出结果。"""
+    d = dialog()
+
+    d.ShowWebhookTestResult("企业微信推送成功", ok=True)
+    assert theme.success_color(False).name() in d.test_label.styleSheet()
+    assert d.test_button.isEnabled()
+
+    d.ShowWebhookTestResult("发不出去：网络请求失败", ok=False)
+    assert theme.error_color(False).name() in d.test_label.styleSheet()
+
+    d.ShowWebhookTestResult("正在发送…", ok=None)
+    assert theme.muted_color(False).name() in d.test_label.styleSheet()
+
+
+def test_the_result_line_follows_the_theme(dialog):
+    """颜色是照主题现算的：深色窗口里的绿是深色那一档。
+
+    结果回来时没人再递一遍主题（结果是按下去之后才到的），所以窗口得自己记着。
+    """
+    d = dialog()
+    d.SetDark(True)
+
+    d.ShowWebhookTestResult("企业微信推送成功", ok=True)
+
+    assert theme.success_color(True).name() in d.test_label.styleSheet()
+    assert theme.success_color(False).name() not in d.test_label.styleSheet()
+
+
+def test_the_result_line_sits_under_the_webhook_box(dialog, qapp):
+    """结果那行在输入框底下、左边跟它对齐，且不把窗口顶宽（长原因自己换行）。"""
+    d = _shown(dialog, qapp, "notify")
+    d.ShowWebhookTestResult(
+        "发不出去：网络请求失败: HTTPSConnectionPool(host='qyapi.weixin.qq.com', "
+        "port=443): Max retries exceeded with url: /cgi-bin/webhook/send?key=***",
+        ok=False,
+    )
+    qapp.processEvents()
+
+    box = _rect(d.editors[settings.WEBHOOK_KEY], d)
+    line = _rect(d.test_label, d)
+    button = _rect(d.test_button, d)
+
+    assert line.top() >= box.bottom()               # 在输入框下面，不跟它挤一行
+    assert abs(line.left() - box.left()) <= 1       # 左边跟输入框对齐
+    assert line.right() <= d.width()                # 长原因留在窗口里
+    assert button.left() >= box.right()             # 按钮在输入框右边，没盖住它
+
+
 # ---------------- 主题与「改过哪些项」 ----------------
 
 

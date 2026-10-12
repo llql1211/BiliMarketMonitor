@@ -13,7 +13,7 @@
 代价是「加一项配置」要动两处，由 tests/test_settings.py 盯着别漏。
 """
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QCheckBox,
@@ -21,8 +21,10 @@ from PyQt5.QtWidgets import (
     QDialogButtonBox,
     QGridLayout,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
+    QPushButton,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -54,6 +56,13 @@ SECTIONS = (
 # 所以它自成一列，正好也把所有行的控件左边对齐
 LABEL_WIDTH = 150  # 标签列的起步宽度：够放下最长的「成交高亮时限（小时）」
 BADGE_SIZE = 16
+
+# webhook 那一行右边挂着一颗「测试 Webhook」按钮——地址填完不用先按确定、也不用
+# 等真有降价，当场就知道通不通。它是全窗口唯一一颗行内按钮，所以按钮本身没写进
+# FIELDS（Field 里没这项），摆这一行时按 key 认出来就行——跟 THEME_KEY 一个路子。
+# 哪天第二行也要按钮了，再把它挪进 Field 不迟。
+WEBHOOK_KEY = "notify_wecom_webhook"
+TEST_BUTTON_TEXT = "测试 Webhook"
 
 
 class Field:
@@ -250,6 +259,10 @@ class SettingsDialog(QDialog):
     「取消」就等于什么都没发生过。
     """
 
+    # 按下「测试 Webhook」：地址在这一侧校验过，请主窗口拿它去发一条测试消息。
+    # 窗口不自己发——它不碰网络（见模块开头），发与不发由 app 决定。
+    test_webhook_requested = pyqtSignal(str)
+
     def __init__(self, values, dark, parent=None):
         super().__init__(parent)
         self.setWindowTitle(TITLE)
@@ -262,6 +275,13 @@ class SettingsDialog(QDialog):
         self.placeholder_editors = []  # 有占位文字的输入框，上色时要一起过一遍
         self.section_titles = {}       # 内部名 -> 页签标题（报错文案里要用）
         self.section_index = {}        # 内部名 -> 页签序号（出错时翻页要用）
+
+        self.test_button = None    # webhook 那一行右边那颗，摆到那一行时才造出来
+        # 测试结果写在这颗按钮底下（见 _AddRow）：平时藏着，按下按钮才露面
+        self.test_label = QLabel()
+        self.test_label.setWordWrap(True)
+        self.test_label.setVisible(False)
+        self.test_ok = None        # None 正在发 / True 成了 / False 没成，决定那行小字的颜色
 
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget()
@@ -345,7 +365,13 @@ class SettingsDialog(QDialog):
             grid.addWidget(QLabel(field.label), row, 0)
             editor = self._MakeEditor(field)
             self.editors[field.key] = editor
-            grid.addWidget(editor, row, 2)
+            if field.key == WEBHOOK_KEY:
+                grid.addWidget(self._WebhookCell(editor), row, 2)
+                # 结果那行小字摆在按钮底下、输入框起头的那一列上（跨过按钮那格，
+                # 长原因才铺得开）：按钮在哪儿按的，回话就在哪儿
+                grid.addWidget(self.test_label, row + 1, 2, 1, 2)
+            else:
+                grid.addWidget(editor, row, 2)
         badge = TipBadge(field.tip)
         self.badges.append(badge)
         grid.addWidget(badge, row, 1)
@@ -369,6 +395,24 @@ class SettingsDialog(QDialog):
             editor.setPlaceholderText(field.hint)
             self.placeholder_editors.append(editor)
         return editor
+
+    def _WebhookCell(self, editor) -> QWidget:
+        """webhook 那一行的控件格：输入框 + 「测试 Webhook」按钮，横着摆。
+
+        按钮不另占一列：那三列的宽度是给所有行对齐用的，为它开一列会把每一行
+        的控件都挤窄。挤在这一格里，动的只有这一行。
+
+        提示里写明「真发一条」：它按下去是往群里发消息，不是本地试算。
+        """
+        cell = QWidget()
+        line = QHBoxLayout(cell)
+        line.setContentsMargins(0, 0, 0, 0)
+        line.addWidget(editor, 1)
+        self.test_button = QPushButton(TEST_BUTTON_TEXT)
+        self.test_button.setToolTip("往这个地址发一条测试消息（群里的人看得到）")
+        self.test_button.clicked.connect(self.OnTestWebhook)
+        line.addWidget(self.test_button)
+        return cell
 
     # ---------------- 收 ----------------
 
@@ -433,14 +477,66 @@ class SettingsDialog(QDialog):
         self.error_label.setVisible(True)
         self.tabs.setCurrentIndex(self.section_index.get(errors[0][0], 0))
 
+    # ---------------- 测试 webhook ----------------
+
+    def OnTestWebhook(self):
+        """按下「测试 Webhook」：先就地校验地址，合格了再请主窗口去发。
+
+        校验用的还是 config 那一条规则（空串在那边是合法的，等于"还没配"；但按下
+        测试按钮时空着没有意义，这儿单独拦一句）。拦下来就地报在按钮底下，不往
+        窗口底部那行错误里塞——那儿是「按了确定、整份都不写」的口气，这里只是
+        这一项不合格。
+
+        发消息本身不在这儿做：窗口不碰网络，交给主窗口（见 test_webhook_requested）。
+        """
+        text = self.editors[WEBHOOK_KEY].text().strip()
+        if not text:
+            self.ShowWebhookTestResult("先填上群机器人的地址", ok=False)
+            return
+        url, reason = config.check_value(WEBHOOK_KEY, text)
+        if reason is not None:
+            self.ShowWebhookTestResult(f"发不出去：{reason}", ok=False)
+            return
+        # 先摆出「正在发」：这一趟要出网，回来之前得让人知道按上了
+        self.ShowWebhookTestResult("正在发送…", ok=None)
+        self.test_webhook_requested.emit(url)
+
+    def ShowWebhookTestResult(self, text, ok):
+        """把测试结果写进按钮底下那行小字，顺带管着按钮能不能再按。
+
+        ok 三种：None 是"正在发"（灰字，等着就行）、True 成了（绿）、False 没成（红）。
+        发送中把按钮灰上——连点两下就是两条消息发进群。
+        """
+        self.test_ok = ok
+        self.test_label.setText(text)
+        self.test_label.setVisible(True)
+        if self.test_button is not None:
+            self.test_button.setEnabled(ok is not None)
+        self._StyleTestLabel()
+
+    def _StyleTestLabel(self):
+        """给结果那行小字上色（三态各一色，见 ShowWebhookTestResult）。"""
+        if self.test_ok is None:
+            color = theme.muted_color(self.dark)
+        elif self.test_ok:
+            color = theme.success_color(self.dark)
+        else:
+            color = theme.error_color(self.dark)
+        self.test_label.setStyleSheet(f"color: {color.name()};")
+
     # ---------------- 主题 ----------------
 
     def SetDark(self, dark: bool):
-        """给窗口里自绘的那几处上色（圈「？」、占位灰、出错提示、下拉框的箭头）。
+        """给窗口里自绘的那几处上色（圈「？」、占位灰、出错提示、下拉框的箭头、
+        webhook 测试结果那行小字）。
 
         窗口只在造出来时按当前主题上一次色：主题要等按下「确定」才换，换了窗口
         也就关了，不会留一个半深半浅的窗口在屏幕上。
+
+        记下这份主题：测试结果是按下去之后才来的，那时候没人再递一遍 dark，
+        得自己留着（见 _StyleTestLabel）。
         """
+        self.dark = dark
         self.error_label.setStyleSheet(f"color: {theme.error_color(dark).name()};")
         for editor in self.placeholder_editors:
             theme.style_placeholder(editor, dark)

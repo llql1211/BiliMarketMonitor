@@ -3054,6 +3054,90 @@ def test_notify_failed_does_not_pop_a_dialog(window, msgboxes):
     assert msgboxes == []
 
 
+# ---- 设置窗口里的「测试 Webhook」 ----
+
+def _open_test_dialog(w):
+    """造一份设置窗口并按真窗那样接上那颗测试按钮（不弹，见 OnOpenSettings）。"""
+    dialog = w.SettingsDialog()
+    dialog.test_webhook_requested.connect(w.OnTestWebhook)
+    return dialog
+
+
+def test_webhook_test_button_sends_the_test_message(window):
+    """按下测试按钮：把 notifier 里那条测试文案连同地址交出去。
+
+    文案归 notifier 定（见 TEST_MESSAGE）：设置窗口改的是地址，不是消息格式，
+    测试要是自拟一段内容，那就是在测另一条消息了。
+    """
+    w = window()
+    sent = []
+    w.test_notifier.send = lambda url, text: sent.append((url, text))
+    dialog = _open_test_dialog(w)
+    dialog.editors["notify_wecom_webhook"].setText(WEBHOOK)
+
+    dialog.test_button.click()
+
+    assert sent == [(WEBHOOK, notifier.TEST_MESSAGE)]
+
+
+def test_webhook_test_result_lands_in_the_settings_dialog(window):
+    """结果回到开着的那份设置窗口上，不进状态栏。"""
+    w = window()
+    dialog = _open_test_dialog(w)
+    w.settings_dialog = dialog
+
+    w.test_notifier.sent.emit(notifier.NOTIFY_OK_TEXT)
+
+    assert dialog.test_label.text() == notifier.NOTIFY_OK_TEXT
+    # 状态栏那行是抓取进度，测试结果混进去下次就没人认得它是哪轮留下的
+    assert notifier.NOTIFY_OK_TEXT not in w.progress_label.text()
+
+
+def test_webhook_test_failure_is_reported_in_the_dialog_and_the_console(window, capsys):
+    """没发出去：窗口里报一句，控制台再留一份——原因多半得照着改地址。"""
+    w = window()
+    dialog = _open_test_dialog(w)
+    w.settings_dialog = dialog
+
+    w.test_notifier.failed.emit("网络请求失败: ConnectTimeout")
+
+    assert "发不出去" in dialog.test_label.text()
+    assert "ConnectTimeout" in dialog.test_label.text()
+    assert "[notify] webhook 测试失败" in capsys.readouterr().out
+
+
+def test_webhook_test_result_arriving_after_the_dialog_closed_is_ignored(window, capsys):
+    """窗口关了（或压根没开）才回来的结果：谁也不写，失败仍在控制台留一份。
+
+    槽里抛异常在 PyQt 下是直接 abort 进程的（同 closeEvent 那段），所以这条
+    「没有人接就静静放下」得钉住。
+    """
+    w = window()
+
+    assert w.settings_dialog is None
+    w.test_notifier.sent.emit(notifier.NOTIFY_OK_TEXT)
+    w.test_notifier.failed.emit("网络请求失败")
+
+    assert "[notify] webhook 测试失败" in capsys.readouterr().out
+
+
+def test_opening_settings_holds_the_dialog_only_while_it_is_open(window, monkeypatch):
+    """开着的这段时间里才记着那份窗口：关掉之后再回来的结果就别往它上面写了。"""
+    w = window()
+    seen = []
+
+    def _exec_(dialog):
+        seen.append(w.settings_dialog is dialog)
+        return QDialog.Rejected
+
+    monkeypatch.setattr(settings.SettingsDialog, "exec_", _exec_)
+
+    w.OnOpenSettings()
+
+    assert seen == [True]
+    assert w.settings_dialog is None
+
+
 def test_enabled_without_webhook_is_reported_at_startup(window, capsys):
     """开了推送却没填地址，启动时留一行痕。
 
