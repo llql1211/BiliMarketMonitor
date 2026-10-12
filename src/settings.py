@@ -17,7 +17,6 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QCheckBox,
-    QComboBox,
     QDialog,
     QDialogButtonBox,
     QGridLayout,
@@ -259,6 +258,7 @@ class SettingsDialog(QDialog):
         self.checkboxes = {}       # key -> QCheckBox（布尔项的取值都走它）
         self.editors = {}          # key -> QLineEdit / QComboBox
         self.badges = []
+        self.combos = []           # 自绘箭头的那种下拉框，上色时要一起过一遍
         self.placeholder_editors = []  # 有占位文字的输入框，上色时要一起过一遍
         self.section_titles = {}       # 内部名 -> 页签标题（报错文案里要用）
         self.section_index = {}        # 内部名 -> 页签序号（出错时翻页要用）
@@ -353,13 +353,14 @@ class SettingsDialog(QDialog):
     def _MakeEditor(self, field):
         current = self.current_values.get(field.key)
         if field.kind == ENUM:
-            combo = QComboBox()
+            combo = theme.ComboBox()
             for text, value in field.choices:
                 combo.addItem(text, value)
             index = combo.findData(current)
             # 值不在选项里（配置写了个没见过的范围，已被校验拦过、退回默认）时
             # 落在第一项：界面显示的和实际生效的都是「全部商品」，对得上
             combo.setCurrentIndex(index if index >= 0 else 0)
+            self.combos.append(combo)
             return combo
 
         text = number_text(current) if field.kind == NUMBER else str(current or "")
@@ -435,7 +436,7 @@ class SettingsDialog(QDialog):
     # ---------------- 主题 ----------------
 
     def SetDark(self, dark: bool):
-        """给窗口里自绘的那几处上色（圈「？」、占位灰、出错提示）。
+        """给窗口里自绘的那几处上色（圈「？」、占位灰、出错提示、下拉框的箭头）。
 
         窗口只在造出来时按当前主题上一次色：主题要等按下「确定」才换，换了窗口
         也就关了，不会留一个半深半浅的窗口在屏幕上。
@@ -445,3 +446,5 @@ class SettingsDialog(QDialog):
             theme.style_placeholder(editor, dark)
         for badge in self.badges:
             badge.SetDark(dark)
+        for combo in self.combos:
+            combo.SetDark(dark)

@@ -6,10 +6,11 @@
 
 import pytest
 from PyQt5.QtCore import QPoint, QRect
-from PyQt5.QtWidgets import QCheckBox, QComboBox, QLineEdit
+from PyQt5.QtWidgets import QCheckBox, QLineEdit
 
 import config
 import settings
+import theme
 
 
 @pytest.fixture
@@ -92,7 +93,11 @@ def test_widgets_match_the_field_kinds(dialog):
             assert isinstance(d.checkboxes[field.key], QCheckBox)
             assert field.key not in d.editors
         elif field.kind == settings.ENUM:
-            assert isinstance(d.editors[field.key], QComboBox)
+            # 用的得是自绘箭头那个（见 theme.ComboBox）：原生 QComboBox 在深色下
+            # 右边那一格还是系统画的浅色按钮
+            assert isinstance(d.editors[field.key], theme.ComboBox)
+            # 登记进 combos，换主题时 SetDark 才轮得到它
+            assert d.editors[field.key] in d.combos, "下拉框没登记，换主题时箭头不会跟着换色"
         else:
             assert isinstance(d.editors[field.key], QLineEdit)
 
@@ -353,6 +358,24 @@ def test_toggling_the_theme_waits_for_ok(dialog):
 
     assert d.badges[0].styleSheet() == before  # 圈「？」没跟着换色
     assert d.Values() == {}                    # 还没按确定，什么都还没交出去
+
+
+def test_switching_the_theme_tells_the_combo_boxes(dialog):
+    """下拉框的箭头是自绘的，得知道现在是深色还是浅色。
+
+    漏了这步，深色下箭头还会按浅色那套走（浅色主题里这个控件压根不画箭头），
+    框里就只剩一格空白。
+    """
+    d = dialog()
+    d.SetDark(True)
+
+    assert d.combos, "一个下拉框都没登记，这条测试就白跑了"
+    for combo in d.combos:
+        assert combo._dark is True
+
+    d.SetDark(False)
+    for combo in d.combos:
+        assert combo._dark is False
 
 
 def test_theme_is_carried_in_the_values(dialog):

@@ -10,7 +10,7 @@ import types
 
 import pytest
 from PyQt5.QtGui import QColor, QPalette
-from PyQt5.QtWidgets import QPlainTextEdit, QStyle
+from PyQt5.QtWidgets import QComboBox, QPlainTextEdit, QStyle
 
 import theme
 
@@ -87,6 +87,56 @@ def test_dark_qss_paints_the_tab_bar_itself():
     }
     for what, pattern in rules.items():
         assert re.search(pattern, theme.DARK_QSS), f"{what}没自己上色，会由原生样式画"
+
+
+def test_dark_qss_paints_the_combo_box_itself():
+    """设置窗口的下拉框得自己上色，不能交给原生样式。
+
+    同页签那个毛病：不写这几条，框身就由原生样式（Windows 那套）画成白底，
+    字色却照 QWidget 那层走 #e3e3e3。量过：不写时同一个框在 Fusion 与
+    windowsvista 下底色不一样（45 对 34），写了才都是 #26272b。
+    """
+    rules = {
+        "框身": r"QComboBox\s*\{[^}]*background-color:\s*#26272b",
+        "右边那一格": r"QComboBox::drop-down\s*\{[^}]*width:\s*20px",
+        "弹出来的列表": r"QComboBox QAbstractItemView\s*\{[^}]*background-color:\s*#26272b",
+    }
+    for what, pattern in rules.items():
+        assert re.search(pattern, theme.DARK_QSS), f"下拉框的{what}没自己上色，会由原生样式画"
+
+
+def _combo_image(widget):
+    """把下拉框画出来，取最右边那一格（自己画的箭头只会出现在这里）。"""
+    widget.addItem("全部商品")
+    widget.resize(200, 26)
+    image = widget.grab().toImage()
+    return image, [image.pixelColor(x, y)
+                   for y in range(image.height())
+                   for x in range(image.width() - 20, image.width() - 2)]
+
+
+def test_combo_box_draws_its_own_arrow_in_dark_mode(qapp):
+    """暗色下箭头由 theme.ComboBox 自己画。
+
+    QSS 写了 QComboBox::drop-down，原生样式就整格交权（这是甩掉它那块浅色按钮
+    的唯一办法），连箭头也不画了——这一颗得自己补上，否则这个控件看不出能点。
+    """
+    theme.apply_theme(qapp, True)
+    _, ours = _combo_image(theme.ComboBox(dark=True))
+    _, native = _combo_image(QComboBox())
+
+    arrow = QColor(theme.COMBO_ARROW_COLOR)
+    assert arrow in ours, "右边那一格里没有自绘的箭头"
+    assert arrow not in native, "原生样式本来就画箭头的话，加的这颗就是多余的"
+
+
+def test_combo_box_leaves_the_light_theme_to_the_native_style(qapp):
+    """浅色下不画：那边 LIGHT_QSS 没有下拉框规则，仍是原生样式，箭头原生就有，
+    再画一颗就成了两颗。"""
+    theme.apply_theme(qapp, False)
+    ours, _ = _combo_image(theme.ComboBox(dark=False))
+    native, _ = _combo_image(QComboBox())
+    assert ours == native
 
 
 @pytest.mark.parametrize("dark", [True, False])

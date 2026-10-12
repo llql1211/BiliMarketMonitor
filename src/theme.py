@@ -4,8 +4,14 @@
 所以系统主题判断、样式表应用、占位色设置全都自带兜底。
 """
 
-from PyQt5.QtGui import QColor, QPalette
-from PyQt5.QtWidgets import QProxyStyle, QStyle
+from PyQt5.QtCore import QPointF, Qt
+from PyQt5.QtGui import QColor, QPainter, QPalette, QPolygonF
+from PyQt5.QtWidgets import (
+    QComboBox,
+    QProxyStyle,
+    QStyle,
+    QStyleOptionComboBox,
+)
 
 # 浅色基本用 Qt 默认样式。这一条是例外：序号槽（垂直表头）在最后一行下方的
 # 空白区，Qt 默认刷的是表头那种浅灰，表格空白区是白的，于是序号槽会拖一条
@@ -141,6 +147,40 @@ QPlainTextEdit, QTextEdit {
     border: 1px solid #4a4d55;
     border-radius: 4px;
     padding: 4px;
+}
+QComboBox {
+    /* 设置窗口里「抓取范围」那个下拉框。跟输入框一个路子：不写这段，框身就交给
+       原生样式画（Windows 上是一块白底），而字色照 QWidget 走 #e3e3e3——
+       深色下白底白字。量过：不写这条时同一个框在 Fusion 与 windowsvista 下
+       画出来的底色不一样（45 对 34），说明是原生样式在画 */
+    background-color: #26272b;
+    color: #e3e3e3;
+    border: 1px solid #4a4d55;
+    border-radius: 4px;
+    padding: 3px 6px;
+}
+QComboBox:focus {
+    border-color: #3d5a80;
+}
+QComboBox::drop-down {
+    /* 右边那一格。只写上面那条 QComboBox 的话，这一格仍归原生样式（Windows 上
+       是一块浅色按钮），深色底下格外扎眼；写了这条才轮到样式表接手。
+       代价是原生样式不再被问到箭头，得由 ComboBox 自己画——见那个类 */
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 20px;
+    border: none;
+    background: transparent;
+}
+QComboBox QAbstractItemView {
+    /* 弹出来的那份列表是另一个窗口，拿不到 QComboBox 这层的底色，得单独写。
+       不写的话选中那行还是系统那套亮蓝高亮，深色底下很跳 */
+    background-color: #26272b;
+    color: #e3e3e3;
+    border: 1px solid #4a4d55;
+    selection-background-color: #3d5a80;
+    selection-color: #ffffff;
+    outline: none;
 }
 QToolTip {
     background-color: #2f3136;
@@ -309,6 +349,59 @@ def style_placeholder(widget, dark: bool):
     palette = widget.palette()
     palette.setColor(QPalette.PlaceholderText, QColor(color))
     widget.setPalette(palette)
+
+
+# 下拉框右边那颗箭头由 ComboBox 自己画（原因见那个类）。颜色跟框里的字一致
+# （DARK_QSS 里 QComboBox 的 color 就是这个值）：它是这个控件唯一的操作提示，
+# 不该比字还弱。
+COMBO_ARROW_COLOR = "#e3e3e3"
+
+
+class ComboBox(QComboBox):
+    """设置窗口里的下拉框：右边那颗箭头自己画。
+
+    DARK_QSS 一旦写下 ::drop-down，原生样式就整格交权——这是甩掉它那块浅色按钮
+    的唯一办法（只写 QComboBox 那几条的话，那一格还是它画），连箭头也一并不画了。
+    两头只能选一头：不接管则那格是原生的浅色，接管则没有箭头。选后者，箭头由这里
+    补上，颜色和大小就都归自己管。
+
+    浅色主题不走这套（LIGHT_QSS 里没有下拉框规则）：那边仍是原生样式，箭头原生
+    就会画，这里再画一颗就成了两颗。
+    """
+
+    ARROW_WIDTH = 9    # 箭头底边长
+    ARROW_HEIGHT = 5   # 箭头高：比原生的略小一点，深色底下不显得笨重
+
+    def __init__(self, dark=False, parent=None):
+        super().__init__(parent)
+        self._dark = dark
+
+    def SetDark(self, dark: bool):
+        self._dark = dark
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)  # 框身、文字、右边那一格都照样式表来
+        if not self._dark:
+            return
+        # 画在哪一格问样式要：哪儿属 ::drop-down 是 QSS 说了算，别在这儿再写一遍
+        option = QStyleOptionComboBox()
+        self.initStyleOption(option)
+        rect = self.style().subControlRect(
+            QStyle.CC_ComboBox, option, QStyle.SC_ComboBoxArrow, self
+        )
+        center = rect.center()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(COMBO_ARROW_COLOR))
+        painter.drawPolygon(QPolygonF([
+            QPointF(center.x() - self.ARROW_WIDTH / 2,
+                    center.y() - self.ARROW_HEIGHT / 2),
+            QPointF(center.x() + self.ARROW_WIDTH / 2,
+                    center.y() - self.ARROW_HEIGHT / 2),
+            QPointF(center.x(), center.y() + self.ARROW_HEIGHT / 2),
+        ]))
 
 
 class _ToolTipDelayStyle(QProxyStyle):
