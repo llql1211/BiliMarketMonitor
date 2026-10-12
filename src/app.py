@@ -13,6 +13,7 @@
 
 import html
 import os
+import queue
 import sys
 import threading
 import time
@@ -76,10 +77,12 @@ import parser
 import settings
 import store
 import theme
+import thumbs
 
 IMAGE_SIZE = 96  # 缩略图边长（配合 CDN 裁剪后缀减小流量）
 IMAGE_SUFFIX = f"@{IMAGE_SIZE}w_{IMAGE_SIZE}h_85q.webp"
 IMAGE_TIMEOUT = 10  # 单张图等多久算失败（拉图不重试：留白总比卡着强）
+IMAGE_WORKERS = 8  # 同时拉几张缩略图：多了反而更慢（见 ImageFetcher 的说明）
 
 # 双击缩略图看的大图：原图是 1280x1280、动辄 1MB 出头，720w 有 60 多 KB，
 # 铺满默认大小的预览窗口（约 860）正合适，再往上放大才见糊
@@ -1136,26 +1139,88 @@ class StatusLabel(QLabel):
 
 
 class ImageFetcher(QObject):
-    """在普通子线程里拉图，通过信号回传 QPixmap（避免卡界面）。
+    """在固定几个子线程里拉图，通过信号回传 QPixmap（避免卡界面）。
 
-    信号里带的是调用方自己认的 key：缩略图用行号，双击放大用预览请求号。
+    信号里带的是调用方自己认的 key：缩略图用图片地址（同一张图可能有好几行在等，
+    地址天然就是它的身份，用行号的话行列一重排就会贴错），双击放大用预览请求号。
     下载失败时发 failed 而不是静默丢弃——大图下不下来得跟用户说一声，
-    缩略图那边不接这个信号，等于照旧不吭声。
+    缩略图那边只拿它清掉等待表，照样不吭声。
+
+    几个要点：
+
+    - **常驻 worker + 队列**，不是每张图起一个线程。几百个线程各自跟同一台 CDN
+      重新握手，网络一抖就会互相拖成十几秒才回来第一张；8 个是实测的甜点
+      （本地对照：200 个请求不限并发 1176ms，8 个 worker 536ms，32 个反而 1056ms）。
+    - 用自建的 daemon 线程，不用 ThreadPoolExecutor：后者的线程不是 daemon，
+      退出时会把正在跑的下载（最长 IMAGE_TIMEOUT）等完，关窗口就卡在那儿。
+    - 同一个 (key, url) 已经在排队或在下就不再排第二次：重画表格会把每张图再要一遍。
     """
 
-    fetched = pyqtSignal(int, QPixmap)
-    failed = pyqtSignal(int)
+    fetched = pyqtSignal(object, QPixmap)
+    failed = pyqtSignal(object)
+
+    def __init__(self, cache=None, workers=IMAGE_WORKERS):
+        """cache：给了就把下回来的字节交给它存一份（缩略图落盘，见 thumbs.py）。"""
+        super().__init__()
+        self.cache = cache
+        self.workers = workers
+        self._queue = queue.Queue()
+        self._threads = []
+        self._pending = set()  # 已排队 / 在飞的 (key, url)
+        self._stopped = False
+        self._lock = threading.Lock()  # 只管 _pending 与 _threads 两样
 
     def fetch(self, key, url):
-        threading.Thread(target=self._work, args=(key, url), daemon=True).start()
+        with self._lock:
+            if self._stopped or (key, url) in self._pending:
+                return
+            self._pending.add((key, url))
+            self._ensure_workers()
+        self._queue.put((key, url))
+
+    def stop(self):
+        """收尾：不再接新活儿，排着队的丢掉；在飞的那几张跑完也不再回包。"""
+        with self._lock:
+            self._stopped = True
+            self._pending.clear()
+            threads = list(self._threads)
+        for _ in threads:
+            self._queue.put(None)  # 一个哨兵放一个 worker，把它们从 get() 上叫醒
+
+    def _ensure_workers(self):
+        """第一次要用才起线程（不拉图就不占着）。调用方须持有 _lock。"""
+        while len(self._threads) < self.workers:
+            thread = threading.Thread(target=self._pump, daemon=True)
+            thread.start()
+            self._threads.append(thread)
+
+    def _pump(self):
+        while True:
+            task = self._queue.get()
+            if task is None or self._stopped:
+                return
+            key, url = task
+            try:
+                self._work(key, url)
+            finally:
+                with self._lock:
+                    self._pending.discard((key, url))
 
     def _work(self, key, url):
         pixmap = QPixmap()
+        data = b""
         try:
             # 走 net：同一线程里连着拉的这几张共用一条连接，不必每张都重握手
-            pixmap.loadFromData(net.get(url, timeout=IMAGE_TIMEOUT))
+            data = net.get(url, timeout=IMAGE_TIMEOUT)
+            pixmap.loadFromData(data)
         except Exception:
             pass  # 拿不到就当空图，统一走下面的失败分支
+        if data and not pixmap.isNull() and self.cache is not None:
+            self.cache(url, data)  # 顺手存一份，下次启动直接读盘（见 thumbs.py）
+        with self._lock:
+            stopped = self._stopped
+        if stopped:
+            return  # 窗口都收了，别再往主线程发信号
         if pixmap.isNull():
             self.failed.emit(key)
         else:
@@ -1722,6 +1787,9 @@ class MainWindow(QMainWindow):
         self.row_urls = {}       # 行号 -> 详情页链接
         self.row_images = {}     # 行号 -> 缩略图原始地址（下载回来时用来认领）
         self.icons = {}          # 缩略图原始地址 -> QPixmap，重画表格时复用
+        # 缩略图地址 -> 正在等这张图的行号集合：同一张图只下一次，回来时一起贴上
+        # （几个商品用同一张图是常事，行号在这儿只当"贴哪儿"用，重排后要核对）
+        self.pending_images = {}
         self.poller = None
         self.names_learned = False  # 本次抓取是否学到了新名称（决定要不要回写清单）
         self.poller_stopped = False  # 本次抓取是否被「停止抓取」中止
@@ -1742,9 +1810,11 @@ class MainWindow(QMainWindow):
         # 最近一次正常跑完的总结快照（见 ShowSummary / OnShowLastSummary）。
         # 只留一份，不做栈：用户要的是「刚才那轮」，回溯更远的靠表格即可
         self.last_summary = None
-        self.image_fetcher = ImageFetcher()  # 缩略图：key 是行号
+        # 缩略图：key 是图片地址，下回来的字节顺手落盘（cache，见 thumbs.py）
+        self.image_fetcher = ImageFetcher(cache=thumbs.save)
         self.image_fetcher.fetched.connect(self.OnImageFetched)
-        # 双击放大：另起一个 fetcher，因为它的 key 是预览请求号而不是行号。
+        self.image_fetcher.failed.connect(self.OnImageFailed)
+        # 双击放大：另起一个 fetcher，因为它的 key 是预览请求号而不是地址。
         # 共用一个的话，两种号会混在一个槽里分不清谁是谁
         self.preview_fetcher = ImageFetcher()
         self.preview_fetcher.fetched.connect(self.OnPreviewFetched)
@@ -2105,20 +2175,46 @@ class MainWindow(QMainWindow):
             return None
         return _parse_stamp(self.store.get_setting(store.ACK_AT_SETTING))
 
-    def SetThumbnail(self, row, image_url):
-        """给某行配缩略图：缓存里有就直接贴，没有才后台下载。
+    def ThumbPixmap(self, data):
+        """缩略图字节 -> 贴表格用的 QPixmap（解不出来返回 None）。
 
-        拖拽排序、增删、刷新清单都会整表重画，走到这里；没有这层缓存的话，
+        盘里那份和刚下回来那份走同一条路：CDN 已按 1:1 裁剪，这里兜底缩放
+        保证不超出单元格。
+        """
+        pixmap = QPixmap()
+        pixmap.loadFromData(data)
+        if pixmap.isNull():
+            return None
+        return pixmap.scaled(
+            IMAGE_SIZE, IMAGE_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+
+    def SetThumbnail(self, row, image_url):
+        """给某行配缩略图：内存里有就贴，其次磁盘，都没有才后台下载。
+
+        拖拽排序、增删、刷新清单都会整表重画，走到这里；没有这几层缓存的话，
         每重画一次就要把所有缩略图重下一遍——图标闪一下，还白发一堆请求。
+
+        磁盘那层是为了**重启**（见 thumbs.py）：网络抖的时候，下过的图照样
+        立刻能看见。同一张图只让一个行号去请求，其余行在 pending_images 里排着，
+        回来时一起贴上。
         """
         if not image_url:
             return
         self.row_images[row] = image_url
         pixmap = self.icons.get(image_url)
         if pixmap is None:
-            self.image_fetcher.fetch(row, image_url + IMAGE_SUFFIX)
-        else:
+            # 缓存地址带裁剪后缀：改了 IMAGE_SIZE 就是另一个地址，旧盘上那份自动作废
+            pixmap = self.ThumbPixmap(thumbs.load(image_url + IMAGE_SUFFIX))
+        if pixmap is not None:
+            self.icons[image_url] = pixmap  # 存下来，重画表格时直接贴
             self.PutThumbnail(row, pixmap)
+            return
+        waiting = self.pending_images.setdefault(image_url, set())
+        first = not waiting
+        waiting.add(row)
+        if first:  # 已经在排队 / 在飞的别再排一次（重画表格会把每张图再要一遍）
+            self.image_fetcher.fetch(image_url, image_url + IMAGE_SUFFIX)
 
     def PutThumbnail(self, row, pixmap):
         item = self.table.item(row, COL_IMG)
@@ -3116,17 +3212,29 @@ class MainWindow(QMainWindow):
             if img_item is not None and img_item.icon().isNull():
                 self.SetThumbnail(row, result["image_url"])
 
-    def OnImageFetched(self, row, pixmap):
-        if row >= self.table.rowCount():
-            return
-        # CDN 已按 1:1 裁剪，这里兜底缩放保证不超出单元格
+    def OnImageFetched(self, image_url, pixmap):
+        """缩略图到手：key 是图片地址，等着它的行一起贴上。
+
+        等它的那几行记的是行号，而下载期间表格可能重排过（拖拽、增删、刷新清单），
+        所以贴之前拿 row_images 核对一遍这张图现在还是不是这一行的——不核对就会
+        把甲商品的图贴到乙商品上（还会被 icons 按错的地址记住，连带落盘）。
+        """
+        # CDN 已按 1:1 裁剪，这里兜底缩放保证不超出单元格（跟磁盘那条路同一个口径）
         pixmap = pixmap.scaled(
             IMAGE_SIZE, IMAGE_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation
         )
-        image_url = self.row_images.get(row)
-        if image_url:
-            self.icons[image_url] = pixmap  # 存下来，下次重画表格就不必再下这一张
-        self.PutThumbnail(row, pixmap)
+        self.icons[image_url] = pixmap  # 存下来，重画表格时不必再下这一张
+        for row in self.pending_images.pop(image_url, ()):
+            if self.row_images.get(row) == image_url and row < self.table.rowCount():
+                self.PutThumbnail(row, pixmap)
+
+    def OnImageFailed(self, image_url):
+        """下载失败：把等待表清掉（仍然不对用户吭声）。
+
+        不清的话这张图会一直挂着「有人在等」，往后重画表格也不会再请求它——
+        网络闪断一次就永远留白了。
+        """
+        self.pending_images.pop(image_url, None)
 
     def OnTogglePause(self):
         """暂停 / 继续本次抓取。"""
@@ -3654,6 +3762,10 @@ class MainWindow(QMainWindow):
         """退出前把自动抓取停掉、缓存连接关掉：SQLite 的写入要落盘，文件句柄也别留着。"""
         self.auto_poll_timer.stop()
         self.store.close()
+        # 拉图的线程也停一停：它们收尾后还会往这个窗口发信号，而槽里抛异常在
+        # PyQt 下是直接 abort 进程的（同 AckAt）；排着队的那几百张也就此丢掉
+        self.image_fetcher.stop()
+        self.preview_fetcher.stop()
         # 那份总结窗口的父窗口就是它，主窗口一关就跟着走。引用留着只会指着一个
         # 迟早被销毁的对象，而收尾之后才送到的那句回包（见 conftest 收尾那段）
         # 还会去摸它——槽里抛异常在 PyQt 下是直接 abort 进程的（同 AckAt）

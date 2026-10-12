@@ -15,3 +15,5 @@ data/config.toml
 data/config.toml.bak
 data/watchlist.txt
 data/watchlist.txt.bak
+# 缩略图磁盘缓存：删了下次启动重下，没必要进仓库
+data/thumbs/

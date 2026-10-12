@@ -5,6 +5,7 @@
 """
 
 import json
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -50,6 +51,7 @@ import parser
 import settings
 import store
 import theme
+import thumbs
 
 
 # ---------------- 工具 ----------------
@@ -289,7 +291,8 @@ def test_row_prefers_cached_name_and_requests_thumbnail(window, monkeypatch):
 
     w.LoadWatchlist(w.watchlist_path)
     assert w.table.item(0, app_module.COL_NAME).text() == "缓存里的名字"
-    assert fetched == [(0, "https://img.test/a.jpg" + app_module.IMAGE_SUFFIX)]
+    # key 是图片地址（不再是行号）：同一张图可能有好几行在等，回来时一起贴
+    assert fetched == [("https://img.test/a.jpg", "https://img.test/a.jpg" + app_module.IMAGE_SUFFIX)]
 
 
 def test_make_cell_tooltip_rules(window):
@@ -324,7 +327,9 @@ def test_result_ready_updates_row_cache_and_name(window, monkeypatch):
     assert w.rows[0]["entry"].name == "抓到的新名字"
     assert w.names_learned is True
     assert w.store.get_item("10000008780")["name"] == "抓到的新名字"
-    assert picked == [(0, "https://i0.hdslb.com/bfs/x.jpg" + app_module.IMAGE_SUFFIX)]
+    assert picked == [
+        ("https://i0.hdslb.com/bfs/x.jpg", "https://i0.hdslb.com/bfs/x.jpg" + app_module.IMAGE_SUFFIX)
+    ]
 
 
 def test_result_ready_leaves_missing_deals_blank(window):
@@ -3974,10 +3979,10 @@ def test_thumbnails_are_reused_across_redraws(window, monkeypatch):
     w.LoadWatchlist(w.watchlist_path)
     assert len(fetched) == 2  # 缓存里没有，两张都得下
 
-    for row in (0, 1):  # 假装两张图都下载回来了
-        pixmap = QPixmap(8, 8)
+    for url in ("https://example.test/a.png", "https://example.test/b.png"):
+        pixmap = QPixmap(8, 8)  # 假装两张图都下载回来了
         pixmap.fill(Qt.red)
-        w.OnImageFetched(row, pixmap)
+        w.OnImageFetched(url, pixmap)
 
     fetched.clear()
     w.RenderTable()
@@ -4299,17 +4304,109 @@ def test_settings_write_failure_changes_nothing(
 # ---------------- 缩略图 ----------------
 
 
-def test_image_ready_sets_icon(window):
-    """图片线程回传后给单元格装上图标，越界行号直接忽略。"""
+def test_image_ready_sets_icon(window, monkeypatch):
+    """图片线程回传后给整行装上图标；没人等的那张图不抛异常。"""
     w = window("10000008780\n")
+    w.store.upsert_item("10000008780", "甲", "https://img.test/a.jpg")
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda key, url: None)
     w.LoadWatchlist(w.watchlist_path)
     pixmap = QPixmap(8, 8)
     pixmap.fill(Qt.red)
 
-    w.OnImageFetched(0, pixmap)
+    w.OnImageFetched("https://img.test/a.jpg", pixmap)
     assert not w.table.item(0, app_module.COL_IMG).icon().isNull()
 
-    w.OnImageFetched(99, pixmap)  # 不抛异常即通过
+    w.OnImageFetched("https://img.test/nobody-waits.png", pixmap)  # 不抛异常即通过
+
+
+def test_thumbnail_comes_from_the_disk_cache(window, monkeypatch, png_bytes):
+    """盘里存过就直接贴，一个请求都不发（这就是重启后图标立刻出现的那条路）。"""
+    w = window("10000008780\n")
+    w.store.upsert_item("10000008780", "甲", "https://img.test/a.jpg")
+    url = "https://img.test/a.jpg" + app_module.IMAGE_SUFFIX
+    thumbs.save(url, png_bytes)
+    fetched = []
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda key, u: fetched.append(u))
+
+    w.LoadWatchlist(w.watchlist_path)
+
+    assert fetched == []
+    assert not w.table.item(0, app_module.COL_IMG).icon().isNull()
+
+
+def test_broken_disk_cache_falls_back_to_the_network(window, monkeypatch, png_bytes):
+    """盘上那份解不出图（半张、被改坏了）就当没缓存，仍旧去网络拿。"""
+    w = window("10000008780\n")
+    w.store.upsert_item("10000008780", "甲", "https://img.test/a.jpg")
+    image_url = "https://img.test/a.jpg"
+    thumbs.save(image_url + app_module.IMAGE_SUFFIX, b"<html>not an image</html>")
+    fetched = []
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda key, u: fetched.append(u))
+
+    w.LoadWatchlist(w.watchlist_path)
+
+    assert fetched == [image_url + app_module.IMAGE_SUFFIX]
+    assert w.table.item(0, app_module.COL_IMG).icon().isNull()  # 还没回来，先留白
+
+
+def test_one_image_shared_by_two_rows_is_fetched_once(window, monkeypatch):
+    """两个商品用同一张图：只发一个请求，回来时两行都贴上（行号只是"贴哪儿"）。"""
+    w = window("10000008780 | 甲\n10000000002 | 乙\n")
+    shared = "https://img.test/same.jpg"
+    w.store.upsert_item("10000008780", "甲", shared)
+    w.store.upsert_item("10000000002", "乙", shared)
+    fetched = []
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda key, url: fetched.append((key, url)))
+    w.LoadWatchlist(w.watchlist_path)
+
+    assert fetched == [(shared, shared + app_module.IMAGE_SUFFIX)]
+
+    pixmap = QPixmap(8, 8)
+    pixmap.fill(Qt.red)
+    w.OnImageFetched(shared, pixmap)
+
+    for row in (0, 1):
+        assert not w.table.item(row, app_module.COL_IMG).icon().isNull()
+
+
+def test_a_late_thumbnail_does_not_land_on_the_wrong_row(window, monkeypatch):
+    """下载期间表格重排过：迟到的图按地址核对，不往挪了位的行上贴。
+
+    行号是"贴哪儿"的临时坐标，商品一排序就作废。不核对的话，甲商品的图会贴到
+    乙商品上，还会被 icons 按错的地址记住——落了盘就是永久错图。
+    """
+    w = window("10000008780 | 甲\n10000000002 | 乙\n")
+    w.store.upsert_item("10000008780", "甲", "https://img.test/a.jpg")
+    w.store.upsert_item("10000000002", "乙", "https://img.test/b.jpg")
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda key, url: None)
+    w.LoadWatchlist(w.watchlist_path)
+
+    # 甲那张图还在路上，用户先把两行调了个头（乙跑到第 0 行）
+    w.watch_entries.reverse()
+    w.RebuildRows()
+
+    pixmap = QPixmap(8, 8)
+    pixmap.fill(Qt.red)
+    w.OnImageFetched("https://img.test/a.jpg", pixmap)
+
+    assert w.rows[0]["entry"].name == "乙"
+    assert w.table.item(0, app_module.COL_IMG).icon().isNull()  # 第 0 行现在是乙，不该贴
+    assert not w.table.item(1, app_module.COL_IMG).icon().isNull()  # 甲挪到这儿了，贴这儿
+
+
+def test_failed_thumbnail_is_retried_on_the_next_redraw(window, monkeypatch):
+    """下载失败要清掉等待表：否则这张图往后重画也不肯再请求，永远留白。"""
+    w = window("10000008780\n")
+    w.store.upsert_item("10000008780", "甲", "https://img.test/a.jpg")
+    fetched = []
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda key, url: fetched.append(url))
+    w.LoadWatchlist(w.watchlist_path)
+    assert len(fetched) == 1
+
+    w.OnImageFailed("https://img.test/a.jpg")
+    w.RenderTable()
+
+    assert len(fetched) == 2
 
 
 def test_image_fetcher_emits_downloaded_pixmap(qapp, png_bytes, wait_until, monkeypatch):
@@ -4342,6 +4439,105 @@ def test_image_fetcher_survives_download_failure(qapp, wait_until):
     time.sleep(0.2)  # 给线程一点时间跑完那条注定失败的下载
     qapp.processEvents()
     assert got == []
+
+
+def test_image_fetcher_ignores_a_repeated_request(qapp, wait_until, monkeypatch):
+    """同一对 (key, url) 只下一次：重画表格会把每张图再要一遍。"""
+    called = []
+    monkeypatch.setattr(
+        net, "get", lambda url, timeout=None: called.append(url) or b""
+    )
+    fetcher = app_module.ImageFetcher(workers=1)
+    failed = []
+    fetcher.failed.connect(failed.append)
+
+    for _ in range(3):
+        fetcher.fetch(5, "https://example.test/a.png")
+    fetcher.fetch(5, "https://example.test/b.png")  # 换了个地址，是另一件事
+
+    assert wait_until(lambda: len(failed) == 2, timeout=5)  # 空字节解不出图，都走失败
+    assert called == ["https://example.test/a.png", "https://example.test/b.png"]
+
+
+def test_image_fetcher_runs_at_most_workers_at_a_time(qapp, wait_until, monkeypatch):
+    """同时最多 workers 张：几百个线程各自跟 CDN 握手会互相拖垮。"""
+    release = threading.Event()
+    lock = threading.Lock()
+    running = []
+    peak = []
+
+    def _get(url, timeout=None):
+        with lock:
+            running.append(url)
+            peak.append(len(running))
+        release.wait(10)
+        with lock:
+            running.remove(url)
+        return b""
+
+    monkeypatch.setattr(net, "get", _get)
+    fetcher = app_module.ImageFetcher(workers=3)
+    failed = []
+    fetcher.failed.connect(failed.append)
+
+    for i in range(10):
+        fetcher.fetch(i, f"https://example.test/{i}.png")
+
+    assert wait_until(lambda: max(peak or [0]) == 3, timeout=5)
+    release.set()
+    assert wait_until(lambda: len(failed) == 10, timeout=10)
+    assert max(peak) == 3  # 第四个没挤进来
+
+
+def test_image_fetcher_stops_quietly(qapp, monkeypatch):
+    """收尾之后一张都不回包：窗口都销毁了，信号再送过去就是 abort 进程。"""
+    inflight = threading.Event()
+    started = threading.Event()
+
+    def _get(url, timeout=None):
+        started.set()
+        inflight.wait(10)
+        return b""
+
+    monkeypatch.setattr(net, "get", _get)
+    fetcher = app_module.ImageFetcher(workers=1)
+    got = []
+    fetcher.fetched.connect(lambda key, pixmap: got.append(key))
+    failed = []
+    fetcher.failed.connect(failed.append)
+
+    fetcher.fetch(1, "https://example.test/a.png")
+    assert started.wait(5)  # 这一张正在路上
+    fetcher.stop()
+    inflight.set()  # 现在让它跑完，看它还发不发信号
+
+    time.sleep(0.2)
+    qapp.processEvents()
+    assert got == [] and failed == []
+
+    fetcher.fetch(2, "https://example.test/b.png")  # 停了之后也不再接活儿
+    time.sleep(0.1)
+    qapp.processEvents()
+    assert got == [] and failed == []
+
+
+def test_image_fetcher_hands_the_bytes_to_the_cache(
+    qapp, wait_until, monkeypatch, png_bytes
+):
+    """给了 cache 就把下回来的字节交它存一份（缩略图落盘的那一步）。"""
+    monkeypatch.setattr(net, "get", lambda url, timeout=None: png_bytes)
+    saved = []
+    fetcher = app_module.ImageFetcher(cache=lambda url, data: saved.append((url, data)))
+    got = []
+    fetcher.fetched.connect(lambda key, pixmap: got.append(key))
+
+    url = "https://example.test/a.png@96w_96h_85q.webp"
+    fetcher.fetch("k", url)
+
+    # 存盘在发信号之前，两件事都得等到（信号是排队送过来的，得转事件循环）
+    assert wait_until(lambda: saved and got, timeout=5)
+    assert saved == [(url, png_bytes)]
+    assert got == ["k"]
 
 
 def test_image_fetcher_reports_download_failure(qapp, wait_until):
