@@ -433,6 +433,17 @@ def test_sold_out_row_keeps_a_reference_the_interface_actually_sent(window):
     assert w.table.item(0, app_module.COL_REF).text() == "¥199"
 
 
+def test_on_sale_row_without_a_reference_copies_the_current_price(window):
+    """在售但接口没给划线价（没打折时 priceTag 里压根没有 price 字段）：
+    原价列照抄现价，不留一格空白让人以为没抓到。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, result_ok(price="138"))
+
+    assert w.table.item(0, app_module.COL_PRICE).text() == "¥138"
+    assert w.table.item(0, app_module.COL_REF).text() == "¥138"
+
+
 def test_sold_out_row_without_any_price_leaves_both_columns_empty(window):
     """售罄又没抓到价：两列都留占位符，别把「—」当原价抄过去。"""
     w = window("10000008780\n")

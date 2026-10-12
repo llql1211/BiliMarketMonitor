@@ -2601,10 +2601,12 @@ class MainWindow(QMainWindow):
                 stock = stock_text(record.get("stock_count"))
                 note = _cached_note(record.get("price_updated_at"))
 
-            if sold_out and not reference:
+            if not reference:
+                # 接口没给参考价的，原价列照抄现价：不然同一行「现价」顶着个数字、
+                # 「原价」空着，看着像这格没抓到。两种情形都落在这儿——
                 # 售罄时接口整组不返回 price/priceSymbol，现价格里那个数就是原价
-                # （见 PriceText）。原价列照抄一份：不然同一行「现价」顶着个数字、
-                # 「原价」空着，看着像这格没抓到。
+                # （见 PriceText）；在售但没打折时 priceTag 里压根没有 price 字段
+                # （实测：只有 firstPrice/firstPriceType），那时划线价也就等于现价。
                 reference = price
 
             self.table.setItem(
