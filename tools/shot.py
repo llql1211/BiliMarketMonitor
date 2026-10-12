@@ -373,6 +373,46 @@ def _summary_many(dark):
     return SummaryDialog(changes, [], [], 40, 0, 154.6, dark)
 
 
+def _sample_ack():
+    """第四块「自上次确认以来」的样本：攒了几轮没看的样子。
+
+    头一条跟本轮那条是同一个 dict（累积里本来就带着本轮的内容），所以两处会
+    出现同一行——那是真的，不是摆错了。
+    """
+    changes = _sample_changes()
+    deals = _sample_deals()
+    targets = _sample_targets()
+    return {
+        "changes": changes,
+        "deals": deals,
+        "targets": targets,
+        "since": "2026-10-11 09:15:00",
+        "count": len(changes) + len(deals) + len(targets),
+    }
+
+
+@scene("summary-ack")
+def _summary_ack(dark):
+    """本轮只有一条，底下那块攒着更多：两块的分界、标题里的项数、那个「上次确认」时刻。"""
+    from app import SummaryDialog
+
+    return SummaryDialog(
+        _sample_changes()[:1], [], [], 12, 0, 21.4, dark, ack=_sample_ack()
+    )
+
+
+@scene("summary-ack-polling")
+def _summary_ack_polling(dark):
+    """抓取中：确认按钮该是灰的（按下去会把这一轮正写进来的变化吞掉）。"""
+    from app import SummaryDialog
+
+    dialog = SummaryDialog(
+        _sample_changes()[:1], [], [], 12, 0, 21.4, dark, ack=_sample_ack()
+    )
+    dialog.btn_ack.setEnabled(False)
+    return dialog
+
+
 # 场景里造出来、但只有 Qt 那边认得的对象得在这儿挂住：Python 这边一回收，
 # C++ 那边跟着销毁，出图时就只剩个"wrapped C/C++ object has been deleted"
 _KEEP = []
