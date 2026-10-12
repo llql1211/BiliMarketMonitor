@@ -320,7 +320,7 @@ def test_result_ready_updates_row_cache_and_name(window, monkeypatch):
     w.OnResultReady(0, result_ok(name="抓到的新名字"))
 
     assert w.table.item(0, app_module.COL_NAME).text() == "抓到的新名字"
-    assert w.table.item(0, app_module.COL_NAME).toolTip() == "抓到的新名字"
+    assert w.table.item(0, app_module.COL_NAME).toolTip() == "抓到的新名字\n10000008780"
     assert w.table.item(0, app_module.COL_PRICE).text() == "¥44"
     assert w.table.item(0, app_module.COL_AVG).text() == "¥205"
     assert w.table.item(0, app_module.COL_DEAL_BASE).text() == "¥205 · 8天前"
@@ -349,7 +349,7 @@ def test_result_ready_failure_marks_name_cell(window):
 
     cell = w.table.item(0, app_module.COL_NAME)
     assert cell.text() == app_module.FAILED_TEXT
-    assert cell.toolTip() == "HTTP 500"
+    assert cell.toolTip() == "HTTP 500\n10000008780"
     assert w.table.item(0, app_module.COL_PRICE).text() == app_module.NO_DATA_TEXT
     assert w.rows[0]["values"]["ok"] is False
 
@@ -362,7 +362,7 @@ def test_failure_keeps_known_name(window):
 
     cell = w.table.item(0, app_module.COL_NAME)
     assert cell.text() == "已知名字"
-    assert cell.toolTip() == "读取超时"
+    assert cell.toolTip() == "读取超时\n10000008780"
 
 
 def test_result_for_unknown_row_is_ignored(window):
@@ -1418,6 +1418,21 @@ def test_price_delegate_hands_only_the_price_to_the_base_style(window):
     assert option.text == "¥44 "  # 分隔的空格留着，基类按它把现价摆在该在的地方
 
 
+def test_name_tooltip_carries_the_cluster_id(window):
+    """ID 没有单独一列（那点宽度给了商品名），完整的 clusterID 挂在商品名的
+    悬停提示里：名称 + ID 两行——腾走一列，就得钉住 ID 确实还在别处看得见。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    assert "ID" not in app_module.HEADERS
+    assert w.table.item(0, app_module.COL_NAME).toolTip() == "甲\n10000008780"
+
+    # 名称还是占位符时就只报 ID，别弹一句没信息量的「…」
+    bare = window("10000000002\n")
+    bare.LoadWatchlist(bare.watchlist_path)
+    assert bare.table.item(0, app_module.COL_NAME).toolTip() == "10000000002"
+
+
 def test_segment_rect_sits_right_after_the_price(qapp):
     """涨跌的落点紧接在现价右边，且跟现价同一行——位置对不上两截就会叠住。"""
     metrics = QFontMetrics(qapp.font())
@@ -2027,7 +2042,8 @@ def test_items_still_failing_after_the_retry_are_counted(window, monkeypatch):
 
     assert len(made) == 2  # 补完还失败就是真抓不到，不再来第三轮
     assert w.run_failures == 1
-    assert w.table.item(0, app_module.COL_NAME).toolTip() == "还是失败"  # 报的是最后一次的原因
+    # 报的是最后一次的原因，第二行仍是 clusterID
+    assert w.table.item(0, app_module.COL_NAME).toolTip() == "还是失败\n10000008780"
     _assert_subtitle(w.summary_dialog.subtitle.text(), 1, failures=1)
 
 
@@ -3674,7 +3690,7 @@ def test_refresh_list_keeps_failed_rows_marked(window, data_files):
     w.OnRefreshList()
     cell = w.table.item(0, app_module.COL_NAME)
     assert cell.text() == app_module.FAILED_TEXT
-    assert cell.toolTip() == "HTTP 500"
+    assert cell.toolTip() == "HTTP 500\n10000008780"
 
 
 def test_refresh_rewrites_watchlist(window, data_files):
@@ -3802,7 +3818,7 @@ def test_drop_reorders_rows_table_and_watchlist(window, data_files):
     w.OnRowsDropped([2], 0)  # 把「丙」拖到最前面
 
     assert _ids(w) == ["10000000003", "10000008780", "10000000002"]
-    assert w.table.item(0, app_module.COL_CID).text() == "10000000003"
+    assert w.table.item(0, app_module.COL_NAME).text() == "丙"
     assert w.row_urls[0].endswith("clusterId=10000000003")
     body = [
         line

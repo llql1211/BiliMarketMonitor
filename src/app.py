@@ -103,12 +103,17 @@ ZOOM_MAX = 4.0    # 最多放到铺满的 4 倍；720 的图再往上就是马�
 ROW_NUMBER_PADDING = 16  # 序号槽左右留白，免得数字贴着分隔线
 
 COL_FAVORITE = 0
-COL_IMG, COL_NAME, COL_CID, COL_PRICE, COL_LOW, COL_EXPECT, COL_REF, COL_AVG = (
-    1, 2, 3, 4, 5, 6, 7, 8
+COL_IMG, COL_NAME, COL_PRICE, COL_LOW, COL_EXPECT, COL_REF, COL_AVG = (
+    1, 2, 3, 4, 5, 6, 7
 )
-COL_DEAL_BASE = 9  # 成交① 占 9/10/11 三列
-COL_LINK = 12
-HEADERS = ["收藏", "图片", "商品名", "ID", "现价", "史低价", "预期价", "原价",
+COL_DEAL_BASE = 8  # 成交① 占 8/9/10 三列
+COL_LINK = 11
+
+# 没有单独的「ID」列：11 位 clusterID 横着要占一百来像素，纵着折两行也要六七十，
+# 而它日常没人看——那点宽度给商品名更值。真要核对某一行是哪个商品，悬停商品名
+# 那格会连 ID 一起报（见 FillRow），也可以直接看 data/watchlist.txt 里的
+#「clusterId | 名称」。
+HEADERS = ["收藏", "图片", "商品名", "现价", "史低价", "预期价", "原价",
            "近30天均价", "成交1", "成交2", "成交3", "链接"]
 
 PENDING_TEXT = "…"      # 等待抓取
@@ -1285,6 +1290,21 @@ class PriceDeltaDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+def name_tooltip(head, cluster_id) -> str:
+    """「商品名」格的悬停提示：名称（抓失败时是失败原因）+ clusterID。
+
+    ID 没有单独一列（那点宽度给了商品名，见 HEADERS），这里是界面上唯一看得见、
+    又能选中复制它的去处，所以首屏和抓取回填两处改名字的地方都走这里拼——分头拼
+    早晚会只改一处，抓着抓着提示就变了样。head 还是占位符（…/—）时只报 ID，
+    免得弹一句没信息量的提示。
+
+    分两行：复制的时候上面那行是名字，下面那行是能直接粘进 watchlist.txt 的 ID。
+    """
+    if head in ("", NO_DATA_TEXT, PENDING_TEXT):
+        head = ""
+    return f"{head}\n{cluster_id}" if head else str(cluster_id)
+
+
 class PreviewArea(QScrollArea):
     """看大图用的滚动区：滚轮在这儿改缩放，按住左键还能拖着挪画面。
 
@@ -1996,7 +2016,6 @@ class MainWindow(QMainWindow):
         # 免得去挤商品名——那列是 Stretch，加宽「现价」只会从它身上抠。
         for col in (COL_DEAL_BASE, COL_DEAL_BASE + 1, COL_DEAL_BASE + 2):
             header.resizeSection(col, 110)
-        header.resizeSection(COL_CID, 100)
         header.resizeSection(COL_LINK, 60)
         # 商品名占剩余全部横向空间
         header.setSectionResizeMode(COL_NAME, QHeaderView.Stretch)
@@ -2669,11 +2688,15 @@ class MainWindow(QMainWindow):
             or item["entry"].name
             or (FAILED_TEXT if values and not values.get("ok") else PENDING_TEXT)
         )
-        # 抓失败时，名称格的提示换成失败原因（比重复一遍名称有用）
-        name_tip = (values.get("error") or "未知错误") if values and not values.get("ok") else None
-        self.table.setItem(row, COL_NAME, self.MakeCell(name_text, tooltip=name_tip))
-
-        self.table.setItem(row, COL_CID, self.MakeCell(cluster_id))
+        # 抓失败时，提示里报的是失败原因（比重复一遍名称有用），名称仍留在格子里
+        tip_head = (
+            (values.get("error") or "未知错误")
+            if values and not values.get("ok")
+            else name_text
+        )
+        self.table.setItem(
+            row, COL_NAME, self.MakeCell(name_text, tooltip=name_tooltip(tip_head, cluster_id))
+        )
 
         self.SetFavoriteCell(row, item)
         self.SetPriceCells(row, item)
@@ -3220,12 +3243,13 @@ class MainWindow(QMainWindow):
 
         # 名称：接口返回的才是最新的；失败时如果原本没有名字，标出来而不是留个"…"
         name_item = self.table.item(row, COL_NAME)
+        cluster_id = item["entry"].cluster_id
         if result["ok"] and result["name"]:
             name_item.setText(result["name"])
-            name_item.setToolTip(result["name"])  # 跟着新名字走
+            name_item.setToolTip(name_tooltip(result["name"], cluster_id))  # 跟着新名字走
             item["entry"].name = result["name"]
         elif not result["ok"]:
-            name_item.setToolTip(result["error"] or "未知错误")
+            name_item.setToolTip(name_tooltip(result["error"] or "未知错误", cluster_id))
             if name_item.text() == PENDING_TEXT:
                 name_item.setText(FAILED_TEXT)
         if result["ok"] and result["image_url"]:
