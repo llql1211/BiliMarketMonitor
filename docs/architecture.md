@@ -14,6 +14,9 @@
 - **私有接口，无文档、无频率承诺**。默认轮询间隔保守取 2 秒、依次（非并发）请求，
   间隔本身可调（`poll_interval_seconds`，商品多时调小）；字段则随时可能变，
   解析层对每条取值路径都判空，字段没了就显示 `—`，不报错。
+- **网络随时可能很差**（代理、VPN、坏掉的 v6 路由——都真实发生过）。所以首屏不依赖网络：
+  价格先用缓存里上一轮的，缩略图先用 `data/thumbs/` 里那份，网络回来的慢一点也不影响已经显示的东西。
+  出网一律走 `net.py` 的常驻连接，不逐次重握手。
 - **只监视，不下单**。不碰登录态，不碰交易。
 - **非官方工具**，与哔哩哔哩官方无关。
 - **许可 GPL-3.0-only**。[pyproject.toml](../pyproject.toml) 里有一行注释记着原因：
@@ -33,8 +36,9 @@ BiliMarketMonitor/
 │   ├── watchlist.txt           # 监视清单（用户维护，程序会规范化写回，不入库）
 │   ├── watchlist.txt.bak       # 写回前留的备份，只留第一次那份（不入库）
 │   ├── cache.db                # 本地缓存（首次运行自动生成，不入库）
-│   └── cache.db.bad-<时间戳>    # 缓存损坏时的备份（自动改名留档，不入库）
-├── src/                # 应用代码，9 个模块（见下）
+│   ├── cache.db.bad-<时间戳>    # 缓存损坏时的备份（自动改名留档，不入库）
+│   └── thumbs/                 # 缩略图磁盘缓存（自动生成，可随手删，不入库）
+├── src/                # 应用代码，11 个模块（见下）
 ├── tests/              # pytest 测试，界面走 offscreen（见「测试」）
 ├── tools/              # 开发/维护工具，不随程序分发（见 tools/README.md）
 ├── docs/               # 本文档，以及 README 用的截图
@@ -58,8 +62,10 @@ BiliMarketMonitor/
 | [src/links.py](../src/links.py) | 监视清单读写：解析各种写法、清洗、规范化回写 | `load_links(path)`、`save_watchlist(path, items)`、`build_detail_url(...)` |
 | [src/config.py](../src/config.py) | 配置读取、逐项校验与写回 | `load_config()`、`save_config(changes)`、`check_value(key, value)`、`data_dir()`、`DEFAULTS` |
 | [src/settings.py](../src/settings.py) | 设置窗口：把配置项摆成三页表单，收值与校验 | `SettingsDialog`、`FIELDS`、`changed_values(values, original)` |
+| [src/net.py](../src/net.py) | 出网的唯一接缝：按线程复用 `requests.Session`，别处不再直接 import requests 发请求 | `net.get(url, timeout)`、`net.post(url, **kwargs)`、`session()` |
 | [src/store.py](../src/store.py) | SQLite 缓存：随清单增删、损坏自愈 | `Store`（`sync` / `upsert_item` / `get_all` / `cached_deals`）、`default_db_path()` |
 | [src/theme.py](../src/theme.py) | 深浅两套 QSS、系统深浅色判断、各处配色 | `apply_theme(app, dark)`、`qss_for(dark)`、`system_uses_dark()` |
+| [src/thumbs.py](../src/thumbs.py) | 缩略图磁盘缓存：按图片地址存取、原子写、按数量上限清理 | `load(url)`、`save(url, data)`、`cache_dir()`、`path_for(url)` |
 | [src/notifier.py](../src/notifier.py) | 企业微信群机器人推送：只管把一条 markdown 发出去 | `Notifier`（`send` / `sent` / `failed`）、`_post_wecom(...)` |
 
 几点值得单独记住：
@@ -68,6 +74,10 @@ BiliMarketMonitor/
   无文档的响应、拼出来的 URL）尤其如此。
 - **异常一律降级 + 留痕**，不往上抛、不弹窗打断。`store` 和 `links` 把这次操作的异常情况攒在
   各自的 `notes` 里，`app` 收上去统一在状态栏说一句。详见「降级与留痕」。
+- **出网只有一条接缝 `net.py`**。别处一律 `net.get` / `net.post`，不直接 `requests.get`：
+  每次现开一条连接都要重建 TCP + TLS 握手外加一个 `SSLContext`（本机实测约 20ms CPU），
+  网络不好时（代理、坏掉的 v6 路由）这 20ms 会放大成十几秒；`Session` 按线程复用一份就没这问题。
+  顺带把「测试怎么拦网络」也收成一个点——补 `Session.request` 一处即可，见「测试」。
 - **`notifier` 不 import 本项目任何模块**，连 `config` 都不认识——webhook 地址、要发的正文
   都由 `app` 拼好传进来。这样依赖箭头只有 `app → notifier` 一条，`_post_wecom` 也能当纯函数测。
   代价是「企业微信地址前缀」在 `config._WECOM_PREFIX` 和 `notifier.WECOM_API_PREFIX` 各留了一份，
@@ -129,6 +139,10 @@ data/watchlist.txt
 - **缓存里还有一份「用户意图」不走抓取这条路**：`ack_*` 那几列（上次确认时的样子）跟
   `favorite` 并列，只由用户按「确认」和「第一次抓到」写，见「几个关键判定 → 累积确认的基线」。
   抓取这条流水线的每一棒都不碰它，所以它跟价格快照一样能跨轮攒、跨重启留着。
+- **缩略图比价格多一层磁盘缓存**，走的是另一条支线：`SetThumbnail(row, url)` 先看内存
+  `icons`，再看 `data/thumbs/`，两边都没有才排进 `ImageFetcher` 的队列；同一张图被几行共用
+  只下一次（回来的 key 是地址，贴之前按 `row_images` 核对行号）。判据与上限见
+  「清单与缓存 → 缩略图」。
 
 ### 设置改完怎么生效
 
@@ -177,10 +191,18 @@ data/watchlist.txt
   - 总结里的「用时」是墙钟时间刨掉暂停的那段（`MainWindow.RunElapsed`）：暂停是用户
     自己按的，算进去会让人以为抓取本身就那么慢。暂停时长在 `OnTogglePause` 里攒，
     收尾时定格成 `run_elapsed`——总结窗口换主题要重渲染，那时不能再算一遍。
-- **`ImageFetcher(QObject)`**：拉图不走轮询线程，每张图起一个 daemon 线程，下好一张 emit 一张。
-  信号里带的是调用方自己认的 key（缩略图用行号，双击预览用请求号），对不上就丢掉。
-  下载失败发 `failed` 而不是静默丢弃——大图下不下来得跟用户说一声，缩略图那边不接这个信号，
-  等于照旧不吭声。
+- **`ImageFetcher(QObject)`**：拉图不走轮询线程，固定 8 个常驻 daemon worker 从一个队列里取活儿，
+  下好一张 emit 一张。**不是每张图起一个线程**：几百个线程各自跟同一台 CDN 重新握手，
+  网络一抖就互相拖成十几秒才回来第一张（本地对照：200 个请求不限并发 1176ms，8 个 worker
+  536ms，32 个反而 1056ms）。用自建线程而不是 `ThreadPoolExecutor`，因为后者的线程不是 daemon，
+  退出时会把正在跑的下载等完，关窗口就卡在那儿。
+  - 信号里带的是调用方自己认的 key。**缩略图用图片地址**（同一张图可能有好几行在等，地址天然
+    就是它的身份；用行号的话下载期间表格一重排就会贴到别的行上），双击预览用请求号。
+  - 同一个 `(key, url)` 已排队或在飞就不再排第二次——重画表格会把每张图再要一遍。
+  - 下载失败发 `failed` 而不是静默丢弃——大图下不下来得跟用户说一声；缩略图那边只拿它清掉
+    等待表（不清的话这张图一直挂着「有人在等」，一次闪断就永远留白），仍然不吭声。
+  - `stop()` 在 `closeEvent` 里叫：收尾之后才回来的那几张不能再往已销毁的窗口发信号
+    （槽里抛异常在 PyQt 下是直接 abort 进程的），排着队的那些也就此丢掉。
 - **`auto_poll_timer(QTimer)`**：自动抓取的节拍器，跑在**主线程**，它不是线程、也不发网络请求，
   到点只是在主线程里把一批任务交给 `PollerThread`——网络那部分照旧在子线程。
   - **单次触发 + 每轮收尾重挂**，不用周期定时器。周期定时器每一拍都不管上一轮跑没跑完，
@@ -250,6 +272,18 @@ data/watchlist.txt
   跟同表里价格那组「传了覆盖、传 `None` 保留」的快照语义正好对上，只是判据在调用方手里。
 - 自愈三档：库文件损坏 → 改名成 `cache.db.bad-<时间戳>` 后重建空库；目录不存在 → 自己建；
   连库都开不了（权限之类）→ 退到内存库，本次运行照常可用。全都记进 `notes`。
+
+**缩略图 `data/thumbs/`**（`thumbs.py`）
+
+- 文件名是**图片完整地址（含 CDN 裁剪后缀）的 sha1 前 16 位** + `.img`，内容就是下载回来的原始字节。
+  地址带后缀是有意的：`IMAGE_SIZE` 一改就是另一个地址，旧盘上那份自动作废，不用另写版本号。
+- 三层缓存各管一段：内存里的 `icons`（表格重画）、`pending_images`（同一张图只下一次）、磁盘（**重启**）。
+  第三层是为了网络抖动时「下过的图照样立刻能看见」——实测 225 行、盘里都有时，图标在
+  `LoadWatchlist` 里就贴完了（约 0.2s，零网络请求），没有这层要等 2.5s。
+- 写入是**先 `.part` 再 `os.replace`** 的原子写，读到坏文件（`OSError` 或解不出图）一律当没有，
+  退回网络重下；空字节不落盘——失败的那次不该在盘上留个空壳，否则下次启动会一直拿着它当缓存。
+- 上限 `MAX_FILES = 2000` 个，每存 100 个按 mtime 清一次最旧的（只清理 `*.img`，别的手写文件不动）。
+  整个目录**可以随手删**，代价只是下次启动重下。
 
 ## 几个关键判定
 
@@ -501,7 +535,9 @@ pixi run test           # 等价于 pixi run python -m pytest
    在整场测试前后比对真实 `data/` 的内容指纹，被改动过就 fail。
    *这条是为一次真实事故加的保险*：早期测试直接构造 `MainWindow`，
    `store.sync()` 的「以清单为准」语义把用户的 `cache.db` 清空过。
-2. **不联网**。`requests.get/post` 一律换成抛 `ConnectionError`；要造响应就用 `fake_client`。
+2. **不联网**。`requests.get/post` 与 `requests.Session.request` 一律换成抛 `ConnectionError`
+   （后者是补的：出网改走常驻连接后，只堵前者拦不住了，见 `net.py`）；
+   要造响应就用 `fake_client`，或者像 `tests/test_app.py` 那样直接换掉 `net.get`。
 3. **不弹窗**。`QMessageBox` 的三个静态方法与 `webbrowser.open` 一律被拦下并记录，
    界面测试才能无人值守地跑（`msgboxes` / `opened_urls` fixture）。
 
@@ -511,15 +547,17 @@ pixi run test           # 等价于 pixi run python -m pytest
 
 | 测试文件 | 覆盖 |
 | --- | --- |
-| [tests/test_app.py](../tests/test_app.py) | 主窗口渲染与按钮流程、`PollerThread`、缩略图线程、总结窗口、通知触发与合并、设置窗口的保存与即时生效 |
+| [tests/test_app.py](../tests/test_app.py) | 主窗口渲染与按钮流程、`PollerThread`、缩略图（内存/磁盘两层缓存、同一张图合并成一次下载、失败后重试、重排后不贴错行）、总结窗口、通知触发与合并、设置窗口的保存与即时生效 |
 | [tests/test_client.py](../tests/test_client.py) | 请求形态与各类失败的统一出口 |
 | [tests/test_config.py](../tests/test_config.py) | 配置优先级、逐项校验、单值校验与写回（只改传进来的项、保留注释） |
 | [tests/test_links.py](../tests/test_links.py) | 清单解析、去重、规范化回写 |
+| [tests/test_net.py](../tests/test_net.py) | 同线程复用一份 Session、不同线程各一份、超时透传，以及「不联网」那条规矩确实盖住了这条接缝 |
 | [tests/test_notifier.py](../tests/test_notifier.py) | 企业微信报文、`errcode` 判定、地址校验与脱敏、发送线程回信号 |
 | [tests/test_parser.py](../tests/test_parser.py) | 响应解析与全路径判空 |
 | [tests/test_settings.py](../tests/test_settings.py) | 设置窗口：字段表覆盖了每一项配置、三页签、控件种类与位置、收值与拦错、勾主题不预览 |
 | [tests/test_store.py](../tests/test_store.py) | 缓存随清单增删、设置项、损坏自愈 |
 | [tests/test_theme.py](../tests/test_theme.py) | 样式表、占位文字配色、系统深浅色判断 |
+| [tests/test_thumbs.py](../tests/test_thumbs.py) | 缓存存取与原子写、坏目录/坏文件一律当没有、按数量上限清理时不动别的手写文件 |
 
 ## 改了界面就出图
 
@@ -551,6 +589,8 @@ pixi run shot           # 出图在 tmp/out/，每个场景深色/浅色各一�
 | 设置窗口的排版、标签、提示语 | `settings.FIELDS` / `settings.SECTIONS`；改完 `pixi run shot settings` 出图看一眼 |
 | 设置改完"当场生效"的范围 | `app.ApplyConfig()`：启动时算好存下来的那几处都在里头（高亮秒数与画刷、两处提示、自动抓取定时器） |
 | 缓存要多存一个字段 | `store.ITEM_COLUMNS`，老库由 `_ensure_item_columns()` 自动补列 |
+| 要发一个新请求 / 改连接与超时的行为 | `net.py`（不许在别处直接 `requests.get`，否则又变回一次一张新连接）；拦网络的测试在 `tests/conftest.py` 的 `_offline` |
+| 缩略图的尺寸、并发数、磁盘缓存上限 | `app.IMAGE_SIZE` / `IMAGE_SUFFIX` / `IMAGE_WORKERS`（改 `IMAGE_SIZE` 会让盘上旧缓存自动作废）、`thumbs.MAX_FILES` |
 | 成交判「新增」的算法 | `app.new_deals()` / `_aged_from()` |
 | 「查看上次总结」按钮、快照留多久 | `app.ShowSummary()` / `app.OnShowLastSummary()` / `app._OpenSummaryDialog()`；顶部按钮在 `InitUI()` 的 `info_bar` 里 |
 | 史低价的只降不升规则 | `app.updated_lowest()` / `at_lowest()`；存的那一列在 `store.ITEM_COLUMNS` |
