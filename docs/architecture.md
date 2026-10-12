@@ -126,6 +126,9 @@ data/watchlist.txt
 - **「刷新列表」兼管清单的规范化**：它先重读文件、再按规范格式写回，所以手工编辑
   完点它就够了，不需要一个单独的「整理清单」。但只在**全部行都认得出**时才写——
   写回是按解析结果重排的，有一行认不出就会被写没，判据是 `MainWindow.last_unparsed`。
+- **缓存里还有一份「用户意图」不走抓取这条路**：`ack_*` 那几列（上次确认时的样子）跟
+  `favorite` 并列，只由用户按「确认」和「第一次抓到」写，见「几个关键判定 → 累积确认的基线」。
+  抓取这条流水线的每一棒都不碰它，所以它跟价格快照一样能跨轮攒、跨重启留着。
 
 ### 设置改完怎么生效
 
@@ -228,14 +231,21 @@ data/watchlist.txt
 - **同步以清单为准**：清单里有、缓存里没有的补上，缓存里有、清单里没有的删掉。
   这条语义很硬——早期正是它把用户的 `cache.db` 清空过（清单为空时），
   所以测试专门有个看门狗 fixture 盯着真实 `data/`，见「测试」。
-- `favorite`（收藏）是缓存里**唯一一项不来自抓取**的数据：价格、均价、成交、史低价都是抓来的，
-  它只从清单来。所以能写它的口子只有两个——`sync()` 跟着清单整体覆盖、`set_favorite()` 改一条；
+- `favorite`（收藏）是缓存里**两份「不来自抓取」的数据**之一（另一份是 `ack_*`，见下一条）：
+  价格、均价、成交、史低价都是抓来的，它只从清单来。所以能写它的口子只有两个——`sync()`
+  跟着清单整体覆盖、`set_favorite()` 改一条；
   `upsert_item()` 一个字都不碰，抓取结果回来不会把用户打的星冲掉。传进 `sync()` 的二元组
   （只给 ID 和名字的老写法）按「未收藏」算，也就是会把缓存里那颗星**取消**掉——清单是正本，
   这条没有例外，取消收藏因此不会被下一轮 sync 悄悄还原。
-- `lowest_price`（史低价）是缓存里**唯一一条不可再生**的记录：价格、均价、成交都是「抓一次就
-  回来」的快照，它却是历次抓取攒出来的。所以删库、重建、把商品移出清单再拖回来，都会把它
-  丢掉且补不回来（只能从下一轮抓取重新开始攒）。这条在 README 的「说明」里对用户讲明了。
+- `ack_*` 那六列（`ack_price_text` / `ack_price_value` / `ack_sold_out` / `ack_lowest_price` /
+  `ack_deals_json` / `ack_at`）是**第二份用户意图**，跟 `favorite` 并列：抓取一个字都不碰
+  （`upsert_item()` 的列清单里没有它们），能写它们的只有两处——`acknowledge()`（用户按「确认」）
+  和 `init_ack_if_empty()`（第一次抓到这件商品）。区别是确认**全局**生效：一次把所有行的基线
+  刷到当前，不做逐件确认。判据见「几个关键判定 → 累积确认的基线」。
+- `lowest_price`（史低价）是缓存里**两条不可再生**的记录之一（另一条是累积确认的基线）：
+  价格、均价、成交都是「抓一次就回来」的快照，它却是历次抓取攒出来的。所以删库、重建、
+  把商品移出清单再拖回来，都会把它丢掉且补不回来（只能从下一轮抓取重新开始攒）。
+  这条在 README 的「说明」里对用户讲明了。
   落库用的是普通的 `COALESCE`——传 `None` 是「这轮没有新记录」，不是「清掉记录」，
   跟同表里价格那组「传了覆盖、传 `None` 保留」的快照语义正好对上，只是判据在调用方手里。
 - 自愈三档：库文件损坏 → 改名成 `cache.db.bad-<时间戳>` 后重建空库；目录不存在 → 自己建；
@@ -385,6 +395,42 @@ data/watchlist.txt
   已经覆盖到按「查看上次总结」弹出的那个窗口，因为 `summary_dialog` 始终
   指向当前打开的那一个。
 
+**累积确认的基线**（`app.ack_change` / `ack_new_deals` / `ack_reached` / `BuildAckSummary`）
+
+总结窗口里那块「自上次确认以来」报的不是这一轮，而是**从上次确认攒到现在**的全部变化。
+实现上没有任何"合并历史"的逻辑：`ack_*` 那几列是不动的基线，每轮都拿同一根它重新比一遍，
+上一轮报过的内容自然还在——攒多久取决于用户什么时候按「确认」，不取决于跑了几轮。
+
+- **三个判据是本轮那三个的翻版**，判据口径一字不差，只是基准换成基线：
+  `ack_change` 把基线包成 `previous` 直接调 `price_change`；`ack_new_deals` 把
+  `ack_deals_json` + `ack_at` 当基准交给 `new_deals`（`elapsed` 是 `ack_at` 到现在的秒数）；
+  `ack_reached` 在本轮到价的基础上再要求**确认时没到价**——它跟通知那边一样是边沿，
+  不然确认过一次之后它会一直报。
+- **售罄、认不出数字一律不参与价格比较**，跟 `price_delta` / `expected_reached` 同规矩：
+  售罄行的"现价"是原价，两边售罄就不比；确认时的价认不出来就退化成"不比"，
+  不拿猜出来的数当基准。
+- **首次观察即基线**（`store.init_ack_if_empty`）：缓存里这行还没有 `ack_at` 时，本轮抓到的样子
+  直接记成基线，**这一轮不算变化**——跟涨跌、创史低"第一次抓到不算"是同一条规矩。
+  判据取 `upsert` 之前那份 `previous`（`previous` 里有 `ack_at` 就说明已经记过），
+  写完再回读一遍记录，让内存里的 `record` 带上新基线。
+- **首次初始化不动全局时刻**：`last_ack_at`（`settings` 表里那行）只有 `acknowledge()` 写，
+  所以刚加进来的商品不会把顶部那句从「尚未确认」变成「已确认」。
+- **确认一个事务写完**（`acknowledge`）：基线、成交、史低和全局时刻同进同出。写一半会留下
+  "这行的基线新、那行的基线旧"，之后的累积报告就开始胡说——所以连带它自己那个时刻一起
+  回滚，绝不通过 `set_setting()`（那里嵌的 `with self.conn:` 会把外层事务提前提交）。
+- **通知仍走 `previous`，不要改**：累积那套只给界面看，`NotifyTags` 判边沿用的是**上一轮**缓存
+  里的值。拿 `ack` 顶替它会出事——用户按一次确认，等于把攒了几轮的历史一次性推上手机
+  （本来"上次没到、这次到了"才推）。`test_confirming_does_not_change_the_notification_judgment`
+  盯着这条。
+- **抓取中不给确认**：那一轮正在写缓存，基线这时候刷到"当前"会把中间的变化吞掉。
+  `SetBusy` 把按钮置灰，`OnAcknowledge` 自己再拦一道（快捷键之类绕过去的路）。
+- **顶部那句看的是两样东西**（`UpdateAckLabel`）：有未确认项就是「未确认 N 项变化」（N 来自
+  `BuildAckSummary`），没有则按 `last_ack_at` 给「尚未确认」或「已确认 · 3 小时前」。
+  它跟「上次更新时间」一样在每个结果回来时刷新（`OnResultReady`），不只在收尾时刷。
+- **窗口只管摆、收，不认识 `MainWindow`**：`SummaryDialog.acknowledged` 信号出去、
+  `MainWindow.OnAcknowledge()` 干活（刷基线、重读记录、恢复选中、清掉窗口里那块），
+  跟「确认」按钮不关窗是同一件事的两面——用户可能还想接着看本轮的明细。
+
 **画格子的时机**：抓取开始时把价格清成 `--`，刷到哪行填哪行，一眼能看出进度。
 `PENDING_TEXT`、`NO_DATA_TEXT`、`CLEARED_TEXT`、`FAILED_TEXT` 几个占位符在 `app.py` 顶部。
 
@@ -508,6 +554,7 @@ pixi run shot           # 出图在 tmp/out/，每个场景深色/浅色各一�
 | 成交判「新增」的算法 | `app.new_deals()` / `_aged_from()` |
 | 「查看上次总结」按钮、快照留多久 | `app.ShowSummary()` / `app.OnShowLastSummary()` / `app._OpenSummaryDialog()`；顶部按钮在 `InitUI()` 的 `info_bar` 里 |
 | 史低价的只降不升规则 | `app.updated_lowest()` / `at_lowest()`；存的那一列在 `store.ITEM_COLUMNS` |
+| 累积确认（攒什么、什么时候清零、顶部那句话） | 判据 `app.ack_change()` / `ack_new_deals()` / `ack_reached()` / `BuildAckSummary()`；写入 `store.acknowledge()` / `init_ack_if_empty()`（列在 `ITEM_COLUMNS`）；按钮与那句提示在 `SummaryDialog.btn_ack` / `MainWindow.ack_label` |
 | 清单接受的写法 | `links.parse_line()` / `_split_fields()` |
 | 收藏的写回、回滚与星标 | 交互在 `app.ToggleFavorite()`；清单那段在 `links.parse_line()` / `_strip_favorite()`，缓存那列由 `store.sync()` / `set_favorite()` 写，星标颜色在 `theme.favorite_color()` |
 | 自动抓取的间隔、范围与总结开关 | `data/config.toml` 的 `auto_poll_*` 四项，校验在 `config.py`；调度在 `app.ScheduleAutoPoll()` / `OnAutoPoll()` / `AutoPollTasks()` |
