@@ -218,6 +218,8 @@ PRICE_ALIGN = Qt.AlignLeft | Qt.AlignVCenter
 
 PAUSE_TEXT = "暂停抓取"
 RESUME_TEXT = "继续抓取"
+# 一轮跑完补抓失败的那几件时，进度那行字的前缀（见 StartRetryPass）
+RETRY_PROGRESS_PREFIX = "补抓失败的商品"
 # 顶部那行「上次更新时间」：一次都没抓到过的时候显示这个（有数据时见 _cached_note）
 NO_UPDATE_TEXT = "尚未抓取过"
 LAST_UPDATE_PREFIX = "上次更新时间："
@@ -1800,6 +1802,10 @@ class MainWindow(QMainWindow):
         self.run_failures = 0    # 本次抓取查询失败的条数：失败的那几件看不出变动
         self.run_total = 0       # 本次抓取的目标件数：总结里「共抓取 N 件」用它而不是
                                  # 清单总件数——「仅抓取新添加商品」只抓其中几件
+        # 本次失败的行号。收尾时照它补抓一轮，失败数也按它现算（见 StartRetryPass）
+        self.run_failed_rows = set()
+        self.run_retried = False    # 补抓跑过了（只补一轮，不来回抓）
+        self.run_retry_pass = False  # 正在跑的这轮是不是补抓，只影响进度文案
         # 本轮的计时：起点、已暂停的累计秒数、当前这次暂停的起点（见 RunElapsed）
         # 起点先落在建窗那一刻：没起过一轮就收尾（只有测试会这样）也不会崩
         self.run_started_at = time.monotonic()
@@ -3029,7 +3035,13 @@ class MainWindow(QMainWindow):
         return [(i, self.rows[i]["entry"]) for i in rows]
 
     def FetchProgressPrefix(self) -> str:
-        """状态栏那行字的开头：手动是「查询中」，自动则点明是自动、抓的是哪个范围。"""
+        """状态栏那行字的开头：手动是「查询中」，自动则点明是自动、抓的是哪个范围。
+
+        补抓那一轮另说一句（见 StartRetryPass）：件数少、又是重来一遍，
+        跟第一轮用同一个前缀会让人以为前面那轮没跑完。
+        """
+        if self.run_retry_pass:
+            return RETRY_PROGRESS_PREFIX
         if self.fetch_source != "auto":
             return "查询中"
         scope = self.config["auto_poll_scope"]
@@ -3048,6 +3060,9 @@ class MainWindow(QMainWindow):
         self.names_learned = False
         self.poller_stopped = False
         self.run_changes = []  # 上一轮的变动和失败数不带到这一轮的总结里
+        self.run_failed_rows = set()  # 这一批失败的行号，收尾时照它补抓
+        self.run_retried = False      # 补抓还没跑
+        self.run_retry_pass = False   # 正在跑的是第一轮
         self.run_deals = []
         self.run_targets = []
         self.run_failures = 0
@@ -3185,11 +3200,15 @@ class MainWindow(QMainWindow):
             item["record"] = self.store.get_item(cluster_id)
             if result["name"] and result["name"] != item["entry"].name:
                 self.names_learned = True
+            # 补抓把这一件捞回来了：从失败名单里划掉，它也就不再算失败
+            self.run_failed_rows.discard(row)
         else:
             # 这次没抓到，还显示缓存里的价格，涨跌自然也就无从谈起；
             # 但得记一笔，总结里"没有变动"才不至于连失败一起含糊过去
             item["delta"] = None
-            self.run_failures += 1
+            # 失败数不在这儿累加：收尾时要按这份名单现算（补抓捞回来的不算，
+            # 见 StartRetryPass），中途加加减减容易和名单对不上
+            self.run_failed_rows.add(row)
         item["values"] = result  # 失败的也记下来，重建表格时不会退回"待抓取"
 
         self.SetPriceCells(row, item)
@@ -3278,7 +3297,54 @@ class MainWindow(QMainWindow):
             idle += time.monotonic() - self.run_paused_at
         return max(0.0, time.monotonic() - self.run_started_at - idle)
 
+    def StartRetryPass(self) -> bool:
+        """这一轮失败的那几件再抓一遍。返回 True 表示补抓已经起跑。
+
+        单条请求自带的那次重试（见 PollerThread）是背靠背发出去的：网络抖一下、
+        接口偶发 500，两次一起撞上就整轮挂着失败。跑完一轮再从头补一次，中间隔着
+        几十秒（甚至几分钟），捞回来的概率大得多；失败数只按补抓之后的结果算，
+        总结里那句「其中 N 件查询失败」才对得上。
+
+        只补一轮：补完还失败就是真抓不到（商品下架、接口一直 500），再来一轮
+        只是拖着不让收尾。中断的那一轮也不补——用户按的是「停止抓取」，
+        补抓等于把他刚停的那轮又跑起来。
+        """
+        if self.poller_stopped or self.run_retried or not self.run_failed_rows:
+            return False
+        # 行号有序：补抓的进度跟第一轮一样从前往后走，好跟表格对上
+        # （行号越界的丢掉，跟 OnResultReady 开头那道闸一个道理）
+        tasks = [
+            (row, self.rows[row]["entry"])
+            for row in sorted(self.run_failed_rows)
+            if 0 <= row < len(self.rows)
+        ]
+        if not tasks:  # 名单里的行一个都不在了，没什么可补的，照常收尾
+            return False
+        self.run_retried = True
+        self.run_retry_pass = True
+        self.poller = PollerThread(
+            tasks,
+            self.config["poll_interval_seconds"],
+            self.config["retry_interval_seconds"],
+            self.config["request_timeout_seconds"],
+        )
+        self.poller.result_ready.connect(self.OnResultReady)
+        self.poller.progress_changed.connect(self.OnProgress)
+        self.poller.finished_all.connect(self.OnPollFinished)
+        self.poller.start()
+        # 补抓的行不清价：它们本来显示的就是缓存里那个数（失败的退回缓存），
+        # 清成「--」反而像这轮抓丢了
+        self.progress_label.setText(f"{RETRY_PROGRESS_PREFIX} {len(tasks)} 件…")
+        return True
+
     def OnPollFinished(self):
+        # 收尾之前先补抓：失败的那几件再抓一遍，能捞回来就别挂在总结里。补抓这一轮
+        # 也走 OnResultReady/OnPollFinished，所以这儿直接返回——收尾、挂下一拍自动
+        # 抓取、发通知、弹总结都留给补抓跑完的那一次做（busy 也一直开着，补抓期间
+        # 暂停/停止照样管用）
+        if self.StartRetryPass():
+            return
+        self.run_failures = len(self.run_failed_rows)  # 补抓之后剩下的才算失败
         self.SetBusy(False)
         self.RestorePendingPrices()  # 没轮到的行别一直空着（停止抓取的也一样）
         # 下一拍在这儿挂，三条收尾路径都要经过它：定时器是单次触发的，这一拍用完

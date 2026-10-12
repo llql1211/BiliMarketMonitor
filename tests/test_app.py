@@ -1986,6 +1986,66 @@ def test_summary_mentions_failed_queries(window, monkeypatch, wait_until):
     _assert_subtitle(w.summary_dialog.subtitle.text(), 2, failures=1)
 
 
+def test_failed_items_get_one_more_pass_at_the_end_of_the_round(window, monkeypatch):
+    """跑完一轮，失败的那几件自动补抓一遍——只抓它们，其余的重抓纯属白跑。"""
+    w = window("10000008780 | 甲\n10000000002 | 乙\n")
+    w.LoadWatchlist(w.watchlist_path)
+    made = _record_pollers(monkeypatch)
+
+    w.OnFetchPrices()
+    w.OnResultReady(0, result_ok(name="甲", price="¥44"))
+    w.OnResultReady(1, result_fail("查询失败"))
+    w.OnPollFinished()
+
+    assert len(made) == 2  # 补抓起了一个新线程
+    assert [row for row, _ in made[1].tasks] == [1]  # 只有失败那行
+    assert "补抓失败的商品" in w.progress_label.text()
+    # 补抓还没跑完，这一轮就没收尾：按钮还是灰的，暂停/停止对着新线程照样管用
+    assert not w.btn_fetch.isEnabled()
+
+    # 补抓把这件捞了回来：总结里不该再提"查询失败"
+    w.OnResultReady(1, result_ok(name="乙", price="¥50"))
+    w.OnPollFinished()
+
+    assert len(made) == 2  # 只补一轮
+    assert w.run_failures == 0
+    assert w.btn_fetch.isEnabled()  # 这回落定了
+    _assert_subtitle(w.summary_dialog.subtitle.text(), 2)
+
+
+def test_items_still_failing_after_the_retry_are_counted(window, monkeypatch):
+    """补抓仍失败的那几件才算失败：总结还是照实说「其中 N 件查询失败」。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    made = _record_pollers(monkeypatch)
+
+    w.OnFetchPrices()
+    w.OnResultReady(0, result_fail("查询失败"))
+    w.OnPollFinished()          # 起补抓
+    w.OnResultReady(0, result_fail("还是失败"))
+    w.OnPollFinished()          # 补抓也跑完了
+
+    assert len(made) == 2  # 补完还失败就是真抓不到，不再来第三轮
+    assert w.run_failures == 1
+    assert w.table.item(0, app_module.COL_NAME).toolTip() == "还是失败"  # 报的是最后一次的原因
+    _assert_subtitle(w.summary_dialog.subtitle.text(), 1, failures=1)
+
+
+def test_a_stopped_round_does_not_retry_failed_items(window, monkeypatch):
+    """中途「停止抓取」的那轮不补抓：用户要的就是停下，补抓等于把他刚停的那轮又跑起来。"""
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    made = _record_pollers(monkeypatch)
+
+    w.OnFetchPrices()
+    w.OnResultReady(0, result_fail("查询失败"))
+    w.OnStopFetch()
+    w.OnPollFinished()
+
+    assert len(made) == 1
+    assert "已停止抓取" in w.progress_label.text()
+
+
 def test_summary_reports_the_elapsed_time(window):
     """总结里报这一轮花了多久：起点摆在 21 秒前，就该说「用时 21 秒」。"""
     w = window("10000008780\n")

@@ -110,8 +110,10 @@ data/watchlist.txt
       ▼
    信号回主线程 ──► 刷新表格 + store.upsert_item() 写缓存
                     ├► links.save_watchlist()  学到了新名字才回写清单
-                    └► OnPollFinished 收尾，顺手挂下一拍自动抓取
-                         └► FlushNotifications()  攒下的通知合成一条，交给 notifier
+                    └► OnPollFinished
+                         ├► 有失败的行？补抓一遍（StartRetryPass），收尾顺延到那一轮
+                         └► 收尾：挂下一拍自动抓取
+                              └► FlushNotifications()  攒下的通知合成一条，交给 notifier
 ```
 
 - **配置读一次就存在 `MainWindow.config` 里**（`__init__` 里的 `config.load_config()`），
@@ -185,6 +187,13 @@ data/watchlist.txt
     已经抓到的结果保留在表格和缓存里。
   - 相邻请求之间按 `poll_interval_seconds` 睡，单个商品失败后按 `retry_interval_seconds`
     等一会儿重试 1 次；重试仍失败只影响这一件，其余照抓。
+  - **一轮跑完，失败的那几件再补抓一遍**（`StartRetryPass`）：单条那次重试是**背靠背**
+    发出去的，网络抖一下两次一起撞上就整轮挂着失败；跑完一轮再从头抓这几件，中间隔着
+    几十秒起步，捞回来的概率大得多。补抓也是一个 `PollerThread`，只装失败的那几行，
+    进度显示「补抓失败的商品 3/5」，收尾（挂下一拍自动抓取、发通知、弹总结）留给补抓
+    跑完的那一次——`OnPollFinished` 里起跑成功就直接 return。**只补一轮**，失败数按补抓
+    之后的结果现算（`run_failed_rows`），总结那句「其中 N 件查询失败」才对得上；中途
+    「停止抓取」的那轮不补，用户要的就是停下。
   - 一轮正常抓完 emit 结束信号，主线程弹抓取总结：这一轮抓了多少件、花了多久，
     再加上涨跌 / 新成交 / 到价三块明细。**中途停止的那一轮不弹**
     （只抓了一半，拿半份数据当总结容易让人以为其余商品都没变）。
