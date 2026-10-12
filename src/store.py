@@ -38,7 +38,29 @@ ITEM_COLUMNS = (
                                     # 不改高；是缓存里唯一一条"重抓补不回来"的记录
     ("deals_json", "TEXT"),         # 上次抓到的近 N 条成交（JSON 数组）
     ("deals_updated_at", "TEXT"),   # 上面那组成交是什么时候抓的
+    # 上次「确认」时这行是什么样子（见 acknowledge / init_ack_if_empty，界面上那块
+    # 「自上次确认以来」拿它当基准）。跟 favorite 一样是**用户意图**：抓取一个字都
+    # 不碰——upsert_item 的列清单里没有这几列，只有确认那两处会写。
+    # 它一直是"跨越几轮攒变化"的那根基线，所以只写不读的老库补列对它毫无影响：
+    # 补出来是空的，就等于"这件还没确认过"，累积从下一次确认重新起算
+    ("ack_price_text", "TEXT"),     # 确认时的现价原文
+    ("ack_price_value", "REAL"),    # 上面那个的数值（app 算好传进来，
+                                    # 保持 store 不 import parser 的单向依赖）
+    ("ack_sold_out", "INTEGER"),    # 确认时是不是售罄（0/1）
+    ("ack_lowest_price", "TEXT"),   # 确认时的史低价（留个"确认时贵不贵"的底）
+    ("ack_deals_json", "TEXT"),     # 确认时的成交快照（跟 deals_json 同格式）
+    ("ack_at", "TEXT"),             # 这行的基线是什么时候记下的。空 = 还没确认过
 )
+
+# settings 表里写一行的 SQL。set_setting 和 acknowledge 都要用：确认得把"确认时刻"
+# 跟那一组基线放进**同一个事务**，不能借道 set_setting——它自带一个 `with self.conn:`，
+# 嵌在外层事务里会先把外层提交掉，正好破坏了"要么全成、要么全不动"。
+_SETTING_SQL = """INSERT INTO settings (key, value) VALUES (?, ?)
+                  ON CONFLICT(key) DO UPDATE SET value = excluded.value"""
+
+# 「上次确认是什么时候」记在 settings 里（值见 acknowledge）。它是全局一个时刻，
+# 不是按商品记的：确认的语义就是"这一屏我都看过了"
+ACK_AT_SETTING = "last_ack_at"
 
 
 class Store:
@@ -336,6 +358,104 @@ class Store:
                 ),
             )
 
+    def acknowledge(self, entries, at):
+        """把一组商品的确认基线刷成给的值，并把全局确认时刻记进 settings。
+
+        entries 为 [(cluster_id, price_text, price_value, sold_out, lowest_price,
+        deals_json)]，一个事务写完——写一半会留下"这行的基线新、那行的基线旧"，
+        之后的累积报告就开始胡说。
+
+        deals_json 沿用 _deals_json 的格式（app 直接把缓存里那格原文递进来），
+        省得两处各写一套序列化。价格那一段认不出数字时给 None：基线里没有数值，
+        累积那边就退化成"不比"，总好过拿猜出来的数当基准。
+
+        跟 set_favorite 同一类：这是用户意图，抓取一个字都不碰它（见 upsert_item
+        的列清单）。区别在于确认是**全局**的——一次把所有行的基线一起挪到当前，
+        不做逐件确认（见 app.OnAcknowledge）。
+        """
+        self._begin()
+        at = _clean_cached_text(at)
+        if at is None:
+            self._note("确认时刻不合法，已跳过基线写入")
+            return
+        rows = []
+        for entry in entries or []:
+            if not isinstance(entry, (tuple, list)) or len(entry) != 6:
+                self._note("确认基线里的条目形状不对，已跳过")
+                continue
+            cluster_id = _clean_id(entry[0])
+            if cluster_id is None:
+                self._note("确认基线里的 clusterId 不合法，已跳过")
+                continue
+            _, price_text, price_value, sold_out, lowest_price, deals_json = entry
+            rows.append(
+                (
+                    _clean_cached_text(price_text),
+                    _clean_amount(price_value),
+                    int(bool(sold_out)),
+                    _clean_cached_text(lowest_price),
+                    _snapshot_json(deals_json),
+                    at,
+                    cluster_id,
+                )
+            )
+
+        with self.conn:
+            for row in rows:
+                self.conn.execute(
+                    """UPDATE items
+                          SET ack_price_text   = ?,
+                              ack_price_value  = ?,
+                              ack_sold_out     = ?,
+                              ack_lowest_price = ?,
+                              ack_deals_json   = ?,
+                              ack_at           = ?
+                        WHERE cluster_id = ?""",
+                    row,
+                )
+            # 全局那个时刻跟这组基线同进同出：只写了基线没写时刻（或反过来），
+            # 顶部那句「已确认 · 3 小时前」就会指着一次并不完整的确认
+            self.conn.execute(_SETTING_SQL, (ACK_AT_SETTING, at))
+
+    def init_ack_if_empty(self, cluster_id, price_text, price_value, sold_out,
+                          lowest_price, deals=None):
+        """首次观察到某商品时记一份基线；已经有基线就一个字节都不动。
+
+        跟 acknowledge 的分工有两处：这里只写**还没有基线**的行（WHERE 里判
+        ack_at 为空，同一轮里同一商品也只该走一次），而且不碰全局的 last_ack_at
+        ——用户什么也没确认过，顶部那句该停在「尚未确认」，不该因为刚加了件商品
+        就变成「已确认」。
+
+        记下第一次抓到的样子，是为了下一轮有"相对什么"可比（见 app.BuildAckSummary）：
+        首次观察本身不算一条变化，这跟 price_change 那边"第一次抓到不报涨跌"
+        是同一条规矩。
+        """
+        self._begin()
+        cluster_id = _clean_id(cluster_id)
+        if cluster_id is None:
+            self._note("首次观察的 clusterId 不合法，已跳过基线写入")
+            return
+        with self.conn:
+            self.conn.execute(
+                """UPDATE items
+                      SET ack_price_text   = ?,
+                          ack_price_value  = ?,
+                          ack_sold_out     = ?,
+                          ack_lowest_price = ?,
+                          ack_deals_json   = ?,
+                          ack_at           = ?
+                    WHERE cluster_id = ? AND (ack_at IS NULL OR ack_at = '')""",
+                (
+                    _clean_cached_text(price_text),
+                    _clean_amount(price_value),
+                    int(bool(sold_out)),
+                    _clean_cached_text(lowest_price),
+                    _snapshot_json(deals),
+                    _now(),
+                    cluster_id,
+                ),
+            )
+
     def set_favorite(self, cluster_id: str, favorite):
         """手动打 / 取消收藏（items.favorite 存 0/1）。
 
@@ -382,11 +502,7 @@ class Store:
             self._note("设置的键值不合法，已跳过写入")
             return
         with self.conn:
-            self.conn.execute(
-                """INSERT INTO settings (key, value) VALUES (?, ?)
-                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
-                (key, str(value)),
-            )
+            self.conn.execute(_SETTING_SQL, (key, str(value)))
 
 
 def _now() -> str:
@@ -440,6 +556,29 @@ def _clean_count(value):
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         return None
     return value
+
+
+def _clean_amount(value):
+    """确认基线里的价格数值（REAL 列）：认得出的数字才写，其余按"没记下"处理。
+
+    跟别处一样不猜：认不出来的就存 NULL，判定那边（见 app.ack_change）据此退化成
+    "不比"。bool 是 int 的子类，得单独挡掉，别让 True 变成 1.0。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _snapshot_json(value):
+    """确认基线里那组成交：给列表就按标准格式序列化，给文本就照用。
+
+    两条路都是调用方那边就定下来的形状——acknowledge 递的是缓存里 deals_json
+    那格原文（原样搬过来，不必解析再拼一遍），init_ack_if_empty 递的是这次抓到的
+    成交列表。合在一处，省得每个调用点各判一次。
+    """
+    if isinstance(value, list):
+        return _deals_json(value)
+    return _clean_cached_text(value)
 
 
 def _deals_json(deals):

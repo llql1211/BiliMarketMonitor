@@ -1,5 +1,6 @@
 """store 的回归测试：建表、sync 语义、upsert 保留旧值、排序与设置读写。"""
 
+import json
 import sqlite3
 
 import pytest
@@ -768,4 +769,209 @@ def test_old_db_without_deal_columns_is_upgraded(db):
     assert st.cached_deals("1001") == ([], None)
     st.upsert_item("1001", "甲", None, price_text="¥44", deals=[{"price": "¥205", "time": "刚刚"}])
     assert st.cached_deals("1001")[0] == [{"price": "¥205", "time": "刚刚"}]
+    assert st.notes == []
+
+
+# ---------------- 累积确认 ----------------
+#
+# ack_* 那几列跟 favorite 是同一类：用户意图，抓取一个字都不碰。写进去的路有两条
+# ——用户按「确认」（acknowledge，一次把所有行刷到当前）和首次观察到某商品
+# （init_ack_if_empty，只写还没有基线的行）。两条都得落库：攒的是"跨多少轮、
+# 跨多少次重启都还在"的变化（见 app.BuildAckSummary）。
+
+
+ACK_AT = "2026-10-12T10:30:00"
+
+
+def _baseline(price_text="¥44", price_value=44.0, sold_out=False, lowest="¥44", deals=None):
+    """acknowledge 收的一行（不含 cluster_id），跟 app.OnAcknowledge 拼的形状一致。"""
+    return (price_text, price_value, sold_out, lowest, deals)
+
+
+def test_ack_columns_are_empty_on_a_new_row(db):
+    """建表时就有 ack_* 那几列；新行全是空，等于"还没确认过"（老库补列也是这个状态）。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", None, price_text="¥44")
+
+    row = st.get_item("1001")
+    for column in ("ack_price_text", "ack_price_value", "ack_sold_out",
+                   "ack_lowest_price", "ack_deals_json", "ack_at"):
+        assert row[column] is None
+
+
+def test_acknowledge_writes_the_whole_baseline(db):
+    """确认把这组商品的样子和全局时刻一起写下去：价格、数值、售罄、史低、成交、时刻。"""
+    st = store.Store(db)
+    st.sync([("1001", "甲")])
+    st.acknowledge(
+        [("1001", *_baseline(deals=[{"price": "¥44", "time": "1小时前"}]))], ACK_AT
+    )
+
+    row = st.get_item("1001")
+    assert (row["ack_price_text"], row["ack_price_value"]) == ("¥44", 44.0)
+    assert row["ack_sold_out"] == 0
+    assert row["ack_lowest_price"] == "¥44"
+    assert json.loads(row["ack_deals_json"]) == [{"price": "¥44", "time": "1小时前"}]
+    assert row["ack_at"] == ACK_AT
+    assert st.get_setting(store.ACK_AT_SETTING) == ACK_AT  # 顶部那句「已确认」看它
+
+
+def test_acknowledge_remembers_a_sold_out_row(db):
+    """售罄记成 1：累积那边拿它判"确认之后又上架了"。"""
+    st = store.Store(db)
+    st.sync([("1001", "甲")])
+    st.acknowledge([("1001", *_baseline("¥138", 138.0, True))], ACK_AT)
+
+    row = st.get_item("1001")
+    assert row["ack_sold_out"] == 1
+    assert row["ack_price_value"] == 138.0
+
+
+def test_acknowledge_without_a_number_stores_none(db):
+    """认不出数字就存 NULL：基线里没有数值，累积那边退化成"不比"，不拿猜的数当基准。"""
+    st = store.Store(db)
+    st.sync([("1001", "甲")])
+    st.acknowledge([("1001", *_baseline("暂无报价", None))], ACK_AT)
+
+    row = st.get_item("1001")
+    assert row["ack_price_text"] == "暂无报价"  # 原文照留，好原样显示
+    assert row["ack_price_value"] is None
+
+
+def test_acknowledge_is_one_transaction(db):
+    """写一半炸了整笔回滚：留下半新半旧的基线，之后的累积报告就开始胡说。
+
+    触发器让第二行炸——第一行那时候已经写进去了，要验的正是它也一起滚掉；
+    全局时刻跟基线同进同出，也不许留下。
+    """
+    st = store.Store(db)
+    st.sync([("1001", "甲"), ("1002", "乙")])
+    with st.conn:
+        st.conn.execute(
+            """CREATE TRIGGER ack_boom BEFORE UPDATE OF ack_price_text ON items
+               WHEN NEW.cluster_id = '1002'
+               BEGIN SELECT RAISE(ABORT, '写不进去'); END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        st.acknowledge(
+            [("1001", *_baseline()), ("1002", *_baseline("¥50", 50.0))], ACK_AT
+        )
+
+    assert st.conn.in_transaction is False
+    assert st.get_item("1001")["ack_at"] is None
+    assert st.get_item("1002")["ack_at"] is None
+    assert st.get_setting(store.ACK_AT_SETTING) is None
+
+
+def test_acknowledge_skips_unusable_entries(db):
+    """形状不对、clusterId 不合法的条目跳过并各留一句提示，其余照写。"""
+    st = store.Store(db)
+    st.sync([("1001", "甲")])
+
+    st.acknowledge([("1001",), ("没编号", *_baseline()), ("1001", *_baseline())], ACK_AT)
+
+    assert len(st.notes) == 2
+    assert st.get_item("1001")["ack_at"] == ACK_AT
+
+
+def test_acknowledge_refuses_a_missing_moment(db):
+    """确认时刻认不出来就整笔不写：基线跟时刻得成对，缺一个就说不出"从哪儿算起"。"""
+    st = store.Store(db)
+    st.sync([("1001", "甲")])
+
+    st.acknowledge([("1001", *_baseline())], "   ")
+
+    assert st.notes and "确认时刻" in st.notes[0]
+    assert st.get_item("1001")["ack_at"] is None
+    assert st.get_setting(store.ACK_AT_SETTING) is None
+
+
+def test_upsert_item_does_not_touch_the_ack_baseline(db):
+    """抓取结果里没有"确认基线"这一项：upsert 一个字都不许动它（同 favorite 那条规矩）。"""
+    st = store.Store(db)
+    st.sync([("1001", "甲")])
+    st.acknowledge([("1001", *_baseline())], ACK_AT)
+
+    st.upsert_item("1001", "甲", "img", price_text="¥38", lowest_price="¥38",
+                   deals=[{"price": "¥38", "time": "刚刚"}])
+
+    row = st.get_item("1001")
+    assert row["price_text"] == "¥38"      # 抓来的照写
+    assert row["ack_price_text"] == "¥44"  # 基线一动不动
+    assert row["ack_sold_out"] == 0
+    assert row["ack_lowest_price"] == "¥44"
+    assert row["ack_at"] == ACK_AT
+    assert st.get_setting(store.ACK_AT_SETTING) == ACK_AT
+
+
+def test_init_ack_if_empty_records_the_first_sight(db):
+    """首次抓到某商品时记一份基线，好让下一轮有"相对什么"可比。"""
+    st = store.Store(db)
+    st.sync([("1001", "甲")])
+
+    st.init_ack_if_empty("1001", "¥44", 44.0, False, "¥44",
+                         deals=[{"price": "¥205", "time": "刚刚"}])
+
+    row = st.get_item("1001")
+    assert (row["ack_price_text"], row["ack_price_value"]) == ("¥44", 44.0)
+    assert row["ack_lowest_price"] == "¥44"
+    assert json.loads(row["ack_deals_json"]) == [{"price": "¥205", "time": "刚刚"}]
+    assert row["ack_at"]  # 记下"这行基线是什么时候写的"，成交那边才算得出隔了多久
+
+
+def test_init_ack_if_empty_never_overwrites(db):
+    """已经有基线就一个字节都不动——每轮都刷成当前的话，累积永远是空的。"""
+    st = store.Store(db)
+    st.sync([("1001", "甲")])
+    st.acknowledge([("1001", *_baseline())], ACK_AT)
+
+    st.init_ack_if_empty("1001", "¥1", 1.0, False, "¥1")
+
+    row = st.get_item("1001")
+    assert (row["ack_price_text"], row["ack_price_value"], row["ack_at"]) == (
+        "¥44", 44.0, ACK_AT,
+    )
+
+
+def test_init_ack_if_empty_leaves_the_global_moment_alone(db):
+    """首次观察不是确认：全局时刻不动，顶部那句该停在「尚未确认」。"""
+    st = store.Store(db)
+    st.sync([("1001", "甲")])
+
+    st.init_ack_if_empty("1001", "¥44", 44.0, False, "¥44")
+
+    assert st.get_setting(store.ACK_AT_SETTING) is None
+
+
+def test_init_ack_if_empty_rejects_a_bad_id(db):
+    """编号不合法就跳过并留一句提示。"""
+    st = store.Store(db)
+
+    st.init_ack_if_empty("没编号", "¥44", 44.0, False, "¥44")
+
+    assert st.notes
+
+
+def test_old_db_without_ack_columns_is_upgraded(db):
+    """老库打开时自动补上 ack_* 那几列，老行算"还没确认过"，接着就能记基线。"""
+    conn = sqlite3.connect(db)
+    with conn:
+        conn.execute(
+            """CREATE TABLE items (
+                   cluster_id TEXT PRIMARY KEY,
+                   name       TEXT,
+                   image_url  TEXT,
+                   updated_at TEXT
+               )"""
+        )
+        conn.execute("INSERT INTO items VALUES ('1001', '甲', 'img', '2024-01-01T00:00:00')")
+    conn.close()
+
+    st = store.Store(db)
+    assert st.get_item("1001")["ack_at"] is None
+
+    st.init_ack_if_empty("1001", "¥44", 44.0, False, "¥44")
+
+    assert st.get_item("1001")["ack_price_text"] == "¥44"
     assert st.notes == []
