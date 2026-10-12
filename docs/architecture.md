@@ -369,6 +369,22 @@ data/watchlist.txt
   取 `0.0` 的话，开机头一分钟里启动程序，第一次推送会被自己的限流挡掉——而边沿只发生一次，
   挡掉就是永远错过。测试 `test_first_push_is_not_throttled_by_uptime` 盯着这条。
 
+**上一次总结留一份**（`app.ShowSummary` / `app.OnShowLastSummary`）
+
+一轮正常跑完弹总结时，顺手把 `run_changes` / `run_deals` / `run_targets` /
+`run_total` / `run_failures` / `run_elapsed` 这一组引用整体留一份到
+`MainWindow.last_summary` 里，供顶部「查看上次总结」按钮再弹出来。
+
+- **只留一份，不做栈**：用户要的是"刚才那轮"，回溯更远的去看表格就行。
+  下一轮正常跑完时会整体替换掉这一份，没有清理逻辑，也不占地方。
+- **只在那条会弹窗口的路径上录**：中途「停止抓取」不弹总结（半份数据当
+  总结会误导），也就**不覆盖** `last_summary`——用户之前看过的那轮还在。
+- **引用而不是拷贝**：`StartFetch()` 里那几个字段是整段重新赋值的（`self.run_changes = []`），
+  旧列表整体被搁置，不会因为下一轮清空字段就跟着变空。
+- **主题切换跟着走**：`SwitchTheme` 里那一句 `summary_dialog.SetDark(...)`
+  已经覆盖到按「查看上次总结」弹出的那个窗口，因为 `summary_dialog` 始终
+  指向当前打开的那一个。
+
 **画格子的时机**：抓取开始时把价格清成 `--`，刷到哪行填哪行，一眼能看出进度。
 `PENDING_TEXT`、`NO_DATA_TEXT`、`CLEARED_TEXT`、`FAILED_TEXT` 几个占位符在 `app.py` 顶部。
 
@@ -490,6 +506,7 @@ pixi run shot           # 出图在 tmp/out/，每个场景深色/浅色各一�
 | 设置改完"当场生效"的范围 | `app.ApplyConfig()`：启动时算好存下来的那几处都在里头（高亮秒数与画刷、两处提示、自动抓取定时器） |
 | 缓存要多存一个字段 | `store.ITEM_COLUMNS`，老库由 `_ensure_item_columns()` 自动补列 |
 | 成交判「新增」的算法 | `app.new_deals()` / `_aged_from()` |
+| 「查看上次总结」按钮、快照留多久 | `app.ShowSummary()` / `app.OnShowLastSummary()` / `app._OpenSummaryDialog()`；顶部按钮在 `InitUI()` 的 `info_bar` 里 |
 | 史低价的只降不升规则 | `app.updated_lowest()` / `at_lowest()`；存的那一列在 `store.ITEM_COLUMNS` |
 | 清单接受的写法 | `links.parse_line()` / `_split_fields()` |
 | 收藏的写回、回滚与星标 | 交互在 `app.ToggleFavorite()`；清单那段在 `links.parse_line()` / `_strip_favorite()`，缓存那列由 `store.sync()` / `set_favorite()` 写，星标颜色在 `theme.favorite_color()` |

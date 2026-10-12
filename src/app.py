@@ -223,6 +223,14 @@ ADD_PLACEHOLDER = "粘贴商品 ID 或分享链接，一行一个…"
 
 # 一轮抓取跑完后的总结窗口（见 SummaryDialog）
 SUMMARY_TITLE = "本轮抓取总结"
+# 顶部信息栏里那个「查看上次总结」：关了窗口还能看回来（见 OnShowLastSummary）。
+# 文案两处说同一件事——用户第一眼看到的是悬停提示
+LAST_SUMMARY_TEXT = "查看上次总结"
+LAST_SUMMARY_TIP = (
+    "重新打开最近一次正常跑完的抓取总结\n"
+    "只记最近的一份；再跑一轮就被替换掉了\n"
+    "还没跑过一轮时按钮是灰的"
+)
 NO_CHANGE_TEXT = "本次没有变化"
 CHANGE_UP, CHANGE_DOWN = "up", "down"
 CHANGE_SOLD_OUT, CHANGE_ON_SALE = "sold_out", "on_sale"
@@ -1578,6 +1586,9 @@ class MainWindow(QMainWindow):
         self.run_paused_at = None
         self.run_elapsed = 0.0   # 收尾时算好存下来：总结窗口换主题重渲染时要拿它
         self.summary_dialog = None  # 最近一次弹的总结窗口，切主题时要跟着重画
+        # 最近一次正常跑完的总结快照（见 ShowSummary / OnShowLastSummary）。
+        # 只留一份，不做栈：用户要的是「刚才那轮」，回溯更远的靠表格即可
+        self.last_summary = None
         self.image_fetcher = ImageFetcher()  # 缩略图：key 是行号
         self.image_fetcher.fetched.connect(self.OnImageFetched)
         # 双击放大：另起一个 fetcher，因为它的 key 是预览请求号而不是行号。
@@ -1645,10 +1656,18 @@ class MainWindow(QMainWindow):
         self.auto_poll_label = QLabel()
         self.auto_poll_label.setToolTip(AUTO_POLL_LABEL_TIP)
         self.UpdateAutoPollLabel()
+        # 「查看上次总结」也搁这一行：按钮行已经有七个按钮，再加一个就顶到默认窗口
+        # 宽度（那一行单是按钮就 1265px，见 test_updated_label_does_not_widen_the_window），
+        # 而这一行除掉两截文字还空着大半
+        self.btn_last_summary = QPushButton(LAST_SUMMARY_TEXT)
+        self.btn_last_summary.setToolTip(LAST_SUMMARY_TIP)
+        self.btn_last_summary.setEnabled(False)  # 有快照才点亮，见 ShowSummary
+        self.btn_last_summary.clicked.connect(self.OnShowLastSummary)
         info_bar = QHBoxLayout()
         info_bar.addWidget(self.updated_label)
         info_bar.addStretch()
         info_bar.addWidget(self.auto_poll_label)
+        info_bar.addWidget(self.btn_last_summary)
         layout.addLayout(info_bar)
 
         # 顶部按钮行
@@ -2967,17 +2986,44 @@ class MainWindow(QMainWindow):
         只在正常跑完时弹：中途「停止抓取」那一轮只抓了一半，拿半份数据当
         "总结"很容易让人以为其余商品没变化——那种情况该看的是表格里的「--」。
         """
+        # 录一份快照：用户关了窗口之后还能按「查看上次总结」看回来。
+        # 引用整份列表而不是逐项拷贝：StartFetch() 重新赋值 run_changes 等
+        # 字段时，这一份指向的旧列表依然在（见 __init__ 里那组字段的说明）
+        self.last_summary = {
+            "changes": self.run_changes,
+            "deals": self.run_deals,
+            "targets": self.run_targets,
+            "total": self.run_total,
+            "failures": self.run_failures,
+            "elapsed": self.run_elapsed,
+        }
+        self.btn_last_summary.setEnabled(True)
+        self._OpenSummaryDialog(self.last_summary)
+
+    def OnShowLastSummary(self):
+        """按下「查看上次总结」：拿最近一份快照再弹一次。"""
+        if self.last_summary is None:
+            return  # 按钮本来是灰的，这条是防御性的一行
+        self._OpenSummaryDialog(self.last_summary)
+
+    def _OpenSummaryDialog(self, snapshot):
+        """按一份总结快照弹窗口；已经在看的先关掉。
+
+        只造窗口，不录快照——录快照是 ShowSummary 的事。两件事拆开是为了让
+        「查看上次总结」不顺手把自己又写成一份新快照：内容虽然一样，但那样
+        「最近一份」就有了两个来源，往后谁覆盖谁就得靠人去推。
+        """
         if self.summary_dialog is not None:
             self.summary_dialog.close()
             # 上一份还没关就换掉，顺手回收；留着引用会越堆越多
             self.summary_dialog.deleteLater()
         self.summary_dialog = SummaryDialog(
-            self.run_changes,
-            self.run_deals,
-            self.run_targets,
-            self.run_total,
-            self.run_failures,
-            self.run_elapsed,
+            snapshot["changes"],
+            snapshot["deals"],
+            snapshot["targets"],
+            snapshot["total"],
+            snapshot["failures"],
+            snapshot["elapsed"],
             self.dark,
             self,
         )

@@ -2051,6 +2051,91 @@ def test_summary_keeps_its_colors_when_the_theme_toggles(window):
     assert theme.PRICE_DOWN_COLOR_DARK in w.summary_dialog.detail.toHtml().lower()
 
 
+# ---------------- 查看上次总结 ----------------
+
+
+def test_last_summary_button_disabled_before_first_run(window):
+    """还没跑过任何一轮时，按钮是灰的，点了也不弹。"""
+    w = window("10000008780\n")
+
+    assert not w.btn_last_summary.isEnabled()
+    w.btn_last_summary.click()  # 不该弹、也不该崩
+
+    assert w.summary_dialog is None
+
+
+def test_closed_summary_can_be_opened_again(window, monkeypatch, wait_until):
+    """跑完一轮 -> 按钮点亮 -> 关掉窗口 -> 按回来还是同一份内容。"""
+    w = window("10000008780 | 甲\n")
+    _seed_cache(w, price="¥50")  # 甲：50 -> 44
+    w.LoadWatchlist(w.watchlist_path)
+    monkeypatch.setattr(
+        client, "fetch_cluster", _fetch_by_id({"10000008780": raw_ok(name="甲", price="¥44")})
+    )
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
+
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+
+    assert w.btn_last_summary.isEnabled()
+    snapshot = w.last_summary
+    w.summary_dialog.close()
+    assert w.summary_dialog is not None  # 只是 close，不是 deleteLater
+
+    w.btn_last_summary.click()  # 等价于 OnShowLastSummary
+
+    assert w.last_summary is snapshot  # 快照没被这一按覆盖
+    assert w.summary_dialog is not None
+    assert w.summary_dialog.headline.text() == "本次 1 项：降价 1"
+
+
+def test_stopped_run_keeps_the_last_summary(window, monkeypatch, wait_until):
+    """中途「停止抓取」那一轮不录快照：上一轮看过的那份还在，按回去看到的是它。"""
+    w = window("10000008780 | 甲\n")
+    _seed_cache(w, price="¥50")
+    w.LoadWatchlist(w.watchlist_path)
+    monkeypatch.setattr(
+        client, "fetch_cluster", _fetch_by_id({"10000008780": raw_ok(name="甲", price="¥44")})
+    )
+    monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
+
+    w.OnFetchPrices()
+    assert _wait_run(w, wait_until)
+    saved = w.last_summary
+
+    # 第二轮抓到一半按了「停止抓取」：收尾照走，只是不弹总结、也不录快照。
+    # 这一轮真的抓到过一条涨价——免得断言其实是在验「什么都没发生」
+    w.run_changes = [
+        {"kind": "up", "name": "甲", "old_price": "¥44", "new_price": "¥50",
+         "delta": "↑6", "change": 6}
+    ]
+    w.poller_stopped = True
+    w.SetBusy(True)
+
+    w.OnPollFinished()
+
+    assert w.last_summary is saved
+    w.OnShowLastSummary()
+    assert w.summary_dialog.headline.text() == "本次 1 项：降价 1"  # 不是那一轮的「涨价」
+
+
+def test_last_summary_button_does_not_widen_the_window(window):
+    """按钮加在顶部信息栏，不该把窗口的最小宽度顶上去（同 updated_label 那条规矩）。
+
+    不写死像素，只比「有按钮」和「没按钮」的差：信息栏里本来就有那段 Stretch 接着它，
+    所以两下算出来的最小宽度该是一样的；挤不下时多出来的那截会落到最小宽度上，
+    这台机器上过不了的东西在别人那儿更过不了。
+    """
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+    with_button = w.minimumSizeHint().width()
+
+    w.btn_last_summary.setVisible(False)
+    without_button = w.minimumSizeHint().width()
+
+    assert with_button == without_button
+
+
 # ---------------- 自动抓取 ----------------
 #
 # 定时器是单次触发的，每轮收尾重挂（见 ScheduleAutoPoll）。所以用例都不等真定时器
