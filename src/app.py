@@ -19,7 +19,6 @@ import time
 import webbrowser
 from datetime import datetime
 
-import requests
 from PyQt5.QtCore import (
     QEvent,
     QObject,
@@ -71,6 +70,7 @@ from PyQt5.QtWidgets import (
 import client
 import config
 import links
+import net
 import notifier
 import parser
 import settings
@@ -79,6 +79,7 @@ import theme
 
 IMAGE_SIZE = 96  # 缩略图边长（配合 CDN 裁剪后缀减小流量）
 IMAGE_SUFFIX = f"@{IMAGE_SIZE}w_{IMAGE_SIZE}h_85q.webp"
+IMAGE_TIMEOUT = 10  # 单张图等多久算失败（拉图不重试：留白总比卡着强）
 
 # 双击缩略图看的大图：原图是 1280x1280、动辄 1MB 出头，720w 有 60 多 KB，
 # 铺满默认大小的预览窗口（约 860）正合适，再往上放大才见糊
@@ -1151,8 +1152,8 @@ class ImageFetcher(QObject):
     def _work(self, key, url):
         pixmap = QPixmap()
         try:
-            req = requests.get(url, timeout=10)
-            pixmap.loadFromData(req.content)
+            # 走 net：同一线程里连着拉的这几张共用一条连接，不必每张都重握手
+            pixmap.loadFromData(net.get(url, timeout=IMAGE_TIMEOUT))
         except Exception:
             pass  # 拿不到就当空图，统一走下面的失败分支
         if pixmap.isNull():

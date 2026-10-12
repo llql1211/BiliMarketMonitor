@@ -193,13 +193,19 @@ def window(qapp, data_files):
 
 @pytest.fixture(autouse=True)
 def _offline(monkeypatch):
-    """禁用真实网络：requests 一律失败（调用方按各自的错误路径处理）。"""
+    """禁用真实网络：requests 一律失败（调用方按各自的错误路径处理）。
+
+    三处都堵：``requests.get`` / ``requests.post`` 挡住直连的写法，
+    ``Session.request`` 挡住经 net.py 复用连接的那条路（程序的正式写法）。
+    只堵前两个的话，改走 Session 的代码照样能溜出去联网。
+    """
 
     def _blocked(*args, **kwargs):
         raise requests.ConnectionError("测试中已禁用网络")
 
     monkeypatch.setattr(requests, "get", _blocked)
     monkeypatch.setattr(requests, "post", _blocked)
+    monkeypatch.setattr(requests.Session, "request", _blocked)
 
 
 @pytest.fixture(autouse=True)

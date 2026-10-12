@@ -13,6 +13,8 @@ import math
 
 import requests
 
+import net
+
 API_URL = "https://mall.bilibili.com/mall-search-items/items_detail/cluster_info"
 
 DEFAULT_TIMEOUT = 10.0
@@ -40,7 +42,9 @@ def fetch_cluster(cluster_id: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
         raise ApiError(f"clusterId 不合法（{raw_id!r}），已跳过请求")
 
     try:
-        resp = requests.post(
+        # 走 net：同一个线程里连着发的这一轮共用一条连接，不必每条都重握手
+        # （一轮几百条，一抖就是几十秒的差别，见 net.py 开头）
+        resp = net.post(
             API_URL,
             json={"clusterId": cluster_id},
             headers=_HEADERS,

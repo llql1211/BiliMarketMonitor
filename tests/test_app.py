@@ -9,7 +9,6 @@ import time
 from datetime import datetime, timedelta
 
 import pytest
-import requests
 from PyQt5.QtCore import (
     QEvent,
     QMimeData,
@@ -45,6 +44,7 @@ import app as app_module
 import client
 import config
 import links
+import net
 import notifier
 import parser
 import settings
@@ -4318,7 +4318,7 @@ def test_image_fetcher_emits_downloaded_pixmap(qapp, png_bytes, wait_until, monk
     class _Resp:
         content = png_bytes
 
-    monkeypatch.setattr(requests, "get", lambda url, timeout=None: _Resp())
+    monkeypatch.setattr(net, "get", lambda url, timeout=None: _Resp().content)
     fetcher = app_module.ImageFetcher()
     got = []
     fetcher.fetched.connect(lambda row, pixmap: got.append((row, pixmap)))
@@ -4332,7 +4332,7 @@ def test_image_fetcher_emits_downloaded_pixmap(qapp, png_bytes, wait_until, monk
 
 
 def test_image_fetcher_survives_download_failure(qapp, wait_until):
-    """下载失败（conftest 已把 requests.get 换成抛 ConnectionError）时静默放弃。"""
+    """下载失败（conftest 已把网络堵死）时静默放弃。"""
     fetcher = app_module.ImageFetcher()
     got = []
     fetcher.fetched.connect(lambda row, pixmap: got.append(row))
@@ -4364,7 +4364,7 @@ def test_image_fetcher_reports_a_response_that_is_not_an_image(
     class _Resp:
         content = b"<html>not an image</html>"
 
-    monkeypatch.setattr(requests, "get", lambda url, timeout=None: _Resp())
+    monkeypatch.setattr(net, "get", lambda url, timeout=None: _Resp().content)
     fetcher = app_module.ImageFetcher()
     failed = []
     fetcher.failed.connect(failed.append)

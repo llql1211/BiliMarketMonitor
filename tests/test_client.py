@@ -8,6 +8,7 @@ import pytest
 import requests
 
 import client
+import net
 
 
 class FakeResponse:
@@ -26,10 +27,10 @@ class FakeResponse:
 
 @pytest.fixture
 def posted(monkeypatch):
-    """替换 requests.post，返回 (调用记录, 可控状态)。
+    """替换 net.post，返回 (调用记录, 可控状态)。
 
-    conftest 的 _offline 已把 requests.post 换成抛 ConnectionError，
-    这里再 patch 一次即覆盖之。
+    conftest 的 _offline 已把 requests 那条路堵死，这里再 patch 一次即覆盖之
+    （client 现在走 net.post，不再直接 requests.post，见 net.py）。
     """
     calls = []
     state = {"response": FakeResponse(), "error": None}
@@ -40,7 +41,7 @@ def posted(monkeypatch):
             raise state["error"]
         return state["response"]
 
-    monkeypatch.setattr(requests, "post", _post)
+    monkeypatch.setattr(net, "post", _post)
     return calls, state
 
 
