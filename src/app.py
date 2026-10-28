@@ -243,7 +243,7 @@ ADD_PLACEHOLDER = "粘贴商品 ID 或分享链接，一行一个…"
 
 # 一轮抓取跑完后的总结窗口（见 SummaryDialog）
 SUMMARY_TITLE = "本轮抓取总结"
-# 总结里的商品名是链接：点一下关掉报告、跳回表格里那件商品（见 OnSummaryItemClicked）。
+# 总结里的商品名是链接：点一下跳回表格里那件商品，报告留着（见 OnSummaryItemClicked）。
 # 用自定义 scheme，免得跟真链接混在一起；主窗口只认这一种前缀
 SUMMARY_ITEM_SCHEME = "bmm-item"
 SUMMARY_ITEM_MISSING_TEXT = "这件商品已经不在清单里了"
@@ -1588,9 +1588,9 @@ class SummaryDialog(QDialog):
     不开模态（和看图那个窗口同理）：总结是"看一眼"的东西，读的时候顺手点点
     表格、打开个详情页都很自然，没必要把主窗口锁住。
 
-    明细里的商品名可点（见 `_name_html`）：点了发 `name_clicked`，由主窗口关掉
-    这份报告、把表格滚到那一件并选中它。窗口自己不做跳转——它不认识 MainWindow，
-    跟「确认」按钮同一个分工。
+    明细里的商品名可点（见 `_name_html`）：点了发 `name_clicked`，由主窗口把表格
+    滚到那一件并选中它。报告不关，方便接着点别的条目。窗口自己不做跳转——它不
+    认识 MainWindow，跟「确认」按钮同一个分工。
 
     什么都没有时也照样弹（用户要的是每轮都有个收尾交代），此时藏掉明细那块空框。
     """
@@ -3610,10 +3610,10 @@ class MainWindow(QMainWindow):
         self.summary_dialog.show()
 
     def OnSummaryItemClicked(self, cluster_id):
-        """总结里点了商品名：关掉报告，把表格滚到那一件并选中。
+        """总结里点了商品名：保留报告，把表格滚到那一件并选中。
 
-        先关窗口再跳：报告是浮在表格上面的，不关掉的话"跳过去"的那一行正好被它
-        挡着。报告本身没丢——顶部「查看上次总结」还能调出来。
+        报告不关：用户可能还要接着看别的条目，关掉就得重新点「查看上次总结」。
+        这里只把主窗口提到前面、选中那一行；报告是独立窗口，挡着了可以自己挪开。
 
         报告里的商品可能已经被删了（先开着报告、再去删清单里那一行），那种情况
         只留一句状态栏提示，不猜也不乱跳。
@@ -3622,8 +3622,6 @@ class MainWindow(QMainWindow):
         for row, item in enumerate(self.rows):
             if item["entry"].cluster_id != cluster_id:
                 continue
-            if self.summary_dialog is not None and self.summary_dialog.isVisible():
-                self.summary_dialog.close()
             self.raise_()
             self.activateWindow()
             # 整行选中，并把"当前格"落在商品名上（光标键、复制都从这儿起）

@@ -5998,15 +5998,15 @@ def test_summary_dialog_reports_a_click_on_a_name(qapp):
     assert seen == ["10000000001"]
 
 
-def test_clicking_a_summary_name_selects_the_row(window):
-    """点商品名：关掉报告，选中并滚到表格里那件商品。"""
+def test_clicking_a_summary_name_selects_the_row_and_keeps_the_report(window):
+    """点商品名：报告留着，选中并滚到表格里那件商品。"""
     w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"), ("10000000003", "丙"))
     w.ShowSummary()
     assert w.summary_dialog.isVisible()
 
     assert w.OnSummaryItemClicked("10000000003") is True
 
-    assert not w.summary_dialog.isVisible()  # 关掉才好看见跳过去的那一行
+    assert w.summary_dialog.isVisible()  # 报告不关，还能接着点别的条目
     assert w.table.currentRow() == 2
     assert w.SelectedClusterIds() == {"10000000003"}
     assert "丙" in w.progress_label.text()
