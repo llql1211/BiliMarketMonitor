@@ -4083,6 +4083,98 @@ def test_drop_hint_tracks_the_drag(window, monkeypatch):
     assert w.table._drop_at is None
 
 
+# ---------------- 拖动时自动滚动 ----------------
+
+
+def _many_rows(count=100):
+    """够长、能滚起来的清单（缩略图那列让一行有一百来像素高）。"""
+    return [(f"1000000{i:04d}", f"商品{i}") for i in range(count)]
+
+
+def test_dragging_near_the_bottom_scrolls_the_view(window, qapp):
+    """光标压到可视区下边缘，页面自己往下滚——够不着屏幕外的行就白拖了。"""
+    w = _loaded(window, *_many_rows())
+    w.show()
+    qapp.processEvents()
+    table = w.table
+    bar = table.verticalScrollBar()
+    bar.setValue(0)
+    mime = QMimeData()
+
+    for y in (table.viewport().height() - 2, table.viewport().height() - 20):
+        table.dragMoveEvent(
+            QDragMoveEvent(QPoint(10, y), Qt.MoveAction, mime, Qt.LeftButton, Qt.NoModifier)
+        )
+        assert table._drag_scroll.isActive()
+        assert table._drag_step > 0  # 越靠边越快，但方向都是往下
+        before = bar.value()
+        table._on_drag_scroll()
+        assert bar.value() > before
+
+
+def test_dragging_near_the_top_scrolls_up_and_stops_at_the_top(window, qapp):
+    """对着上边缘拖就往上滚；滚到顶后定时器自己停掉，不空转。"""
+    w = _loaded(window, *_many_rows())
+    w.show()
+    qapp.processEvents()
+    table = w.table
+    bar = table.verticalScrollBar()
+    bar.setValue(bar.maximum())
+    table.dragMoveEvent(
+        QDragMoveEvent(QPoint(10, 2), Qt.MoveAction, QMimeData(), Qt.LeftButton, Qt.NoModifier)
+    )
+
+    assert table._drag_scroll.isActive()
+    assert table._drag_step < 0
+    while bar.value() > 0:
+        table._on_drag_scroll()
+    assert bar.value() == 0
+    assert not table._drag_scroll.isActive()  # 到顶了，别再空转
+
+
+def test_autoscroll_stops_away_from_the_edges(window, qapp):
+    """光标回到中间就不滚了：不能拖到一半一直滚下去。"""
+    w = _loaded(window, *_many_rows())
+    w.show()
+    qapp.processEvents()
+    table = w.table
+    table.dragMoveEvent(
+        QDragMoveEvent(QPoint(10, 2), Qt.MoveAction, QMimeData(), Qt.LeftButton, Qt.NoModifier)
+    )
+    assert table._drag_scroll.isActive()
+
+    table.dragMoveEvent(
+        QDragMoveEvent(
+            QPoint(10, table.viewport().height() // 2), Qt.MoveAction, QMimeData(),
+            Qt.LeftButton, Qt.NoModifier,
+        )
+    )
+
+    assert not table._drag_scroll.isActive()
+    assert table._drag_step == 0
+
+
+def test_autoscroll_stops_on_drop(window, qapp, monkeypatch):
+    """松手后定时器必须停：留着它，下一次拖到一半就自己滚起来了。"""
+    w = _loaded(window, *_many_rows())
+    w.show()
+    qapp.processEvents()
+    table = w.table
+    table.selectRow(0)
+    monkeypatch.setattr(table, "indexAt", lambda pos: QModelIndex())
+    table.dragMoveEvent(
+        QDragMoveEvent(QPoint(10, 2), Qt.MoveAction, QMimeData(), Qt.LeftButton, Qt.NoModifier)
+    )
+    assert table._drag_scroll.isActive()
+
+    table.dropEvent(
+        QDropEvent(QPoint(10, 2), Qt.MoveAction, QMimeData(), Qt.LeftButton, Qt.NoModifier)
+    )
+
+    assert not table._drag_scroll.isActive()
+    assert table._drag_pos is None
+
+
 def test_drop_hint_is_painted(window, qapp):
     """那条横线是真画出来了：有落点和没落点的截图得不一样。"""
     w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"))

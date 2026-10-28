@@ -102,6 +102,13 @@ ZOOM_MAX = 4.0    # 最多放到铺满的 4 倍；720 的图再往上就是马�
 
 ROW_NUMBER_PADDING = 16  # 序号槽左右留白，免得数字贴着分隔线
 
+# 拖拽排序时的自动滚动（见 ReorderableTable）：光标进到可视区上下这么宽的一条里就
+# 自己滚，越靠边滚得越快。Qt 自带的那套在自定义 QDrag 下不生效，只能自己接管
+DRAG_SCROLL_EDGE = 40
+DRAG_SCROLL_INTERVAL_MS = 30
+DRAG_SCROLL_MIN_STEP = 4
+DRAG_SCROLL_MAX_STEP = 24
+
 COL_FAVORITE = 0
 COL_IMG, COL_NAME, COL_PRICE, COL_LOW, COL_EXPECT, COL_REF, COL_AVG = (
     1, 2, 3, 4, 5, 6, 7
@@ -1673,6 +1680,14 @@ class ReorderableTable(QTableWidget):
         # 拖动时等于看不见落点在哪儿
         self.setDropIndicatorShown(False)
         self._drop_at = None  # 正在拖时：落点（插入位置）；None 表示没在拖
+        # 自动滚动也自己来：外面套的那个 QDrag 让 Qt 自带的那套不生效，
+        # 拖到窗口边缘时页面纹丝不动，够不着屏幕外的行
+        self.setAutoScroll(False)  # 关掉它，免得两边同时滚（或者只有它不滚）
+        self._drag_pos = None      # 拖动中光标在可视区里的位置，滚动 tick 靠它更新落点
+        self._drag_step = 0        # 每个 tick 滚多少像素；负数向上、正数向下
+        self._drag_scroll = QTimer(self)
+        self._drag_scroll.setInterval(DRAG_SCROLL_INTERVAL_MS)
+        self._drag_scroll.timeout.connect(self._on_drag_scroll)
 
     def startDrag(self, actions):
         """自己起拖拽，绕开 QAbstractItemView.startDrag 的"搬格子 + 删源行"。
@@ -1699,6 +1714,8 @@ class ReorderableTable(QTableWidget):
             drag.setHotSpot(hotspot)
         drag.exec_(Qt.MoveAction)
         drag.deleteLater()
+        # 拖拽结束（松手、按 Esc 取消）后停止自动滚动；dropEvent 只覆盖"放下"那条路
+        self._stop_drag_scroll()
 
     def dragEnterEvent(self, event):
         """只接自己拖自己；从文件管理器之类拖进来的内容一概不理。
@@ -1708,16 +1725,19 @@ class ReorderableTable(QTableWidget):
         （另外"从资源管理器拖文件进来"这类来源，source() 本来就是空的。）
         """
         if event.source() is self:
-            super().dragEnterEvent(event)  # 交给 Qt：它还要置拖拽状态、启动自动滚动
+            super().dragEnterEvent(event)  # 交给 Qt：拖拽状态那一套还得它管
         else:
             event.ignore()
 
     def dragMoveEvent(self, event):
-        super().dragMoveEvent(event)  # 自动滚动、拖拽状态这些还得 Qt 管
-        self._set_drop_hint(self._drop_target(event.pos()))
+        super().dragMoveEvent(event)  # 拖拽状态这些还得 Qt 管
+        self._drag_pos = event.pos()
+        self._set_drop_hint(self._drop_target(self._drag_pos))
+        self._update_drag_scroll(event.pos())
         event.acceptProposedAction()
 
     def dragLeaveEvent(self, event):
+        self._stop_drag_scroll()
         self._set_drop_hint(None)
         super().dragLeaveEvent(event)
 
@@ -1725,6 +1745,7 @@ class ReorderableTable(QTableWidget):
         """接住落点，交给窗口去重排——本类自己一行都不动。"""
         rows = self._selected_rows()
         target = self._drop_target(event.pos())
+        self._stop_drag_scroll()
         self._set_drop_hint(None)
         if not rows:
             event.ignore()
@@ -1760,6 +1781,61 @@ class ReorderableTable(QTableWidget):
             rect = self.visualRect(self.model().index(target, 0))
             y = rect.top() if rect.isValid() else viewport.top()
         return max(viewport.top(), min(y, viewport.bottom()))
+
+    # ---------------- 自动滚动 ----------------
+
+    def _update_drag_scroll(self, pos):
+        """按光标离上下边缘多远起停自动滚动：越靠边滚得越快，回到中间就停。
+
+        pos 是可视区坐标（dragMoveEvent 给的就是这个）。到顶/到底时定时器会在
+        tick 里自己停，这里只管"该不该滚、往哪边滚"。
+        """
+        y = pos.y()
+        height = self.viewport().height()
+        if y < DRAG_SCROLL_EDGE:
+            depth = DRAG_SCROLL_EDGE - y
+            step = -self._drag_scroll_step(depth)
+        elif y > height - DRAG_SCROLL_EDGE:
+            depth = y - (height - DRAG_SCROLL_EDGE)
+            step = self._drag_scroll_step(depth)
+        else:
+            self._drag_scroll.stop()
+            self._drag_step = 0
+            return
+        self._drag_step = step
+        if not self._drag_scroll.isActive():
+            self._drag_scroll.start()
+
+    @staticmethod
+    def _drag_scroll_step(depth) -> int:
+        """光标陷进边缘多深（像素）→ 每个 tick 滚多少：线性加速，并留个下限。"""
+        ratio = min(1.0, max(0.0, depth) / DRAG_SCROLL_EDGE)
+        return max(
+            DRAG_SCROLL_MIN_STEP, int(round(DRAG_SCROLL_MAX_STEP * ratio))
+        )
+
+    def _on_drag_scroll(self):
+        """定时器 tick：滚一格，并按新的滚动位置重算落点（光标没动，行动了）。"""
+        if self._drag_pos is None:
+            self._drag_scroll.stop()
+            return
+        bar = self.verticalScrollBar()
+        before = bar.value()
+        bar.setValue(before + self._drag_step)
+        hit_edge = (
+            (self._drag_step < 0 and bar.value() == bar.minimum())
+            or (self._drag_step > 0 and bar.value() == bar.maximum())
+        )
+        if bar.value() == before or hit_edge:
+            self._drag_scroll.stop()  # 到顶/到底了，再滚也是空转
+        # 滚动之后光标下面是别的行了，那条横线得跟着挪
+        self._set_drop_hint(self._drop_target(self._drag_pos))
+
+    def _stop_drag_scroll(self):
+        """收掉自动滚动和拖动中的光标位置（松手、离开、取消拖拽都走这儿）。"""
+        self._drag_scroll.stop()
+        self._drag_pos = None
+        self._drag_step = 0
 
     # ---------------- 内部 ----------------
 

@@ -479,6 +479,19 @@ data/watchlist.txt
   `MainWindow.OnAcknowledge()` 干活（刷基线、重读记录、恢复选中、清掉窗口里那块），
   跟「确认」按钮不关窗是同一件事的两面——用户可能还想接着看本轮的明细。
 
+**拖拽排序与自动滚动**（`app.ReorderableTable`）
+
+表格只是顺序的视图：`startDrag` 自己起一个 `QDrag`（绕开 Qt 内部 Move 会搬格子、删源行那套），
+拖动中画出落点横线，松手后只发 `rows_dropped(行号, 插入位置)`，真正改顺序的是
+`MainWindow.OnRowsDropped` → `move_rows()` → 写回清单。
+
+- **自动滚动自己做**：`setAutoScroll(False)` 关掉 Qt 自带的那套（自定义 `QDrag` 下它并不动），
+  改成 `dragMoveEvent` 里按光标到上下边缘的距离算方向和速度，`QTimer` 每 30ms 滚一格。
+  越靠边越快（`DRAG_SCROLL_MAX_STEP`），到顶/到底或回到中间就停；每次 tick 还用同一个光标
+  位置重算落点，横线才会跟着滚动后的行一起挪。
+- **停的地方要全**：`dropEvent`、`dragLeaveEvent`、`startDrag` 的 `exec_()` 返回之后都调
+  `_stop_drag_scroll()`。漏一条，下一次拖到一半页面就自己滚起来。
+
 **画格子的时机**：抓取开始时把价格清成 `--`，刷到哪行填哪行，一眼能看出进度。
 `PENDING_TEXT`、`NO_DATA_TEXT`、`CLEARED_TEXT`、`FAILED_TEXT` 几个占位符在 `app.py` 顶部。
 
@@ -607,6 +620,8 @@ pixi run shot           # 出图在 tmp/out/，每个场景深色/浅色各一�
 | 缩略图的尺寸、并发数、磁盘缓存上限 | `app.IMAGE_SIZE` / `IMAGE_SUFFIX` / `IMAGE_WORKERS`（改 `IMAGE_SIZE` 会让盘上旧缓存自动作废）、`thumbs.MAX_FILES` |
 | 成交判「新增」的算法 | `app.new_deals()` / `_aged_from()` |
 | 「查看上次总结」按钮、快照留多久 | `app.ShowSummary()` / `app.OnShowLastSummary()` / `app._OpenSummaryDialog()`；顶部按钮在 `InitUI()` 的 `info_bar` 里 |
+| 总结里的商品名能不能点、点了跳哪儿 | 链接在 `app._name_html()`（scheme 是 `SUMMARY_ITEM_SCHEME`），信号在 `SummaryDialog.name_clicked`，跳转在 `MainWindow.OnSummaryItemClicked()` |
+| 拖拽排序的落点、自动滚动速度与触发边距 | `app.ReorderableTable`（`dragMoveEvent` / `_update_drag_scroll` / `_on_drag_scroll`）；速度与边距是顶部 `DRAG_SCROLL_*` 常量 |
 | 史低价的只降不升规则 | `app.updated_lowest()` / `at_lowest()`；存的那一列在 `store.ITEM_COLUMNS` |
 | 累积确认（攒什么、什么时候清零、顶部那句话） | 判据 `app.ack_change()` / `ack_new_deals()` / `ack_reached()` / `BuildAckSummary()`；写入 `store.acknowledge()` / `init_ack_if_empty()`（列在 `ITEM_COLUMNS`）；按钮与那句提示在 `SummaryDialog.btn_ack` / `MainWindow.ack_label` |
 | 清单接受的写法 | `links.parse_line()` / `_split_fields()` |
