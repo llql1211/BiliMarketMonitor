@@ -2236,11 +2236,15 @@ def test_last_summary_button_does_not_widen_the_window(window):
 # 基准是 ack_* 那几列，用户不点「确认」就不动，所以攒的内容跨轮、跨重启都在。
 
 
-def _row(price=None, sold_out=0, ack=None, deals=None, ack_deals=None, ack_at=CACHED_AT):
+def _row(price=None, sold_out=0, ack=None, deals=None, ack_deals=None, ack_at=CACHED_AT,
+         ack_deals_at=None):
     """一条缓存记录（只摆判定用到的那几格）。
 
     ack 给确认基线那组的现价 (price_text, sold_out)，跟 store 里那两格同名同义；
     ack 为 None 表示还没确认过（新商品、或老库补列留下的空基线）。
+
+    ack_deals_at 是基线里那份成交快照**抓回来**的时刻（store 的
+    ack_deals_updated_at）；不给就跟 ack_at 一致，等价于"确认时顺手抓的"。
     """
     record = {
         "price_text": price,
@@ -2253,6 +2257,7 @@ def _row(price=None, sold_out=0, ack=None, deals=None, ack_deals=None, ack_at=CA
     record["ack_price_value"] = parser.price_number(ack_price)
     record["ack_sold_out"] = ack_sold_out
     record["ack_deals_json"] = json.dumps(ack_deals) if ack_deals is not None else None
+    record["ack_deals_updated_at"] = ack_deals_at if ack_deals_at else ack_at
     record["ack_at"] = ack_at if ack else None
     return record
 
@@ -2294,6 +2299,45 @@ def test_ack_new_deals_uses_the_confirmation_as_the_baseline():
     )
 
     assert [deal["time"] for deal in fresh] == ["978400秒前"]
+
+
+def test_ack_new_deals_stays_quiet_when_the_user_confirms_late():
+    """回归：确认得晚，也不能让已读的成交在下一轮又冒出来。
+
+    成交快照的锚点是**抓回来**的时刻，不是用户点确认的时刻。这里快照抓回来 40 分钟
+    之后才点确认、又过 30 分钟再抓一轮：那 40 分钟要是漏算，老成交会被当成"变年轻了"
+    重新报成新增——就是「已读后下一次抓取还包含这次成交」那个 bug。
+    """
+    now = datetime.now()
+
+    def stamp(seconds):
+        return (now - timedelta(seconds=seconds)).isoformat(timespec="seconds")
+
+    record = _row(
+        "¥44",
+        ack=("¥44", 0),
+        # 现在这轮：同一条成交已经 40 分钟前
+        deals=[{"price": "¥44", "time": "40分钟前"}],
+        # 确认时快照里它是「刚刚」，那份快照是 40 分钟前抓的；用户 30 分钟前才点确认
+        ack_deals=[{"price": "¥44", "time": "刚刚"}],
+        ack_at=stamp(1800),
+        ack_deals_at=stamp(2400),
+    )
+
+    assert app_module.ack_new_deals(record) == []
+
+
+def test_ack_new_deals_falls_back_to_ack_at_for_old_caches():
+    """老缓存没有 ack_deals_updated_at：退回用确认时刻，行为跟升级前一样，别崩也别乱报。"""
+    at = datetime.now().isoformat(timespec="seconds")
+    record = _row(
+        "¥44", ack=("¥44", 0),
+        deals=[{"price": "¥205", "time": "1小时前"}],
+        ack_deals=[{"price": "¥205", "time": "1小时前"}], ack_at=at,
+    )
+    record.pop("ack_deals_updated_at")  # 升级前写下的基线
+
+    assert app_module.ack_new_deals(record) == []
 
 
 def test_ack_new_deals_without_a_moment_reports_nothing():
@@ -2452,6 +2496,9 @@ def test_confirming_clears_the_block_and_flips_the_label(window, monkeypatch, wa
     assert "¥44 → ¥50" in dialog.detail.toPlainText()  # 本轮明细还在
     assert w.ack_label.text() == f"{app_module.ACK_DONE_PREFIX} · 1 秒前"
     assert w.store.get_setting(store.ACK_AT_SETTING)  # 全局时刻落库了
+    # 成交快照的锚点跟着"抓回来的时刻"走，不是确认时刻（见 ack_new_deals）
+    row = w.store.get_item("10000008780")
+    assert row["ack_deals_updated_at"] == row["deals_updated_at"]
 
 
 def test_confirmation_survives_a_restart(window, monkeypatch, wait_until):

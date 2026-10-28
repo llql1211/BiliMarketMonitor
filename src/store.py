@@ -49,6 +49,9 @@ ITEM_COLUMNS = (
     ("ack_sold_out", "INTEGER"),    # 确认时是不是售罄（0/1）
     ("ack_lowest_price", "TEXT"),   # 确认时的史低价（留个"确认时贵不贵"的底）
     ("ack_deals_json", "TEXT"),     # 确认时的成交快照（跟 deals_json 同格式）
+    ("ack_deals_updated_at", "TEXT"),  # 那份成交快照是什么时候抓的。**不是** ack_at：
+                                       # 用户可能过很久才点确认，拿确认时刻当锚点会把
+                                       # 老成交算年轻，下一轮又报成"新增"（见 app.ack_new_deals）
     ("ack_at", "TEXT"),             # 这行的基线是什么时候记下的。空 = 还没确认过
 )
 
@@ -302,12 +305,15 @@ class Store:
         （见 app.updated_lowest）——递进来的只该是比现存更低的那个，None 表示这次
         没有刷新它（没抓到价格、售罄、认不出数字都走这条）。这里不做比较，只按
         COALESCE 存：值给什么写什么，给 None 就保留旧值。
+
+        返回这次写入用的时刻（成交快照的抓取时刻也是它）。调用方拿它当首次观察
+        基线的锚点，省得再回读一遍（见 app.OnResultReady）。
         """
         self._begin()
         cluster_id = _clean_id(cluster_id)
         if cluster_id is None:
             self._note("抓取结果里的 clusterId 不合法，已跳过缓存写入")
-            return
+            return None
         now = _now()
         with self.conn:
             self.conn.execute(
@@ -357,17 +363,20 @@ class Store:
                     now,
                 ),
             )
+        return now
 
     def acknowledge(self, entries, at):
         """把一组商品的确认基线刷成给的值，并把全局确认时刻记进 settings。
 
         entries 为 [(cluster_id, price_text, price_value, sold_out, lowest_price,
-        deals_json)]，一个事务写完——写一半会留下"这行的基线新、那行的基线旧"，
-        之后的累积报告就开始胡说。
+        deals_json, deals_updated_at)]，一个事务写完——写一半会留下"这行的基线新、
+        那行的基线旧"，之后的累积报告就开始胡说。
 
         deals_json 沿用 _deals_json 的格式（app 直接把缓存里那格原文递进来），
-        省得两处各写一套序列化。价格那一段认不出数字时给 None：基线里没有数值，
-        累积那边就退化成"不比"，总好过拿猜出来的数当基准。
+        省得两处各写一套序列化。deals_updated_at 是**这组成交抓回来的时刻**，
+        不是确认时刻——用户可能隔很久才点确认，用 at 当锚点会让下一轮把老成交
+        重新报成新增（见 app.ack_new_deals）。价格那一段认不出数字时给 None：
+        基线里没有数值，累积那边就退化成"不比"，总好过拿猜出来的数当基准。
 
         跟 set_favorite 同一类：这是用户意图，抓取一个字都不碰它（见 upsert_item
         的列清单）。区别在于确认是**全局**的——一次把所有行的基线一起挪到当前，
@@ -380,14 +389,22 @@ class Store:
             return
         rows = []
         for entry in entries or []:
-            if not isinstance(entry, (tuple, list)) or len(entry) != 6:
+            if not isinstance(entry, (tuple, list)) or len(entry) != 7:
                 self._note("确认基线里的条目形状不对，已跳过")
                 continue
             cluster_id = _clean_id(entry[0])
             if cluster_id is None:
                 self._note("确认基线里的 clusterId 不合法，已跳过")
                 continue
-            _, price_text, price_value, sold_out, lowest_price, deals_json = entry
+            (
+                _,
+                price_text,
+                price_value,
+                sold_out,
+                lowest_price,
+                deals_json,
+                deals_updated_at,
+            ) = entry
             rows.append(
                 (
                     _clean_cached_text(price_text),
@@ -395,6 +412,7 @@ class Store:
                     int(bool(sold_out)),
                     _clean_cached_text(lowest_price),
                     _snapshot_json(deals_json),
+                    _clean_cached_text(deals_updated_at),
                     at,
                     cluster_id,
                 )
@@ -409,6 +427,7 @@ class Store:
                               ack_sold_out     = ?,
                               ack_lowest_price = ?,
                               ack_deals_json   = ?,
+                              ack_deals_updated_at = ?,
                               ack_at           = ?
                         WHERE cluster_id = ?""",
                     row,
@@ -418,13 +437,17 @@ class Store:
             self.conn.execute(_SETTING_SQL, (ACK_AT_SETTING, at))
 
     def init_ack_if_empty(self, cluster_id, price_text, price_value, sold_out,
-                          lowest_price, deals=None):
+                          lowest_price, deals=None, deals_updated_at=None):
         """首次观察到某商品时记一份基线；已经有基线就一个字节都不动。
 
         跟 acknowledge 的分工有两处：这里只写**还没有基线**的行（WHERE 里判
         ack_at 为空，同一轮里同一商品也只该走一次），而且不碰全局的 last_ack_at
         ——用户什么也没确认过，顶部那句该停在「尚未确认」，不该因为刚加了件商品
         就变成「已确认」。
+
+        deals_updated_at 是这组成交抓回来的时刻，也就是确认基线里那份成交快照
+        的锚点（理由同 acknowledge：不能拿写基线的时刻当锚点）。老调用方不给时
+        按写基线的时刻算，跟以前一样。
 
         记下第一次抓到的样子，是为了下一轮有"相对什么"可比（见 app.BuildAckSummary）：
         首次观察本身不算一条变化，这跟 price_change 那边"第一次抓到不报涨跌"
@@ -443,6 +466,7 @@ class Store:
                           ack_sold_out     = ?,
                           ack_lowest_price = ?,
                           ack_deals_json   = ?,
+                          ack_deals_updated_at = ?,
                           ack_at           = ?
                     WHERE cluster_id = ? AND (ack_at IS NULL OR ack_at = '')""",
                 (
@@ -451,6 +475,7 @@ class Store:
                     int(bool(sold_out)),
                     _clean_cached_text(lowest_price),
                     _snapshot_json(deals),
+                    _clean_cached_text(deals_updated_at),
                     _now(),
                     cluster_id,
                 ),

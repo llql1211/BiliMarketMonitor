@@ -500,8 +500,13 @@ def ack_new_deals(record):
     """自上次确认以来新出现的成交（基准是确认那一刻存下的那份快照）。
 
     判定整条复用 new_deals：把 previous 换成 ack_deals_json、elapsed 换成
-    ack_at 到现在，_aged_from 一个字不用改。这份基线跟 ack_at 一起存在缓存里，
-    关掉程序再开还接着算——累积能跨轮就是靠它落了库。
+    "那份快照抓回来之后到现在"，_aged_from 一个字不用改。这份基线跟 ack_at 一起
+    存在缓存里，关掉程序再开还接着算——累积能跨轮就是靠它落了库。
+
+    锚点用 ack_deals_updated_at（快照**抓回来**的时刻），不是 ack_at（用户**点确认**
+    的时刻）：用户完全可能隔很久才点确认，拿确认时刻算间隔会把那几小时漏掉，老成交
+    在下一轮就被当成"变年轻了"重新报成新增——这正是"已读之后下一次抓取还包含这次
+    成交记录"那个 bug。老缓存没有这一列时退回 ack_at，行为跟以前一样。
 
     三种情况一条都不报（跟 new_deals 的"没有基准就不报"同一条规矩）：没确认过、
     确认时没存下成交、或认不出那份基线是什么时候记的（elapsed 认不出来时
@@ -510,9 +515,9 @@ def ack_new_deals(record):
     record = record or {}
     # 借用 cached_deals_of 的读取路径：它认的就是 deals_json + 它的抓取时刻这两格，
     # 而 ack 那组基线是同样的形状（见 store._snapshot_json）
+    anchor = record.get("ack_deals_updated_at") or record.get("ack_at")
     baseline, anchor = store.cached_deals_of(
-        {"deals_json": record.get("ack_deals_json"),
-         "deals_updated_at": record.get("ack_at")}
+        {"deals_json": record.get("ack_deals_json"), "deals_updated_at": anchor}
     )
     if not baseline:
         return []
@@ -3196,8 +3201,9 @@ class MainWindow(QMainWindow):
                         ),
                     }
                 )
-            # 第一次抓到的新商品写入缓存；已缓存的也顺手刷新名称、缩略图和价格
-            self.store.upsert_item(
+            # 第一次抓到的新商品写入缓存；已缓存的也顺手刷新名称、缩略图和价格。
+            # 返回的时刻就是这轮成交快照的抓取时刻，下面初始化基线时要拿它当锚点
+            fetched_at = self.store.upsert_item(
                 cluster_id,
                 result["name"],
                 result["image_url"],
@@ -3223,6 +3229,7 @@ class MainWindow(QMainWindow):
                     # 没刷（售罄、认不出数字、不比现存的低）就用上一个记录里的
                     new_lowest if new_lowest is not None else previous.get("lowest_price"),
                     result["deals"],
+                    fetched_at,  # 成交快照的锚点，不是"现在"（见 app.ack_new_deals）
                 )
             # 写完再回读一遍：既拿到刚写进去的价格，也把可能刚记下的基线一起带回来。
             # 累积判定看的是内存里这份 record（见 BuildAckSummary），不回读的话，
@@ -3538,6 +3545,8 @@ class MainWindow(QMainWindow):
                     bool(record.get("sold_out")),
                     record.get("lowest_price"),
                     record.get("deals_json"),
+                    # 成交快照的锚点是它抓回来的时刻，不是下面这个确认时刻
+                    record.get("deals_updated_at"),
                 )
             )
         self.store.acknowledge(entries, at)

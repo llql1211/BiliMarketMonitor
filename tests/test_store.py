@@ -781,11 +781,13 @@ def test_old_db_without_deal_columns_is_upgraded(db):
 
 
 ACK_AT = "2026-10-12T10:30:00"
+DEALS_AT = "2026-10-12T10:00:00"  # 成交快照抓回来的时刻，比确认时刻早半小时
 
 
-def _baseline(price_text="¥44", price_value=44.0, sold_out=False, lowest="¥44", deals=None):
+def _baseline(price_text="¥44", price_value=44.0, sold_out=False, lowest="¥44", deals=None,
+              deals_updated_at=DEALS_AT):
     """acknowledge 收的一行（不含 cluster_id），跟 app.OnAcknowledge 拼的形状一致。"""
-    return (price_text, price_value, sold_out, lowest, deals)
+    return (price_text, price_value, sold_out, lowest, deals, deals_updated_at)
 
 
 def test_ack_columns_are_empty_on_a_new_row(db):
@@ -795,7 +797,7 @@ def test_ack_columns_are_empty_on_a_new_row(db):
 
     row = st.get_item("1001")
     for column in ("ack_price_text", "ack_price_value", "ack_sold_out",
-                   "ack_lowest_price", "ack_deals_json", "ack_at"):
+                   "ack_lowest_price", "ack_deals_json", "ack_deals_updated_at", "ack_at"):
         assert row[column] is None
 
 
@@ -812,6 +814,7 @@ def test_acknowledge_writes_the_whole_baseline(db):
     assert row["ack_sold_out"] == 0
     assert row["ack_lowest_price"] == "¥44"
     assert json.loads(row["ack_deals_json"]) == [{"price": "¥44", "time": "1小时前"}]
+    assert row["ack_deals_updated_at"] == DEALS_AT  # 快照自己的锚点，不是确认时刻
     assert row["ack_at"] == ACK_AT
     assert st.get_setting(store.ACK_AT_SETTING) == ACK_AT  # 顶部那句「已确认」看它
 
@@ -911,12 +914,14 @@ def test_init_ack_if_empty_records_the_first_sight(db):
     st.sync([("1001", "甲")])
 
     st.init_ack_if_empty("1001", "¥44", 44.0, False, "¥44",
-                         deals=[{"price": "¥205", "time": "刚刚"}])
+                         deals=[{"price": "¥205", "time": "刚刚"}],
+                         deals_updated_at=DEALS_AT)
 
     row = st.get_item("1001")
     assert (row["ack_price_text"], row["ack_price_value"]) == ("¥44", 44.0)
     assert row["ack_lowest_price"] == "¥44"
     assert json.loads(row["ack_deals_json"]) == [{"price": "¥205", "time": "刚刚"}]
+    assert row["ack_deals_updated_at"] == DEALS_AT  # 成交快照的锚点跟着抓取时刻走
     assert row["ack_at"]  # 记下"这行基线是什么时候写的"，成交那边才算得出隔了多久
 
 
@@ -971,7 +976,9 @@ def test_old_db_without_ack_columns_is_upgraded(db):
     st = store.Store(db)
     assert st.get_item("1001")["ack_at"] is None
 
-    st.init_ack_if_empty("1001", "¥44", 44.0, False, "¥44")
+    st.init_ack_if_empty("1001", "¥44", 44.0, False, "¥44",
+                         deals_updated_at=DEALS_AT)
 
     assert st.get_item("1001")["ack_price_text"] == "¥44"
+    assert st.get_item("1001")["ack_deals_updated_at"] == DEALS_AT
     assert st.notes == []

@@ -268,11 +268,11 @@ data/watchlist.txt
   `upsert_item()` 一个字都不碰，抓取结果回来不会把用户打的星冲掉。传进 `sync()` 的二元组
   （只给 ID 和名字的老写法）按「未收藏」算，也就是会把缓存里那颗星**取消**掉——清单是正本，
   这条没有例外，取消收藏因此不会被下一轮 sync 悄悄还原。
-- `ack_*` 那六列（`ack_price_text` / `ack_price_value` / `ack_sold_out` / `ack_lowest_price` /
-  `ack_deals_json` / `ack_at`）是**第二份用户意图**，跟 `favorite` 并列：抓取一个字都不碰
-  （`upsert_item()` 的列清单里没有它们），能写它们的只有两处——`acknowledge()`（用户按「确认」）
-  和 `init_ack_if_empty()`（第一次抓到这件商品）。区别是确认**全局**生效：一次把所有行的基线
-  刷到当前，不做逐件确认。判据见「几个关键判定 → 累积确认的基线」。
+- `ack_*` 那七列（`ack_price_text` / `ack_price_value` / `ack_sold_out` / `ack_lowest_price` /
+  `ack_deals_json` / `ack_deals_updated_at` / `ack_at`）是**第二份用户意图**，跟 `favorite` 并列：
+  抓取一个字都不碰（`upsert_item()` 的列清单里没有它们），能写它们的只有两处——`acknowledge()`
+  （用户按「确认」）和 `init_ack_if_empty()`（第一次抓到这件商品）。区别是确认**全局**生效：
+  一次把所有行的基线刷到当前，不做逐件确认。判据见「几个关键判定 → 累积确认的基线」。
 - `lowest_price`（史低价）是缓存里**两条不可再生**的记录之一（另一条是累积确认的基线）：
   价格、均价、成交都是「抓一次就回来」的快照，它却是历次抓取攒出来的。所以删库、重建、
   把商品移出清单再拖回来，都会把它丢掉且补不回来（只能从下一轮抓取重新开始攒）。
@@ -446,9 +446,14 @@ data/watchlist.txt
 
 - **三个判据是本轮那三个的翻版**，判据口径一字不差，只是基准换成基线：
   `ack_change` 把基线包成 `previous` 直接调 `price_change`；`ack_new_deals` 把
-  `ack_deals_json` + `ack_at` 当基准交给 `new_deals`（`elapsed` 是 `ack_at` 到现在的秒数）；
-  `ack_reached` 在本轮到价的基础上再要求**确认时没到价**——它跟通知那边一样是边沿，
-  不然确认过一次之后它会一直报。
+  `ack_deals_json` + `ack_deals_updated_at` 当基准交给 `new_deals`（`elapsed` 是**那份成交快照
+  抓回来之后**到现在的秒数）；`ack_reached` 在本轮到价的基础上再要求**确认时没到价**——它跟
+  通知那边一样是边沿，不然确认过一次之后它会一直报。
+- **成交快照的锚点不是确认时刻**：用户完全可能隔几小时才点确认，而快照里的「刚刚」说的是
+  抓取那一刻。拿 `ack_at` 算 `elapsed` 会把那几小时漏掉，老成交像变年轻了似的，下一轮又被
+  报成「新增」——这正是「已读之后下一次抓取还包含这次成交」那个 bug。所以 `acknowledge()` /
+  `init_ack_if_empty()` 会单独记 `ack_deals_updated_at`（就是写缓存时那个 `deals_updated_at`），
+  老缓存没这列时 `ack_new_deals` 退回 `ack_at`，行为跟升级前一样。
 - **售罄、认不出数字一律不参与价格比较**，跟 `price_delta` / `expected_reached` 同规矩：
   售罄行的"现价"是原价，两边售罄就不比；确认时的价认不出来就退化成"不比"，
   不拿猜出来的数当基准。
