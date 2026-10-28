@@ -279,15 +279,19 @@ def seed_sample_fetches(window):
 # ---------------- 场景 ----------------
 
 
-def _change(previous, result, name):
+def _change(previous, result, name, cluster_id=None):
     """造一条变动。真调 price_change 而不是手写 dict：样本跟实现就不会各说各话，
     哪天真改了结构，这里先炸，而不是拿着一张早就对不上的图糊弄人。
+
+    cluster_id 给了就把商品名渲染成可点的链接（跟真报告一样），出图才看得到那层样式。
     """
     from app import price_change
 
     change = price_change(previous, result)
     assert change is not None, f"样本造错了：{name} 这一条算不出变动"
     change["name"] = name
+    if cluster_id:
+        change["cluster_id"] = cluster_id
     return change
 
 
@@ -295,22 +299,23 @@ def _sample_changes():
     """四类各一条；第二个名字带尖括号，顺便看转义有没有漏。"""
     return [
         _change({"price_text": "50", "sold_out": False},
-                {"price": "44", "sold_out": False}, "乙烯基唱片收纳箱"),
+                {"price": "44", "sold_out": False}, "乙烯基唱片收纳箱", "10000008780"),
         _change({"price_text": "128", "sold_out": False},
-                {"price": "135", "sold_out": False}, "复古铁皮玩具车 <限定色>"),
+                {"price": "135", "sold_out": False}, "复古铁皮玩具车 <限定色>",
+                "10000000002"),
         _change({"price_text": "20", "sold_out": False},
-                {"price": "20", "sold_out": True}, "木质拼图相框"),
+                {"price": "20", "sold_out": True}, "木质拼图相框", "10000000003"),
         _change({"price_text": "39", "sold_out": True},
-                {"price": "39", "sold_out": False}, "帆布单肩包"),
+                {"price": "39", "sold_out": False}, "帆布单肩包", "10000000004"),
     ]
 
 
 def _sample_deals():
     """新增成交那一块：一件商品一条新成交，另一件一次冒出两条。"""
     return [
-        {"name": "乙烯基唱片收纳箱",
+        {"name": "乙烯基唱片收纳箱", "cluster_id": "10000008780",
          "deals": [{"price": "¥44", "time": "2小时前"}]},
-        {"name": "复古铁皮玩具车 <限定色>",
+        {"name": "复古铁皮玩具车 <限定色>", "cluster_id": "10000000002",
          "deals": [{"price": "¥130", "time": "9小时前"},
                    {"price": "¥135", "time": "1天前"}]},
     ]
@@ -319,8 +324,10 @@ def _sample_deals():
 def _sample_targets():
     """低于预期价那两块：现价该是到价色，预期价带「￥」。"""
     return [
-        {"name": "木质拼图相框", "price": "¥18", "expected_price": "20"},
-        {"name": "帆布单肩包", "price": "¥35", "expected_price": "¥39"},
+        {"name": "木质拼图相框", "cluster_id": "10000000003",
+         "price": "¥18", "expected_price": "20"},
+        {"name": "帆布单肩包", "cluster_id": "10000000004",
+         "price": "¥35", "expected_price": "¥39"},
     ]
 
 
@@ -367,9 +374,9 @@ def _summary_many(dark):
     for i in range(20):
         base = {"price_text": str(100 + i), "sold_out": False}
         changes.append(_change(base, {"price": str(100 + i - 6), "sold_out": False},
-                               f"降价款 {i + 1}"))
+                               f"降价款 {i + 1}", f"1000000{i:04d}"))
         changes.append(_change(base, {"price": str(100 + i + 6), "sold_out": False},
-                               f"涨价款 {i + 1}"))
+                               f"涨价款 {i + 1}", f"2000000{i:04d}"))
     return SummaryDialog(changes, [], [], 40, 0, 154.6, dark)
 
 

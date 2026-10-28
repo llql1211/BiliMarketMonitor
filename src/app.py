@@ -22,6 +22,7 @@ from datetime import datetime
 
 from PyQt5.QtCore import (
     QEvent,
+    QItemSelectionModel,
     QObject,
     QPoint,
     QRect,
@@ -63,6 +64,7 @@ from PyQt5.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTableWidgetSelectionRange,
+    QTextBrowser,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -241,6 +243,10 @@ ADD_PLACEHOLDER = "粘贴商品 ID 或分享链接，一行一个…"
 
 # 一轮抓取跑完后的总结窗口（见 SummaryDialog）
 SUMMARY_TITLE = "本轮抓取总结"
+# 总结里的商品名是链接：点一下关掉报告、跳回表格里那件商品（见 OnSummaryItemClicked）。
+# 用自定义 scheme，免得跟真链接混在一起；主窗口只认这一种前缀
+SUMMARY_ITEM_SCHEME = "bmm-item"
+SUMMARY_ITEM_MISSING_TEXT = "这件商品已经不在清单里了"
 # 顶部信息栏里那个「查看上次总结」：关了窗口还能看回来（见 OnShowLastSummary）。
 # 文案两处说同一件事——用户第一眼看到的是悬停提示
 LAST_SUMMARY_TEXT = "查看上次总结"
@@ -703,6 +709,23 @@ def _esc(value) -> str:
     return html.escape("" if value is None else str(value))
 
 
+def _name_html(item, dark) -> str:
+    """总结里「商品」那一格：有 clusterId 就做成可点的链接，点了跳回表格那一行。
+
+    没有 clusterId 的调用方（出图工具、旧快照）照旧给纯文本——不能因为它缺一个
+    可选字段就让整张表渲染不出来。名字、ID 都转义过：两边都是接口给的。
+    """
+    name = _esc(item.get("name"))
+    cluster_id = item.get("cluster_id")
+    if not cluster_id:
+        return name
+    color = theme.link_color(dark).name()
+    href = f"{SUMMARY_ITEM_SCHEME}:{_esc(cluster_id)}"
+    return (
+        f'<a href="{href}" style="color:{color}; text-decoration: underline">{name}</a>'
+    )
+
+
 def _dicts(items) -> list:
     """从传进来的东西里挑出成形的 dict：渲染路径上多一层保险，别让脏数据卡住重画。"""
     return [item for item in items or [] if isinstance(item, dict)]
@@ -847,7 +870,8 @@ def new_deals_html(items, dark) -> str:
     """
     muted = theme.muted_color(dark).name()
     rows = [
-        (_esc(item.get("name")), _esc(_join(*(_deal_text(d) for d in _dicts(item.get("deals"))))))
+        (_name_html(item, dark),
+         _esc(_join(*(_deal_text(d) for d in _dicts(item.get("deals"))))))
         for item in _dicts(items)
     ]
     return _section_html(DEALS_HEADING, ("商品", "成交记录"), rows, muted)
@@ -865,7 +889,8 @@ def targets_html(items, dark) -> str:
     for item in _dicts(items):
         price = f'<span style="color:{color}">{_esc(item.get("price"))}</span>'
         rows.append(
-            (_esc(item.get("name")), price, _esc(expected_display(item.get("expected_price"))))
+            (_name_html(item, dark), price,
+             _esc(expected_display(item.get("expected_price"))))
         )
     return _section_html(TARGET_HEADING, ("商品", "现价", "预期价"), rows, muted)
 
@@ -962,7 +987,7 @@ def changes_html(changes, dark) -> str:
             price, detail, color = "恢复在售", _join("现价", _esc(change.get("new_price"))), muted
         rows.append(
             (
-                _esc(change.get("name")),
+                _name_html(change, dark),
                 price,
                 f'<span style="color:{color}">{detail}</span>',
             )
@@ -1563,10 +1588,15 @@ class SummaryDialog(QDialog):
     不开模态（和看图那个窗口同理）：总结是"看一眼"的东西，读的时候顺手点点
     表格、打开个详情页都很自然，没必要把主窗口锁住。
 
+    明细里的商品名可点（见 `_name_html`）：点了发 `name_clicked`，由主窗口关掉
+    这份报告、把表格滚到那一件并选中它。窗口自己不做跳转——它不认识 MainWindow，
+    跟「确认」按钮同一个分工。
+
     什么都没有时也照样弹（用户要的是每轮都有个收尾交代），此时藏掉明细那块空框。
     """
 
     acknowledged = pyqtSignal()
+    name_clicked = pyqtSignal(str)  # 商品名被点：参数是 clusterId
 
     def __init__(
         self, changes, deals, targets, total, failures, elapsed, dark,
@@ -1595,7 +1625,11 @@ class SummaryDialog(QDialog):
         layout.addWidget(self.headline)
         layout.addWidget(self.subtitle)
 
-        self.detail = QTextEdit()
+        self.detail = QTextBrowser()
+        # 链接不归它导航：自己的链接要交给主窗口跳表格，外部链接也不该在这里开
+        self.detail.setOpenLinks(False)
+        self.detail.setOpenExternalLinks(False)
+        self.detail.anchorClicked.connect(self._OnAnchorClicked)
         self.detail.setReadOnly(True)  # 只读，但留着选中复制
         self.detail.setMinimumSize(520, 240)
         layout.addWidget(self.detail)
@@ -1611,7 +1645,7 @@ class SummaryDialog(QDialog):
         layout.addWidget(buttons)
 
         self.SetDark(dark)
-        # 定个大小而不是 adjustSize()：QTextEdit 的 sizeHint 跟着内容长，
+        # 定个大小而不是 adjustSize()：正文区的 sizeHint 跟着内容长，
         # 几十条变动时会把窗口撑成一条竖带。写死之后长清单在里面滚。
         if self.HasDetail():
             self.resize(620, 460)  # 三块明细都可能有，比只有变动时高一点
@@ -1624,6 +1658,17 @@ class SummaryDialog(QDialog):
         累积那块也算：本轮什么都可能没有，而攒了几轮没看的时候恰恰只有它有内容。
         """
         return bool(self.changes or self.deals or self.targets or self.ack)
+
+    def _OnAnchorClicked(self, url):
+        """点了正文里的链接：只认「跳到某件商品」那一种，其余一概不处理。
+
+        不直接跳转是故意的——窗口不认识 MainWindow，也不知道表格长什么样；
+        发个 clusterId 出去，谁开的窗口谁来落地。
+        """
+        text = url.toString()
+        prefix = SUMMARY_ITEM_SCHEME + ":"
+        if text.startswith(prefix):
+            self.name_clicked.emit(text[len(prefix):])
 
     def SetAck(self, ack):
         """换掉累积那块（主窗口在用户点了确认之后叫一次）。
@@ -3235,6 +3280,7 @@ class MainWindow(QMainWindow):
             change = price_change(previous, result)
             if change is not None:
                 change["name"] = name
+                change["cluster_id"] = cluster_id  # 总结里点名要靠它跳回表格
                 self.run_changes.append(change)
             # 成交的基准取自缓存里上一轮那组（带着它的抓取时刻），重启也还在；
             # 同样要在 upsert 之前取，不然拿到的是刚写进去的这一轮
@@ -3244,7 +3290,9 @@ class MainWindow(QMainWindow):
                     result["deals"], seen_deals, self.DealsElapsed(seen_anchor)
                 )
                 if fresh:
-                    self.run_deals.append({"name": name, "deals": fresh})
+                    self.run_deals.append(
+                        {"name": name, "cluster_id": cluster_id, "deals": fresh}
+                    )
             # 到价每轮都报：漏看一轮也不会错过（口径见 expected_reached）。
             # 判「设没设」用展示文本那个口径：光有符号的「¥」不算设了价
             if expected_display(item["entry"].expected_price) and expected_reached(
@@ -3253,6 +3301,7 @@ class MainWindow(QMainWindow):
                 self.run_targets.append(
                     {
                         "name": name,
+                        "cluster_id": cluster_id,
                         "price": result["price"],
                         "expected_price": item["entry"].expected_price,
                     }
@@ -3556,7 +3605,41 @@ class MainWindow(QMainWindow):
         self.summary_dialog.btn_ack.setEnabled(not self.IsPolling())
         # 确认按钮的动作归主窗口：窗口只发信号，谁该变什么由这边统一做
         self.summary_dialog.acknowledged.connect(self.OnAcknowledge)
+        # 点商品名也归主窗口：窗口不知道表格里那件商品在第几行
+        self.summary_dialog.name_clicked.connect(self.OnSummaryItemClicked)
         self.summary_dialog.show()
+
+    def OnSummaryItemClicked(self, cluster_id):
+        """总结里点了商品名：关掉报告，把表格滚到那一件并选中。
+
+        先关窗口再跳：报告是浮在表格上面的，不关掉的话"跳过去"的那一行正好被它
+        挡着。报告本身没丢——顶部「查看上次总结」还能调出来。
+
+        报告里的商品可能已经被删了（先开着报告、再去删清单里那一行），那种情况
+        只留一句状态栏提示，不猜也不乱跳。
+        """
+        cluster_id = str(cluster_id)
+        for row, item in enumerate(self.rows):
+            if item["entry"].cluster_id != cluster_id:
+                continue
+            if self.summary_dialog is not None and self.summary_dialog.isVisible():
+                self.summary_dialog.close()
+            self.raise_()
+            self.activateWindow()
+            # 整行选中，并把"当前格"落在商品名上（光标键、复制都从这儿起）
+            self.SelectItems([cluster_id])
+            self.table.selectionModel().setCurrentIndex(
+                self.table.model().index(row, COL_NAME), QItemSelectionModel.NoUpdate
+            )
+            self.table.scrollToItem(
+                self.table.item(row, COL_NAME), QAbstractItemView.PositionAtCenter
+            )
+            self.table.setFocus()
+            name = item["entry"].name or cluster_id
+            self.progress_label.setText(f"已定位到「{name}」（第 {row + 1} 行）")
+            return True
+        self.progress_label.setText(SUMMARY_ITEM_MISSING_TEXT)
+        return False
 
     def BuildAckSummary(self):
         """自上次确认以来的全部变化；一件都没有时返回 None。
@@ -3571,18 +3654,21 @@ class MainWindow(QMainWindow):
         changes, deals, targets = [], [], []
         for item in self.rows:
             record = item["record"] or {}
-            name = record.get("name") or item["entry"].name or item["entry"].cluster_id
+            cluster_id = item["entry"].cluster_id
+            name = record.get("name") or item["entry"].name or cluster_id
             change = ack_change(record)
             if change is not None:
                 change["name"] = name
+                change["cluster_id"] = cluster_id  # 总结里点名要靠它跳回表格
                 changes.append(change)
             fresh = ack_new_deals(record)
             if fresh:
-                deals.append({"name": name, "deals": fresh})
+                deals.append({"name": name, "cluster_id": cluster_id, "deals": fresh})
             if ack_reached(item["entry"], record):
                 targets.append(
                     {
                         "name": name,
+                        "cluster_id": cluster_id,
                         "price": record.get("price_text"),
                         "expected_price": item["entry"].expected_price,
                     }

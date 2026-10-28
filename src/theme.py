@@ -46,6 +46,11 @@ PRICE_DOWN_COLOR_DARK = "#3fb950"
 FAVORITE_COLOR_LIGHT = "#d99500"
 FAVORITE_COLOR_DARK = "#f0c419"
 
+# 总结窗口里可点的商品名（见 app._name_html）。深浅各一档，跟正文有区别但别抢眼：
+# 它是一条"跳到表格那一行"的入口，不是警告也不是价格信号
+LINK_COLOR_LIGHT = "#0b62c4"
+LINK_COLOR_DARK = "#6cb6ff"
+
 DARK_QSS = """
 QWidget {
     background-color: #1e1f22;
@@ -305,6 +310,11 @@ def below_average_color(dark: bool) -> QColor:
     颜色本身仍然只有 PRICE_DOWN_COLOR 一处定义，改配色时不会漏掉这一格。
     """
     return price_delta_color(-1, dark)
+
+
+def link_color(dark: bool) -> QColor:
+    """总结窗口里可点商品名的颜色（见 app._name_html）：看得出能点，又不抢眼。"""
+    return QColor(LINK_COLOR_DARK if dark else LINK_COLOR_LIGHT)
 
 
 def favorite_color(dark: bool, filled: bool) -> QColor:

@@ -18,6 +18,7 @@ from PyQt5.QtCore import (
     QPoint,
     QRect,
     Qt,
+    QUrl,
     pyqtSignal,
 )
 from PyQt5.QtGui import (
@@ -5929,6 +5930,109 @@ def test_changes_html_escapes_the_name():
 
     assert "&lt;b&gt;甲&lt;/b&gt;" in markup
     assert "<b>甲</b>" not in markup
+
+
+# ---------------- 报告里的商品名可点 ----------------
+
+
+def _linked_item(name, cluster_id, **extra):
+    """总结里的一行：名字 + clusterId，外加这一块自己的字段。"""
+    return {"name": name, "cluster_id": cluster_id, **extra}
+
+
+def test_summary_names_link_to_the_item_in_the_table():
+    """三块明细里的商品名都做成链接：href 里带的是 clusterId，主窗口靠它认人。"""
+    changes = [_linked_item("甲", "10000000001", kind="down", old_price="¥50",
+                            new_price="¥44", delta="↓6", change=-6)]
+    deals = [{"name": "乙", "cluster_id": "10000000002",
+              "deals": [{"price": "¥44", "time": "2小时前"}]}]
+    targets = [_linked_item("丙", "10000000003", price="¥18", expected_price="20")]
+
+    markup = app_module.summary_sections(changes, deals, targets, dark=False)
+
+    for cluster_id in ("10000000001", "10000000002", "10000000003"):
+        assert f'href="{app_module.SUMMARY_ITEM_SCHEME}:{cluster_id}"' in markup
+    assert f"color:{theme.LINK_COLOR_LIGHT}" in markup
+
+
+def test_summary_links_follow_the_theme():
+    """深色底下用更亮的那档链接色，否则蓝字沉进背景里看不出能点。"""
+    changes = [_linked_item("甲", "10000000001", kind="down", old_price="¥50",
+                            new_price="¥44", delta="↓6", change=-6)]
+
+    assert theme.LINK_COLOR_LIGHT in app_module.changes_html(changes, dark=False)
+    assert theme.LINK_COLOR_DARK in app_module.changes_html(changes, dark=True)
+
+
+def test_summary_names_without_an_id_stay_plain_text():
+    """没有 clusterId 的调用方（出图工具、旧快照）照旧渲染成纯文本，不是空白。"""
+    markup = app_module.changes_html(
+        [{"kind": "up", "name": "甲", "old_price": "¥1", "new_price": "¥2",
+          "delta": "↑1", "change": 1}],
+        dark=False,
+    )
+
+    assert "甲" in markup
+    assert f"{app_module.SUMMARY_ITEM_SCHEME}:" not in markup
+
+
+def test_summary_dialog_reports_a_click_on_a_name(qapp):
+    """点链接只发 clusterId 出去；别的地址一律不理，也不自己开浏览器。"""
+    dialog = app_module.SummaryDialog(
+        [_linked_item("甲", "10000000001", kind="down", old_price="¥50",
+                      new_price="¥44", delta="↓6", change=-6)],
+        [], [], 1, 0, 1.0, dark=False,
+    )
+    seen = []
+    dialog.name_clicked.connect(seen.append)
+    # 先确认 Qt 那边真把 href 解析成了链接、颜色也跟着主题走（不然点上去什么都不会发生）
+    anchor = dialog.detail.document().find("甲").charFormat()
+    assert anchor.anchorHref() == f"{app_module.SUMMARY_ITEM_SCHEME}:10000000001"
+    assert anchor.foreground().color().name() == theme.LINK_COLOR_LIGHT
+
+    dialog.detail.anchorClicked.emit(
+        QUrl(f"{app_module.SUMMARY_ITEM_SCHEME}:10000000001")
+    )
+    dialog.detail.anchorClicked.emit(QUrl("https://example.test/detail"))
+
+    assert seen == ["10000000001"]
+
+
+def test_clicking_a_summary_name_selects_the_row(window):
+    """点商品名：关掉报告，选中并滚到表格里那件商品。"""
+    w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"), ("10000000003", "丙"))
+    w.ShowSummary()
+    assert w.summary_dialog.isVisible()
+
+    assert w.OnSummaryItemClicked("10000000003") is True
+
+    assert not w.summary_dialog.isVisible()  # 关掉才好看见跳过去的那一行
+    assert w.table.currentRow() == 2
+    assert w.SelectedClusterIds() == {"10000000003"}
+    assert "丙" in w.progress_label.text()
+
+
+def test_clicking_a_removed_summary_name_only_says_so(window):
+    """报告开着的这段时间里那件商品被删了：只提示一句，不乱跳、也不关窗口。"""
+    w = _loaded(window, ("10000008780", "甲"))
+    w.ShowSummary()
+
+    assert w.OnSummaryItemClicked("99999999999") is False
+
+    assert w.summary_dialog.isVisible()
+    assert w.progress_label.text() == app_module.SUMMARY_ITEM_MISSING_TEXT
+
+
+def test_round_report_items_carry_the_cluster_id(window):
+    """抓取结果进报告时就带上 clusterId：渲染那层只管拼链接，不必再回查一遍。"""
+    w = _loaded(window, ("10000008780", "甲"))
+
+    w.OnResultReady(0, _fetched("¥50"))
+    w.OnResultReady(0, _fetched("¥44"))
+
+    assert w.run_changes[0]["cluster_id"] == "10000008780"
+    ack = w.BuildAckSummary()
+    assert ack["changes"][0]["cluster_id"] == "10000008780"
 
 
 @pytest.mark.parametrize(

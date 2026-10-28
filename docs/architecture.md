@@ -438,6 +438,22 @@ data/watchlist.txt
   已经覆盖到按「查看上次总结」弹出的那个窗口，因为 `summary_dialog` 始终
   指向当前打开的那一个。
 
+**报告里的商品名可点**（`app._name_html` / `SummaryDialog.name_clicked` / `OnSummaryItemClicked`）
+
+总结窗口的正文从 `QTextEdit` 换成了 `QTextBrowser`（`setOpenLinks(False)`）：三块明细（含累积
+那块）里的商品名渲染成 `<a href="bmm-item:<clusterId>">`，`anchorClicked` 转成 `name_clicked`
+信号发出去。窗口不自己跳——它不认识 `MainWindow`，跟「确认」按钮同一个分工。
+
+- **`clusterId` 在抓取结果进报告时就带上**（`OnResultReady` / `BuildAckSummary` 各塞一份），
+  渲染层只管拼链接。没有 `clusterId` 的调用方（出图工具、旧快照）退回纯文本，不能因为少一个
+  可选字段就整张表渲染不出来。
+- **点一下关掉报告再跳**：报告浮在表格上面，不关掉正好挡住跳过去的那一行。报告没丢，顶部
+  「查看上次总结」还能调回来。
+- **只认自定义 scheme**：`bmm-item:` 之外的地址一律不理，不在总结窗口里开浏览器（商品详情
+  仍然走表格「链接」那一列）。
+- 主窗口那边按 `clusterId` 找行、整行选中、把当前格落在商品名上并滚到可视区中间；报告开着的
+  期间那件商品被删了的话，只在状态栏说一句「已经不在清单里了」，不猜也不乱跳。
+
 **累积确认的基线**（`app.ack_change` / `ack_new_deals` / `ack_reached` / `BuildAckSummary`）
 
 总结窗口里那块「自上次确认以来」报的不是这一轮，而是**从上次确认攒到现在**的全部变化。
