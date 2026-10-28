@@ -10,7 +10,7 @@ import types
 
 import pytest
 from PyQt5.QtGui import QColor, QPalette
-from PyQt5.QtWidgets import QComboBox, QPlainTextEdit, QStyle
+from PyQt5.QtWidgets import QComboBox, QDialog, QPlainTextEdit, QStyle
 
 import theme
 
@@ -147,6 +147,102 @@ def test_apply_theme_sets_app_stylesheet(qapp, dark):
 
     theme.apply_theme(qapp, not dark)
     assert qapp.styleSheet() == theme.qss_for(not dark)
+
+
+# ---------------- 原生标题栏 ----------------
+#
+# DWM 只在真实 Windows 上有意义，测试跑在 offscreen 上，所以这里把
+# 「是不是 Windows」和「调 DWM」都换成假的，只验调用路径与兜底。
+
+
+@pytest.mark.parametrize("dark, value", [(True, 1), (False, 0)])
+def test_dark_title_bar_sets_the_theme_value(monkeypatch, dark, value):
+    """暗色传 1、浅色传 0；先试 Win10 2004+ 的属性 20。"""
+    calls = []
+    monkeypatch.setattr(theme, "_is_windows", lambda: True)
+    monkeypatch.setattr(
+        theme, "_set_dwm_attribute",
+        lambda hwnd, attribute, val: calls.append((hwnd, attribute, val)) or True,
+    )
+
+    class _Window:
+        def winId(self):
+            return 123
+
+    assert theme.apply_dark_title_bar(_Window(), dark) is True
+    assert calls == [(123, 20, value)]
+
+
+def test_dark_title_bar_falls_back_to_the_older_attribute(monkeypatch):
+    """老 Win10 不认属性 20，接着试 19；成功一次就停。"""
+    calls = []
+    monkeypatch.setattr(theme, "_is_windows", lambda: True)
+    monkeypatch.setattr(
+        theme, "_set_dwm_attribute",
+        lambda hwnd, attribute, value: calls.append((hwnd, attribute, value)) or attribute == 19,
+    )
+
+    class _Window:
+        def winId(self):
+            return 123
+
+    assert theme.apply_dark_title_bar(_Window(), True) is True
+    assert calls == [(123, 20, 1), (123, 19, 1)]
+
+
+def test_dark_title_bar_is_a_noop_outside_windows(monkeypatch):
+    """非 Windows 平台连句柄都不该碰（offscreen 测试也走这条）。"""
+    monkeypatch.setattr(theme, "_is_windows", lambda: False)
+
+    class _Window:
+        def winId(self):
+            raise AssertionError("非 Windows 不该取句柄")
+
+    assert theme.apply_dark_title_bar(_Window(), True) is False
+
+
+def test_dark_title_bar_survives_a_deleted_window(monkeypatch):
+    """窗口已经销毁时只放弃配色，不让换主题把程序带崩。"""
+    monkeypatch.setattr(theme, "_is_windows", lambda: True)
+
+    class _Window:
+        def winId(self):
+            raise RuntimeError("wrapped C/C++ object has been deleted")
+
+    assert theme.apply_dark_title_bar(_Window(), True) is False
+
+
+def test_dark_title_bar_filter_colors_dialogs_when_they_show(qapp, monkeypatch):
+    """Show 事件到的时候原生句柄已经在了，过滤器就在这一刻补色。"""
+    seen = []
+    monkeypatch.setattr(
+        theme, "apply_dark_title_bar",
+        lambda window, dark: seen.append((window, dark)),
+    )
+    event_filter = theme._DarkTitleBarFilter()
+    event_filter.dark = True
+    qapp.installEventFilter(event_filter)
+    dialog = QDialog()
+    try:
+        dialog.show()
+        qapp.processEvents()
+        assert any(window is dialog and dark is True for window, dark in seen)
+    finally:
+        qapp.removeEventFilter(event_filter)
+        dialog.close()
+
+
+def test_apply_theme_keeps_the_title_bar_filter_in_sync(qapp, monkeypatch):
+    """换主题时也要把已开窗口的标题栏翻过来，不能只记在过滤器上。"""
+    monkeypatch.setattr(theme, "_is_windows", lambda: True)
+    monkeypatch.setattr(theme, "apply_dark_title_bar", lambda window, dark: True)
+
+    theme.apply_theme(qapp, True)
+    assert theme._dark_title_bar_filter is not None
+    assert theme._dark_title_bar_filter.dark is True
+
+    theme.apply_theme(qapp, False)
+    assert theme._dark_title_bar_filter.dark is False
 
 
 # ---------------- 占位文字配色 ----------------

@@ -4,10 +4,12 @@
 所以系统主题判断、样式表应用、占位色设置全都自带兜底。
 """
 
-from PyQt5.QtCore import QPointF, Qt
-from PyQt5.QtGui import QColor, QPainter, QPalette, QPolygonF
+from PyQt5.QtCore import QEvent, QObject, QPointF, Qt
+from PyQt5.QtGui import QColor, QGuiApplication, QPainter, QPalette, QPolygonF
 from PyQt5.QtWidgets import (
     QComboBox,
+    QDialog,
+    QMainWindow,
     QProxyStyle,
     QStyle,
     QStyleOptionComboBox,
@@ -259,6 +261,100 @@ def qss_for(dark: bool) -> str:
     return DARK_QSS if dark else LIGHT_QSS
 
 
+# Windows 的标题栏默认由系统画，样式表管不到。暗色主题下它仍是白的，像在
+# 深色窗口上贴了一条白纸。这里用 DWM 的「沉浸式暗色」属性把它一起压暗。
+# 20 是 Win10 2004+ / Win11 的值，19 是更老的 Win10；逐个试，成功就停。
+DARK_TITLE_BAR_ATTRIBUTES = (20, 19)
+_dark_title_bar_filter = None
+
+
+def _is_windows() -> bool:
+    """当前 Qt 平台是不是 Windows 的原生窗口（offscreen 等测试平台直接跳过）。"""
+    try:
+        return QGuiApplication.platformName().startswith("windows")
+    except Exception:
+        return False
+
+
+def _set_dwm_attribute(hwnd, attribute, value) -> bool:
+    """调一次 DwmSetWindowAttribute；成功（HRESULT 为 0）返回 True。
+
+    DwmSetWindowAttribute 在「没开桌面合成 / 老系统」上会失败，这是预期内的：
+    调用方只当标题栏没上成色，不影响窗口本身。
+    """
+    try:
+        import ctypes
+
+        function = ctypes.windll.dwmapi.DwmSetWindowAttribute
+        # 不写 argtypes 的话，64 位下 HWND 会按 c_int 截断，句柄直接传错
+        function.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint,
+        ]
+        function.restype = ctypes.c_long
+        data = ctypes.c_int(value)
+        result = function(
+            ctypes.c_void_p(hwnd), attribute, ctypes.byref(data), ctypes.sizeof(data)
+        )
+        return result == 0
+    except Exception as err:  # 非 Windows、dwmapi 缺失、句柄已销毁……
+        print(f"[theme] 设置标题栏配色失败：{err}")
+        return False
+
+
+def apply_dark_title_bar(window, dark: bool) -> bool:
+    """把窗口的原生标题栏刷成暗色/浅色；Windows 以外或失败时安静跳过。
+
+    必须等窗口有原生句柄（`winId()`）之后才能调，所以主要挂在 Show 事件上；
+    换主题时对已经开着的窗口再补一遍。
+    """
+    if window is None or not _is_windows():
+        return False
+    try:
+        hwnd = int(window.winId())
+    except (RuntimeError, TypeError, ValueError) as err:
+        print(f"[theme] 取窗口句柄失败：{err}")
+        return False
+    if not hwnd:
+        return False
+    value = 1 if dark else 0
+    for attribute in DARK_TITLE_BAR_ATTRIBUTES:
+        if _set_dwm_attribute(hwnd, attribute, value):
+            return True
+    return False
+
+
+class _DarkTitleBarFilter(QObject):
+    """给每个新出现的窗口补标题栏配色：窗口 Show 的时候原生句柄才靠谱。"""
+
+    def __init__(self):
+        super().__init__()
+        self.dark = False
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Show and isinstance(obj, (QDialog, QMainWindow)):
+            apply_dark_title_bar(obj, self.dark)
+        return False
+
+
+def install_dark_title_bar(app, dark: bool):
+    """装一次全局过滤器，并让已经开着的窗口立刻跟着主题走。"""
+    global _dark_title_bar_filter
+
+    if app is None or not hasattr(app, "installEventFilter") or not _is_windows():
+        return
+    try:
+        if _dark_title_bar_filter is None:
+            _dark_title_bar_filter = _DarkTitleBarFilter()
+            app.installEventFilter(_dark_title_bar_filter)
+        _dark_title_bar_filter.dark = dark
+        # 隐藏的窗口不用管：Show 的时候过滤器会补上，也省得提前造原生句柄
+        for widget in app.topLevelWidgets():
+            if isinstance(widget, (QDialog, QMainWindow)) and widget.isVisible():
+                apply_dark_title_bar(widget, dark)
+    except Exception as err:  # 对象已销毁（RuntimeError）等：配色没上成不影响使用
+        print(f"[theme] 安装标题栏配色失败：{err}")
+
+
 def deal_highlight_color(text) -> QColor:
     """把配置里的「近期成交」高亮色解析成 QColor；认不出来退回默认色。
 
@@ -465,5 +561,6 @@ def apply_theme(app, dark: bool):
         return
     try:
         app.setStyleSheet(qss_for(dark))
+        install_dark_title_bar(app, dark)
     except Exception as err:  # 对象已销毁（RuntimeError）等：样式没上成也不影响数据
         print(f"[theme] 应用主题失败：{err}")

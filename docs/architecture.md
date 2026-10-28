@@ -64,7 +64,7 @@ BiliMarketMonitor/
 | [src/settings.py](../src/settings.py) | 设置窗口：把配置项摆成三页表单，收值与校验 | `SettingsDialog`、`FIELDS`、`changed_values(values, original)` |
 | [src/net.py](../src/net.py) | 出网的唯一接缝：按线程复用 `requests.Session`，别处不再直接 import requests 发请求 | `net.get(url, timeout)`、`net.post(url, **kwargs)`、`session()` |
 | [src/store.py](../src/store.py) | SQLite 缓存：随清单增删、损坏自愈 | `Store`（`sync` / `upsert_item` / `get_all` / `cached_deals`）、`default_db_path()` |
-| [src/theme.py](../src/theme.py) | 深浅两套 QSS、系统深浅色判断、各处配色 | `apply_theme(app, dark)`、`qss_for(dark)`、`system_uses_dark()` |
+| [src/theme.py](../src/theme.py) | 深浅两套 QSS、系统深浅色判断、Windows 标题栏配色、各处配色 | `apply_theme(app, dark)`、`qss_for(dark)`、`system_uses_dark()`、`apply_dark_title_bar(window, dark)` |
 | [src/thumbs.py](../src/thumbs.py) | 缩略图磁盘缓存：按图片地址存取、原子写、按数量上限清理 | `load(url)`、`save(url, data)`、`cache_dir()`、`path_for(url)` |
 | [src/notifier.py](../src/notifier.py) | 企业微信群机器人推送：只管把一条 markdown 发出去 | `Notifier`（`send` / `sent` / `failed`）、`_post_wecom(...)` |
 
@@ -85,6 +85,10 @@ BiliMarketMonitor/
 - **网页地址（webhook）是敏感信息**：只在 `data/config.toml` 里出现（`config.example.toml` 给的是空串），
   不入库、不写进缓存；出错文案里可能夹着它（requests 的网络异常会把整条 URL 抄进去），
   所以 `notifier._redact_webhook` 会把 `key=` 后面那段先抹掉再往外说。
+- **原生标题栏不归 Qt 样式表管**：Windows 下暗色主题用 DWM 的沉浸式暗色属性
+  （`theme.apply_dark_title_bar`，先试 20、老 Win10 退回 19）把标题栏一起压暗；
+  新窗口在 Show 事件里补，换主题时对已开的窗口再刷一遍。非 Windows / 老系统 / 句柄已销毁
+  都只放弃配色、打一行日志，不影响窗口本身。
 - **测试面**：`parser` 和 `links` 是纯函数，最好测；`app` 有 3300 多行、逻辑最重，测试也最厚
   （`tests/test_app.py` 5500 行）；改这两处时对应测试一起改。
   `notifier` 的发送链路全 mock，测试一个字节都不出网。
@@ -528,6 +532,7 @@ data/watchlist.txt
 | 设置窗口里填了不合格的值（数字框里写了别的、颜色名不存在、webhook 不是企业微信的地址） | 窗口不关，底部列出「页签：原因」并翻到出问题的那一页；一项不合格就整份不写，不留半新半旧的配置 |
 | 写 `config.toml` 失败（只读、盘满） | 弹一句提示，本次改的都不生效（主题也不换）；内存里的配置不动，省得跟文件对不上 |
 | 推送发不出去（网络、webhook 被删、地址填错） | 控制台打一行带原因，状态栏在后面接一句「企业微信推送失败：…」；**不弹窗**，抓取结果照旧 |
+| 原生标题栏没法跟着主题变（非 Windows、老系统、窗口已销毁） | 保留系统默认标题栏，控制台打一行原因；窗口内容与主题照常 |
 
 留痕的路子是同一个：`store` 和 `links` 的公开操作都收一个 `notes` 列表（不传就只静默降级），
 模块往里面 append，`app` 取走后拼成一句话送进状态栏。区别是 `store` 自己持有 `notes`
