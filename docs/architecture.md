@@ -453,6 +453,10 @@ data/watchlist.txt
   可选字段就整张表渲染不出来。
 - **点一下不关报告**：报告是独立窗口，用户可能还要接着点别的条目，关掉就得重新
   「查看上次总结」。跳转只把主窗口提到前面、选中那一行；报告挡着了由用户自己挪开。
+- **最小化时先还原**：自动抓取跑完弹报告时主窗口常常还最小化着，而最小化窗口上的
+  `raise_()` / `activateWindow()` 都是空操作。`RestoreMainWindow()` 先清掉
+  `WindowMinimized`（保留 `WindowMaximized`，不把最大化状态一起抹掉）再提到前面，
+  否则选中了那一行也看不见。
 - **只认自定义 scheme**：`bmm-item:` 之外的地址一律不理，不在总结窗口里开浏览器（商品详情
   仍然走表格「链接」那一列）。
 - 主窗口那边按 `clusterId` 找行、整行选中、把当前格落在商品名上并滚到可视区中间；报告开着的
@@ -641,7 +645,7 @@ pixi run shot           # 出图在 tmp/out/，每个场景深色/浅色各一�
 | 缩略图的尺寸、并发数、磁盘缓存上限 | `app.IMAGE_SIZE` / `IMAGE_SUFFIX` / `IMAGE_WORKERS`（改 `IMAGE_SIZE` 会让盘上旧缓存自动作废）、`thumbs.MAX_FILES` |
 | 成交判「新增」的算法 | `app.new_deals()` / `_aged_from()` |
 | 「查看上次总结」按钮、快照留多久 | `app.ShowSummary()` / `app.OnShowLastSummary()` / `app._OpenSummaryDialog()`；顶部按钮在 `InitUI()` 的 `info_bar` 里 |
-| 总结里的商品名能不能点、点了跳哪儿 | 链接在 `app._name_html()`（scheme 是 `SUMMARY_ITEM_SCHEME`），信号在 `SummaryDialog.name_clicked`，跳转在 `MainWindow.OnSummaryItemClicked()` |
+| 总结里的商品名能不能点、点了跳哪儿 | 链接在 `app._name_html()`（scheme 是 `SUMMARY_ITEM_SCHEME`），信号在 `SummaryDialog.name_clicked`，跳转在 `MainWindow.OnSummaryItemClicked()`；最小化时先 `RestoreMainWindow()` |
 | 拖拽排序的落点、自动滚动速度与触发边距 | `app.ReorderableTable`（`dragMoveEvent` / `_update_drag_scroll` / `_on_drag_scroll`）；速度与边距是顶部 `DRAG_SCROLL_*` 常量 |
 | 史低价的只降不升规则 | `app.updated_lowest()` / `at_lowest()`；存的那一列在 `store.ITEM_COLUMNS` |
 | 累积确认（攒什么、什么时候清零、顶部那句话） | 判据 `app.ack_change()` / `ack_new_deals()` / `ack_reached()` / `BuildAckSummary()`；写入 `store.acknowledge()` / `init_ack_if_empty()`（列在 `ITEM_COLUMNS`）；按钮与那句提示在 `SummaryDialog.btn_ack` / `MainWindow.ack_label` |

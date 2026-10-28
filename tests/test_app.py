@@ -6012,6 +6012,36 @@ def test_clicking_a_summary_name_selects_the_row_and_keeps_the_report(window):
     assert "丙" in w.progress_label.text()
 
 
+def test_clicking_a_summary_name_restores_a_minimized_main_window(window):
+    """报告是在主窗口最小化时弹出来的：点商品名得先把主窗口还原，否则选中了也看不见。"""
+    w = _loaded(window, ("10000008780", "甲"), ("10000000002", "乙"))
+    w.show()
+    w.setWindowState(Qt.WindowMinimized)
+    assert w.isMinimized()
+    w.ShowSummary()
+
+    assert w.OnSummaryItemClicked("10000000002") is True
+
+    assert not w.isMinimized()
+    assert w.isVisible()
+    assert w.table.currentRow() == 1
+
+
+def test_clicking_a_summary_name_keeps_the_maximized_state(window):
+    """最大化之后再最小化的那种：还原出来还是最大化，不能缩成默认大小的小窗。"""
+    w = _loaded(window, ("10000008780", "甲"))
+    w.show()
+    w.setWindowState(Qt.WindowMaximized)
+    w.setWindowState(w.windowState() | Qt.WindowMinimized)
+    assert w.isMinimized() and w.isMaximized()
+    w.ShowSummary()
+
+    assert w.OnSummaryItemClicked("10000008780") is True
+
+    assert not w.isMinimized()
+    assert w.isMaximized()
+
+
 def test_clicking_a_removed_summary_name_only_says_so(window):
     """报告开着的这段时间里那件商品被删了：只提示一句，不乱跳、也不关窗口。"""
     w = _loaded(window, ("10000008780", "甲"))

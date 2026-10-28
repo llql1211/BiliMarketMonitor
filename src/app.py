@@ -3609,11 +3609,29 @@ class MainWindow(QMainWindow):
         self.summary_dialog.name_clicked.connect(self.OnSummaryItemClicked)
         self.summary_dialog.show()
 
+    def RestoreMainWindow(self):
+        """把主窗口从最小化里还原并提到前面。
+
+        最小化时 raise_() / activateWindow() 都是空操作——窗口还贴在任务栏上，
+        得先改窗口状态。用 windowState() 而不是 showNormal()：最大化之后再最小化
+        的那种，showNormal() 会把最大化一并抹掉，还原出来是个小窗。
+
+        自动抓取弹报告时主窗口常常还最小化着（见 OnSummaryItemClicked），
+        用户点了报告里的商品名却看不见跳过去的行，就是少了这一步。
+        """
+        state = self.windowState()
+        if state & Qt.WindowMinimized:
+            self.setWindowState((state & ~Qt.WindowMinimized) | Qt.WindowActive)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
     def OnSummaryItemClicked(self, cluster_id):
         """总结里点了商品名：保留报告，把表格滚到那一件并选中。
 
         报告不关：用户可能还要接着看别的条目，关掉就得重新点「查看上次总结」。
-        这里只把主窗口提到前面、选中那一行；报告是独立窗口，挡着了可以自己挪开。
+        主窗口最小化着的时候先还原它（见 RestoreMainWindow），否则选中了也看不见；
+        报告是独立窗口，挡着了可以自己挪开。
 
         报告里的商品可能已经被删了（先开着报告、再去删清单里那一行），那种情况
         只留一句状态栏提示，不猜也不乱跳。
@@ -3622,8 +3640,7 @@ class MainWindow(QMainWindow):
         for row, item in enumerate(self.rows):
             if item["entry"].cluster_id != cluster_id:
                 continue
-            self.raise_()
-            self.activateWindow()
+            self.RestoreMainWindow()
             # 整行选中，并把"当前格"落在商品名上（光标键、复制都从这儿起）
             self.SelectItems([cluster_id])
             self.table.selectionModel().setCurrentIndex(
