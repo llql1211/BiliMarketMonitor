@@ -169,6 +169,7 @@ def parse_cluster(resp: dict) -> dict:
         "sold_out": False,
         "stock_count": None,
         "item_id": None,
+        "self_hint": False,
     }
 
     # 调用方传进来的不一定是 dict（None/列表/数字），直接按"查询失败"处理
@@ -188,6 +189,10 @@ def parse_cluster(resp: dict) -> dict:
 
     # 会员购主商品 ID：店铺只能靠它再查一次 items/info（见 parse_item_shop）
     result["item_id"] = _clean_id(_dig(data, "reportParams", "item_id"))
+
+    # 服务标签里的「自营 / 官仓直发」：主商品查不到（已下架）时，这是唯一还能说明
+    # "这单是谁卖的"的东西（见 parse_item_shop 与 app.NameDelegate）
+    result["self_hint"] = _self_hint(_dig(data, "clusterServiceFloorVO", "services"))
 
     # 价格区：firstPrice 是「现价」，price 是划线那个「原价」。
     # 注意售罄时接口整组不返回 price/priceSymbol，此时 firstPrice 装的就是原价
@@ -316,6 +321,28 @@ def _normalize_shop(result: dict) -> dict:
         "self_sold": self_sold if ok and isinstance(self_sold, bool) else None,
         "gone": bool(result.get("gone")) if ok else False,
     }
+
+
+def _self_hint(services) -> bool:
+    """服务标签里有没有「自营 / 官仓直发」。
+
+    抽样 120 件：带这组标签的 27 件全是会员购自营，商家商品零例（见
+    dev_notes/261101_市集店铺信息调查.md），所以命中即自营；但**没有标签说明不了
+    任何事**——自营商品里只有一半左右带它。
+
+    它是给「主商品已经查不到」的行兜底的：items/info 回 81100001 时问不出店铺，
+    而 cluster 自己还带着这组标签，靠它至少能把「自营」标出来，而不是一片空白。
+    """
+    if not isinstance(services, list):
+        return False
+    for service in services:
+        if not isinstance(service, dict):
+            continue
+        kind = _clean_text(service.get("type")) or ""
+        name = _clean_text(service.get("name")) or ""
+        if kind in ("self", "direct") or "自营" in name or "直发" in name:
+            return True
+    return False
 
 
 def _clean_id(value) -> str | None:
@@ -467,4 +494,5 @@ def _normalize_result(result: dict) -> dict:
         "sold_out": bool(result.get("sold_out")),
         "stock_count": _positive_int(result.get("stock_count")),
         "item_id": _clean_id(result.get("item_id")),
+        "self_hint": bool(result.get("self_hint")),
     }

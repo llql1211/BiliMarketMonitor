@@ -43,6 +43,7 @@ def test_parse_error_structure():
         "sold_out": False,
         "stock_count": None,
         "item_id": None,
+        "self_hint": False,
     }
 
 
@@ -355,7 +356,7 @@ def test_result_structure_is_always_the_same(resp):
     result = parser.parse_cluster(resp)
     assert set(result) == {
         "ok", "error", "name", "price", "reference_price", "avg_price",
-        "deals", "image_url", "sold_out", "stock_count", "item_id",
+        "deals", "image_url", "sold_out", "stock_count", "item_id", "self_hint",
     }
     assert isinstance(result["ok"], bool)
     assert isinstance(result["sold_out"], bool)
@@ -748,3 +749,49 @@ def test_parse_item_shop_without_merchant_id_falls_back_to_the_name():
     empty = parser.parse_item_shop(_item_response(merchant_id=None))
     assert empty["ok"] is True
     assert empty["shop"] is None and empty["self_sold"] is None
+
+
+# ---------------- 服务标签「自营 / 官仓直发」 ----------------
+
+SELF_SERVICES = [
+    {"type": "self", "name": "自营", "style": 1},
+    {"type": "authentic", "name": "正品保障", "style": 1},
+    {"type": "direct", "name": "官仓直发", "style": 1},
+    {"type": "fresh", "name": "全新一手", "style": 1},
+]
+
+
+def _with_services(services):
+    resp = _base_response()
+    if services is not None:
+        resp["data"]["clusterServiceFloorVO"] = {"services": services}
+    return resp
+
+
+def test_cluster_self_hint_comes_from_the_service_tags():
+    """主商品查不到时，cluster 自己的服务标签是唯一还能说明"谁卖的"的东西。"""
+    assert parser.parse_cluster(_with_services(SELF_SERVICES))["self_hint"] is True
+
+    # 只有单项标签也要认；不认识的标签、空列表、整个 floor 不返回都当没有
+    assert parser.parse_cluster(
+        _with_services([{"type": "self", "name": "自营", "style": 1}])
+    )["self_hint"] is True
+    assert parser.parse_cluster(
+        _with_services([{"type": "authentic", "name": "正品保障", "style": 1}])
+    )["self_hint"] is False
+    assert parser.parse_cluster(_with_services([]))["self_hint"] is False
+    assert parser.parse_cluster(_with_services(None))["self_hint"] is False
+
+
+def test_self_hint_does_not_look_at_the_name_alone():
+    """标签是按 type 认的，名字里出现「自营」两个字也算——但别的字样不算。"""
+    assert parser.parse_cluster(
+        _with_services([{"type": "x", "name": "会员购自营", "style": 1}])
+    )["self_hint"] is True
+    assert parser.parse_cluster(
+        _with_services([{"type": "x", "name": "商家发货", "style": 1}])
+    )["self_hint"] is False
+    # 标签列表里混进脏数据（字符串、None）不该炸
+    assert parser.parse_cluster(
+        _with_services(["自营", None, 42, {"type": "self"}])
+    )["self_hint"] is True
