@@ -41,10 +41,13 @@ ITEM_COLUMNS = (
     # 售卖店铺。三个字段是一组快照，但在**另一个维度**上刷新：店铺挂在会员购
     # 主商品（reportParams.item_id）上，几乎不变，所以只在 item_id 换过时才重写，
     # 不是每轮都写（见 upsert_item 的 shop 参数）。shop_item_id 同时是"查过了"
-    # 的标记：商品被删时它也有值、后两列是 NULL，免得每轮都去问一件已经没有的商品
+    # 的标记：商品被删时它也有值、后两列是 NULL。那种"查过但认不出"的记录靠
+    # shop_checked_at 隔几天重新问一次（见 app.SHOP_RECHECK_DAYS）——一次误报的
+    # "已删"不该把这一行永久钉死
     ("shop_item_id", "TEXT"),       # 这份店铺信息对应哪个 itemsId
     ("shop_name", "TEXT"),          # 商家店铺名；NULL = 自营或没查到
     ("shop_self", "INTEGER"),       # 1 = 会员购自营，0 = 商家，NULL = 不知道
+    ("shop_checked_at", "TEXT"),    # 店铺是哪一刻问出来的（"问过但认不出"隔几天重问）
     # 上次「确认」时这行是什么样子（见 acknowledge / init_ack_if_empty，界面上那块
     # 「自上次确认以来」拿它当基准）。跟 favorite 一样是**用户意图**：抓取一个字都
     # 不碰——upsert_item 的列清单里没有这几列，只有确认那两处会写。
@@ -321,6 +324,8 @@ class Store:
         只在 itemsId 换过时才重查（见 app.PollerThread）。所以这里按
         「shop_item_id 给没给」分两种情况：给了就整组按这次的结果重写（店名可以是
         NULL——自营和"商品已删"都没有店名），没给（这次没查/没查到）就一个字不动。
+        shop_checked_at 跟着这一组走：它记的是"这次问出来的"，用来判断"问过但没
+        认出来"的那些记录该不该过几天再问一遍。
         """
         self._begin()
         cluster_id = _clean_id(cluster_id)
@@ -335,8 +340,9 @@ class Store:
                                       price_text, reference_price, avg_text,
                                       sold_out, stock_count, price_updated_at,
                                       lowest_price, deals_json, deals_updated_at,
-                                      shop_item_id, shop_name, shop_self)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      shop_item_id, shop_name, shop_self,
+                                      shop_checked_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(cluster_id) DO UPDATE SET
                        name       = COALESCE(excluded.name, name),
                        image_url  = COALESCE(excluded.image_url, image_url),
@@ -368,7 +374,10 @@ class Store:
                                                ELSE excluded.shop_name END,
                        shop_self        = CASE WHEN excluded.shop_item_id IS NULL
                                                THEN shop_self
-                                               ELSE excluded.shop_self END""",
+                                               ELSE excluded.shop_self END,
+                       shop_checked_at  = CASE WHEN excluded.shop_item_id IS NULL
+                                               THEN shop_checked_at
+                                               ELSE excluded.shop_checked_at END""",
                 (
                     cluster_id,
                     _clean_name(name),
@@ -386,6 +395,7 @@ class Store:
                     shop_item_id,
                     shop_name,
                     shop_self,
+                    now if shop_item_id is not None else None,
                 ),
             )
         return now

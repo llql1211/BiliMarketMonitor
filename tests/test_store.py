@@ -990,25 +990,44 @@ SHOP = {"item_id": "13662015", "name": "Vsinger官方旗舰店", "self": False}
 
 
 def test_upsert_item_saves_shop(db):
-    """店铺三列一起写：店名 + 自营标记 + 这份信息对应哪个 itemsId。"""
+    """店铺四列一起写：店名 + 自营标记 + 对应哪个 itemsId + 什么时候问的。"""
     st = store.Store(db)
     st.upsert_item("1001", "甲", None, shop=SHOP)
     row = st.get_item("1001")
     assert row["shop_item_id"] == "13662015"
     assert row["shop_name"] == "Vsinger官方旗舰店"
     assert row["shop_self"] == 0
+    assert row["shop_checked_at"]  # 有值就说明问过（"已删"的那种靠它算过期）
 
 
 def test_upsert_without_shop_keeps_the_cached_one(db):
     """这次没查店铺（shop 缺省/None）时一个字都不动：下轮重试时不能把旧店名冲掉。"""
     st = store.Store(db)
     st.upsert_item("1001", "甲", None, shop=SHOP)
+    checked_at = st.get_item("1001")["shop_checked_at"]
     st.upsert_item("1001", "甲", None)
     st.upsert_item("1001", "甲", None, shop={"name": "半截数据"})  # 没 item_id，不算
     row = st.get_item("1001")
     assert row["shop_name"] == "Vsinger官方旗舰店"
     assert row["shop_self"] == 0
     assert row["shop_item_id"] == "13662015"
+    assert row["shop_checked_at"] == checked_at  # 没重查就别把时间刷成刚刚
+
+
+def test_upsert_shop_refreshes_the_checked_time(db):
+    """重查过一次就把时间刷新：靠它算"这条结论过期没有"。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", None,
+                   shop={"item_id": "13662015", "name": None, "self": None})
+    first = st.get_item("1001")["shop_checked_at"]
+    st.upsert_item("1001", "甲", None,
+                   shop={"item_id": "13662015", "name": None, "self": None})
+    second = st.get_item("1001")["shop_checked_at"]
+    assert first and second
+    assert second >= first
+    # 新插入、这次没查店铺的行不该凭空有个"问过"的时间
+    st.upsert_item("1002", "乙", None)
+    assert st.get_item("1002")["shop_checked_at"] is None
 
 
 def test_upsert_shop_for_a_new_item_replaces_the_old_one(db):
@@ -1047,7 +1066,7 @@ def test_upsert_shop_strips_blank_names(db):
 
 
 def test_old_db_without_shop_columns_is_upgraded(db):
-    """老库打开时自动补上店铺三列，老行算"还没查过"。"""
+    """老库打开时自动补上店铺那几列，老行算"还没查过"。"""
     conn = sqlite3.connect(db)
     with conn:
         conn.execute(
@@ -1066,6 +1085,7 @@ def test_old_db_without_shop_columns_is_upgraded(db):
     assert row["shop_item_id"] is None
     assert row["shop_name"] is None
     assert row["shop_self"] is None
+    assert row["shop_checked_at"] is None
 
     st.upsert_item("1001", "甲", None, shop=SHOP)
     assert st.get_item("1001")["shop_name"] == "Vsinger官方旗舰店"
