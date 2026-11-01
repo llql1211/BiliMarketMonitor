@@ -5691,10 +5691,62 @@ def test_cached_shop_item_ids_only_covers_the_given_tasks(window):
     tasks = [(0, w.rows[0]["entry"])]
     assert w.CachedShopItemIds(tasks) == {"10000008780": "13662015"}
 
+    # 还没查过的那行不出现在字典里（线程自然会去问），不是显式记一个 None
     both = [(0, w.rows[0]["entry"]), (1, w.rows[1]["entry"])]
-    assert w.CachedShopItemIds(both) == {
-        "10000008780": "13662015", "10000000002": None,
+    assert w.CachedShopItemIds(both) == {"10000008780": "13662015"}
+
+
+def _stamp_days_ago(days):
+    return (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+
+
+def test_gone_shop_is_asked_again_after_a_week(window):
+    """「商品已删」的结论会过期：隔 7 天再问，别让一次误报把这一行永久钉死。"""
+    w = window("10000008780 | 甲\n")
+    w.store.upsert_item(
+        "10000008780", "甲", None,
+        shop={"item_id": "13662015", "name": None, "self": None},
+    )
+    w.LoadWatchlist(w.watchlist_path)
+    tasks = [(0, w.rows[0]["entry"])]
+
+    assert w.CachedShopItemIds(tasks) == {"10000008780": "13662015"}  # 刚查过，不问
+
+    w.rows[0]["record"]["shop_checked_at"] = _stamp_days_ago(8)
+    assert w.CachedShopItemIds(tasks) == {}  # 过期了，再问一次
+
+
+def test_shop_answers_are_not_rechecked_even_when_old(window):
+    """问出结果的（有店名/确认自营）不管放多久都不重问：店铺挂在主商品上，不会变。"""
+    w = window("10000008780 | 甲\n10000000002 | 乙\n")
+    w.store.upsert_item(
+        "10000008780", "甲", None,
+        shop={"item_id": "13662015", "name": "幻梦模玩", "self": False},
+    )
+    w.store.upsert_item(
+        "10000000002", "乙", None,
+        shop={"item_id": "13662999", "name": None, "self": True},
+    )
+    w.LoadWatchlist(w.watchlist_path)
+    for row in w.rows:
+        row["record"]["shop_checked_at"] = _stamp_days_ago(365)
+
+    tasks = [(row, item["entry"]) for row, item in enumerate(w.rows)]
+    assert w.CachedShopItemIds(tasks) == {
+        "10000008780": "13662015", "10000000002": "13662999",
     }
+
+
+def test_shop_recheck_due_survives_a_broken_timestamp(window):
+    """时间戳认不出来就当过期：宁可多问一次，也别把那行当成"问过了"。"""
+    record = {
+        "shop_item_id": "13662015",
+        "shop_name": None,
+        "shop_self": None,
+        "shop_checked_at": "不是时间",
+    }
+    assert app_module.shop_recheck_due(record) is True
+    assert app_module.shop_recheck_due({**record, "shop_checked_at": None}) is True
 
 
 def test_poller_retries_once_after_failure(qapp, monkeypatch, join_thread):

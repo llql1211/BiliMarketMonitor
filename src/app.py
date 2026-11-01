@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from PyQt5.QtCore import (
     QEvent,
@@ -254,6 +254,7 @@ SHOP_LINE_GAP = 2        # 名字和店名之间空多少
 MIN_SHOP_POINT_SIZE = 7.0  # 徽标/店名比正文小一档，但不小于这个点数（再小就成糊点）
 UNKNOWN_SHOP_TEXT = "未知"        # 悬停提示里的说法：「店铺：未知（商品可能已下架）」
 UNKNOWN_SHOP_LINE = "店铺未知"    # 第二行那个占位：查过但认不出，别留一片空白
+SHOP_RECHECK_DAYS = 7             # 「查过但认不出」的记录隔多久再问一次
 
 # 「现价」列一律左对齐：涨跌和剩余件数两截的落点都是从文本区左边算起的（见 segment_rect）
 PRICE_ALIGN = Qt.AlignLeft | Qt.AlignVCenter
@@ -1533,6 +1534,40 @@ def shop_line_text(shop, self_sold, checked=False) -> str:
     if checked:
         return f"店铺：{UNKNOWN_SHOP_TEXT}（商品可能已下架）"
     return ""
+
+
+def shop_answer_is_final(record) -> bool:
+    """缓存里这份店铺算不算"问清楚了"：有店名，或者已经确认过自营/商家。"""
+    if not isinstance(record, dict):
+        return False
+    if record.get("shop_name"):
+        return True
+    return record.get("shop_self") is not None
+
+
+def shop_recheck_due(record, now=None) -> bool:
+    """"问过但认不出"的那条记录，该不该再问一遍。
+
+    `shop_item_id` 有值、店名和自营标记都空，说明当初问出来的是「商品已删除」。
+    这个结论会过期：商品可能重新上架，接口也可能偶发误报。所以隔
+    SHOP_RECHECK_DAYS 天重问一次；问出了结果的行、没问过的行都不归这里管。
+
+    时间戳缺失或认不出来时当成过期——宁可多问一次，也别让一次误报把一行永久钉死。
+    """
+    if not isinstance(record, dict) or record.get("shop_item_id") is None:
+        return False
+    if shop_answer_is_final(record):
+        return False
+    stamp = record.get("shop_checked_at")
+    if not stamp:
+        return True
+    try:
+        checked = datetime.fromisoformat(str(stamp))
+    except ValueError:
+        return True
+    return ((datetime.now() if now is None else now) - checked) >= timedelta(
+        days=SHOP_RECHECK_DAYS
+    )
 
 
 def name_tooltip(head, cluster_id, shop=None, self_sold=None, checked=False) -> str:
@@ -3480,16 +3515,26 @@ class MainWindow(QMainWindow):
         return f"自动抓取（{AUTO_SCOPE_LABELS.get(scope, scope)}）"
 
     def CachedShopItemIds(self, tasks):
-        """这批任务里，缓存中那份店铺各自对应哪个 itemsId（clusterId -> itemsId）。
+        """这批任务里，店铺已经问清楚、这轮不必再问的行（clusterId -> itemsId）。
 
-        轮询线程拿它判断"这件商品的店铺还用不用再问"：一样就不问。只算这次要抓的
-        那几行——部分抓取时不必把所有商品的店铺都扫一遍。
+        轮询线程拿它判断"这件的店铺还用不用再问"：对上了就跳过。两种算问清楚：
+        - 问出了结果（有店名，或确认是自营/商家）：店铺挂在主商品上，基本不变；
+        - 问过但认不出（商品已删）：留着，但隔 SHOP_RECHECK_DAYS 天再问一次
+          （见 shop_recheck_due）——一次误报的"已删"不该把这一行永久钉死。
+
+        没查过的行压根不出现在字典里，线程自然会去问。只算这次要抓的那几行，
+        部分抓取时不必把所有商品的店铺都扫一遍。
         """
+        now = datetime.now()
         ids = {}
         for row, entry in tasks:
-            if 0 <= row < len(self.rows):
-                record = self.rows[row]["record"] or {}
-                ids[entry.cluster_id] = record.get("shop_item_id")
+            if not 0 <= row < len(self.rows):
+                continue
+            record = self.rows[row]["record"] or {}
+            item_id = record.get("shop_item_id")
+            if item_id is None or shop_recheck_due(record, now):
+                continue
+            ids[entry.cluster_id] = item_id
         return ids
 
     def StartFetch(self, tasks, source="manual"):
