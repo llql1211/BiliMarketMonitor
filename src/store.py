@@ -38,6 +38,13 @@ ITEM_COLUMNS = (
                                     # 不改高；是缓存里唯一一条"重抓补不回来"的记录
     ("deals_json", "TEXT"),         # 上次抓到的近 N 条成交（JSON 数组）
     ("deals_updated_at", "TEXT"),   # 上面那组成交是什么时候抓的
+    # 售卖店铺。三个字段是一组快照，但在**另一个维度**上刷新：店铺挂在会员购
+    # 主商品（reportParams.item_id）上，几乎不变，所以只在 item_id 换过时才重写，
+    # 不是每轮都写（见 upsert_item 的 shop 参数）。shop_item_id 同时是"查过了"
+    # 的标记：商品被删时它也有值、后两列是 NULL，免得每轮都去问一件已经没有的商品
+    ("shop_item_id", "TEXT"),       # 这份店铺信息对应哪个 itemsId
+    ("shop_name", "TEXT"),          # 商家店铺名；NULL = 自营或没查到
+    ("shop_self", "INTEGER"),       # 1 = 会员购自营，0 = 商家，NULL = 不知道
     # 上次「确认」时这行是什么样子（见 acknowledge / init_ack_if_empty，界面上那块
     # 「自上次确认以来」拿它当基准）。跟 favorite 一样是**用户意图**：抓取一个字都
     # 不碰——upsert_item 的列清单里没有这几列，只有确认那两处会写。
@@ -279,6 +286,7 @@ class Store:
         stock_count=None,
         lowest_price=None,
         deals=None,
+        shop=None,
     ):
         """保存抓取结果；新值为空时保留旧值。
 
@@ -308,6 +316,11 @@ class Store:
 
         返回这次写入用的时刻（成交快照的抓取时刻也是它）。调用方拿它当首次观察
         基线的锚点，省得再回读一遍（见 app.OnResultReady）。
+
+        店铺（shop）又是另一种节奏：它不是每轮都查得到，而是挂在会员购主商品上、
+        只在 itemsId 换过时才重查（见 app.PollerThread）。所以这里按
+        「shop_item_id 给没给」分两种情况：给了就整组按这次的结果重写（店名可以是
+        NULL——自营和"商品已删"都没有店名），没给（这次没查/没查到）就一个字不动。
         """
         self._begin()
         cluster_id = _clean_id(cluster_id)
@@ -315,13 +328,15 @@ class Store:
             self._note("抓取结果里的 clusterId 不合法，已跳过缓存写入")
             return None
         now = _now()
+        shop_item_id, shop_name, shop_self = _shop_fields(shop)
         with self.conn:
             self.conn.execute(
                 """INSERT INTO items (cluster_id, name, image_url, updated_at,
                                       price_text, reference_price, avg_text,
                                       sold_out, stock_count, price_updated_at,
-                                      lowest_price, deals_json, deals_updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      lowest_price, deals_json, deals_updated_at,
+                                      shop_item_id, shop_name, shop_self)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(cluster_id) DO UPDATE SET
                        name       = COALESCE(excluded.name, name),
                        image_url  = COALESCE(excluded.image_url, image_url),
@@ -346,7 +361,14 @@ class Store:
                        deals_json       = COALESCE(excluded.deals_json, deals_json),
                        deals_updated_at = CASE WHEN excluded.deals_json IS NULL
                                                THEN deals_updated_at
-                                               ELSE excluded.deals_updated_at END""",
+                                               ELSE excluded.deals_updated_at END,
+                       shop_item_id     = COALESCE(excluded.shop_item_id, shop_item_id),
+                       shop_name        = CASE WHEN excluded.shop_item_id IS NULL
+                                               THEN shop_name
+                                               ELSE excluded.shop_name END,
+                       shop_self        = CASE WHEN excluded.shop_item_id IS NULL
+                                               THEN shop_self
+                                               ELSE excluded.shop_self END""",
                 (
                     cluster_id,
                     _clean_name(name),
@@ -361,6 +383,9 @@ class Store:
                     _clean_cached_text(lowest_price),
                     _deals_json(deals),
                     now,
+                    shop_item_id,
+                    shop_name,
+                    shop_self,
                 ),
             )
         return now
@@ -627,6 +652,25 @@ def _deals_json(deals):
 def _dicts(items):
     """从缓存里读回来的东西中挑出成形的 dict（JSON 是外部输入，什么都可能在里面）。"""
     return [item for item in items or [] if isinstance(item, dict)]
+
+
+def _shop_fields(shop):
+    """把抓到的店铺 dict 拆成三列的值；形状不对一律当"这次没查"（返回三个 None）。
+
+    item_id 缺失就不写：它是"这次查的是哪件主商品"的凭据，没有它，写进去的
+    空店名会被当成"查过了、确实没有店铺"，从此不再重试。
+    """
+    if not isinstance(shop, dict):
+        return None, None, None
+    item_id = _clean_cached_text(shop.get("item_id"))
+    if item_id is None:
+        return None, None, None
+    self_sold = shop.get("self")
+    if isinstance(self_sold, bool):
+        self_flag = int(self_sold)
+    else:
+        self_flag = None  # 不知道是自营还是商家（比如商品已删）
+    return item_id, _clean_cached_text(shop.get("name")), self_flag
 
 
 def cached_deals_of(record):

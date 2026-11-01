@@ -982,3 +982,91 @@ def test_old_db_without_ack_columns_is_upgraded(db):
     assert st.get_item("1001")["ack_price_text"] == "¥44"
     assert st.get_item("1001")["ack_deals_updated_at"] == DEALS_AT
     assert st.notes == []
+
+
+# ---------------- 店铺 ----------------
+
+SHOP = {"item_id": "13662015", "name": "Vsinger官方旗舰店", "self": False}
+
+
+def test_upsert_item_saves_shop(db):
+    """店铺三列一起写：店名 + 自营标记 + 这份信息对应哪个 itemsId。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", None, shop=SHOP)
+    row = st.get_item("1001")
+    assert row["shop_item_id"] == "13662015"
+    assert row["shop_name"] == "Vsinger官方旗舰店"
+    assert row["shop_self"] == 0
+
+
+def test_upsert_without_shop_keeps_the_cached_one(db):
+    """这次没查店铺（shop 缺省/None）时一个字都不动：下轮重试时不能把旧店名冲掉。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", None, shop=SHOP)
+    st.upsert_item("1001", "甲", None)
+    st.upsert_item("1001", "甲", None, shop={"name": "半截数据"})  # 没 item_id，不算
+    row = st.get_item("1001")
+    assert row["shop_name"] == "Vsinger官方旗舰店"
+    assert row["shop_self"] == 0
+    assert row["shop_item_id"] == "13662015"
+
+
+def test_upsert_shop_for_a_new_item_replaces_the_old_one(db):
+    """itemsId 换过（同一件商品换了主商品）就整组换掉，不留上一次的店名。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", None, shop=SHOP)
+    st.upsert_item("1001", "甲", None,
+                   shop={"item_id": "13662999", "name": None, "self": True})
+    row = st.get_item("1001")
+    assert row["shop_item_id"] == "13662999"
+    assert row["shop_name"] is None   # 自营没有店名，旧店名必须一起清掉
+    assert row["shop_self"] == 1
+
+
+def test_upsert_shop_remembers_that_a_gone_item_was_checked(db):
+    """商品被删也要记下 itemsId：shop_name/shop_self 空着，靠它判断"问过了"。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", None,
+                   shop={"item_id": "13662015", "name": None, "self": None})
+    row = st.get_item("1001")
+    assert row["shop_item_id"] == "13662015"
+    assert row["shop_name"] is None
+    assert row["shop_self"] is None
+
+
+def test_upsert_shop_strips_blank_names(db):
+    """店名两端空白去掉；只有空白按没有处理（接口给过带尾随空格的「会员购 」）。"""
+    st = store.Store(db)
+    st.upsert_item("1001", "甲", None,
+                   shop={"item_id": "1", "name": " 幻梦模玩 ", "self": False})
+    assert st.get_item("1001")["shop_name"] == "幻梦模玩"
+
+    st.upsert_item("1002", "乙", None,
+                   shop={"item_id": "2", "name": "   ", "self": True})
+    assert st.get_item("1002")["shop_name"] is None
+
+
+def test_old_db_without_shop_columns_is_upgraded(db):
+    """老库打开时自动补上店铺三列，老行算"还没查过"。"""
+    conn = sqlite3.connect(db)
+    with conn:
+        conn.execute(
+            """CREATE TABLE items (
+                   cluster_id TEXT PRIMARY KEY,
+                   name       TEXT,
+                   image_url  TEXT,
+                   updated_at TEXT
+               )"""
+        )
+        conn.execute("INSERT INTO items VALUES ('1001', '甲', 'img', '2024-01-01T00:00:00')")
+    conn.close()
+
+    st = store.Store(db)
+    row = st.get_item("1001")
+    assert row["shop_item_id"] is None
+    assert row["shop_name"] is None
+    assert row["shop_self"] is None
+
+    st.upsert_item("1001", "甲", None, shop=SHOP)
+    assert st.get_item("1001")["shop_name"] == "Vsinger官方旗舰店"
+    assert st.notes == []
