@@ -57,12 +57,12 @@ BiliMarketMonitor/
 | 模块 | 职责 | 主要出口 |
 | --- | --- | --- |
 | [src/app.py](../src/app.py) | PyQt5 主窗口、表格与各对话框、轮询调度、抓取总结 | `MainWindow`、`PollerThread`、`ImageFetcher`、`main()` |
-| [src/client.py](../src/client.py) | 调用接口，失败统一成一个出口 | `fetch_cluster(cluster_id, timeout)`、`ApiError` |
-| [src/parser.py](../src/parser.py) | 解析响应：名称/价格/均价/成交/图片，相对时间换算 | `parse_cluster(resp)`、`parse_error(err)`、`age_bounds(text)` |
+| [src/client.py](../src/client.py) | 调用接口，失败统一成一个出口 | `fetch_cluster(cluster_id, timeout)`、`fetch_item(item_id, timeout)`、`ApiError` |
+| [src/parser.py](../src/parser.py) | 解析响应：名称/价格/均价/成交/图片/店铺，相对时间换算 | `parse_cluster(resp)`、`parse_item_shop(resp)`、`parse_error(err)`、`age_bounds(text)` |
 | [src/links.py](../src/links.py) | 监视清单读写：解析各种写法、清洗、规范化回写 | `load_links(path)`、`save_watchlist(path, items)`、`build_detail_url(...)` |
 | [src/config.py](../src/config.py) | 配置读取、逐项校验与写回 | `load_config()`、`save_config(changes)`、`check_value(key, value)`、`data_dir()`、`DEFAULTS` |
 | [src/settings.py](../src/settings.py) | 设置窗口：把配置项摆成三页表单，收值与校验 | `SettingsDialog`、`FIELDS`、`changed_values(values, original)` |
-| [src/net.py](../src/net.py) | 出网的唯一接缝：按线程复用 `requests.Session`，别处不再直接 import requests 发请求 | `net.get(url, timeout)`、`net.post(url, **kwargs)`、`session()` |
+| [src/net.py](../src/net.py) | 出网的唯一接缝：按线程复用 `requests.Session`，别处不再直接 import requests 发请求 | `net.get(url, timeout)`、`net.post(url, **kwargs)`、`net.get_response(url, **kwargs)`、`session()` |
 | [src/store.py](../src/store.py) | SQLite 缓存：随清单增删、损坏自愈 | `Store`（`sync` / `upsert_item` / `get_all` / `cached_deals`）、`default_db_path()` |
 | [src/theme.py](../src/theme.py) | 深浅两套 QSS、系统深浅色判断、Windows 标题栏配色、各处配色 | `apply_theme(app, dark)`、`qss_for(dark)`、`system_uses_dark()`、`apply_dark_title_bar(window, dark)` |
 | [src/thumbs.py](../src/thumbs.py) | 缩略图磁盘缓存：按图片地址存取、原子写、按数量上限清理 | `load(url)`、`save(url, data)`、`cache_dir()`、`path_for(url)` |
@@ -111,6 +111,8 @@ data/watchlist.txt
   PollerThread（子线程，依次、非并发）
       │  client.fetch_cluster()      发请求，失败重试 1 次
       │  parser.parse_cluster()      判空提取字段
+      │  client.fetch_item()         item_id 变了才问店铺（见「店铺从哪来」）
+      │  parser.parse_item_shop()    自营 / 商家店名 / 商品已删
       ▼
    信号回主线程 ──► 刷新表格 + store.upsert_item() 写缓存
                     ├► links.save_watchlist()  学到了新名字才回写清单
@@ -359,6 +361,32 @@ data/watchlist.txt
 货少的时候接口会把「当前价格还剩几件」写进购买按钮的文案，形如「最低价仅1件」，正则抠出来。
 同一处还会出现「当前最低价」和「已售罄」两种**没带数字**的文案，那两种都当「没有件数可报」——
 不凭空编一个件数出来。
+
+**售卖店铺（自营 / 商家）从哪来**（`client.fetch_item` / `parser.parse_item_shop` / `app.NameDelegate`）
+
+`cluster_info` 里**没有**店铺字段（`merchantAvatars` 恒 null，市集页面自己也不显示店名）。
+店铺要拿 `data.reportParams.item_id` 再查一次主商品接口：
+
+```
+GET https://mall.bilibili.com/mall-c-search/items/info?itemsId=<item_id>&shopId=0&itemsVersion=&v=<ms>
+```
+
+- `merchantId == 0` → 会员购自营（没有店名）；`!= 0` → 商家，店名取 `shopInfoVO.shopName`。
+- **不能用**的两个字段：`shopVO.shopName` 恒为 `「会员购 」`（市集商品的壳）、`selfSold` 恒为 true。
+- `code == 81100001`（商品不存在或被删除）也是**答案**不是失败：记下 `item_id`，往后不再问。
+- 抽样 143 件：16% 的商品已删；自营/商家各 60 件，`merchantId` 一刀切得干干净净。
+  「自营 / 官仓直发」那组服务标签命中即自营（27/27 无假阳性），但只覆盖 45% 的自营商品，
+  只当徽标的补充证据，不当判据。来龙去脉记在 `dev_notes/261101_市集店铺信息调查.md`（开发笔记不入库）。
+
+省钱的两条：店铺挂在**主商品**上、几乎不变，所以只在 `item_id` 跟缓存里记的不一样时才查
+（`app.PollerThread._attach_shop` + `app.CachedShopItemIds`）；同一轮里多件 cluster 共用一个
+`item_id` 也只问一次。缓存里存成三列（`store.ITEM_COLUMNS`）：`shop_item_id` / `shop_name` / `shop_self`，
+`shop_item_id` 有值就表示"这件问过了"，商品已删的那种也靠它避免每轮重问。
+
+显示上不加列：商品名列本来就最窄（1280 宽只剩约 270px），店名挤在同一行会把名字砍掉一多半。
+于是那一列自绘（`app.NameDelegate`）：自营在名字前挂个「自营」徽标，商家的店名画在**第二行**
+（弱化色）。行高是跟着缩略图走的，第二行不额外占地方。悬停提示里另有一行「店铺：…」
+（`app.name_tooltip`），自营写「会员购（自营）」，查过却认不出（商品已删）写「未知（商品可能已下架）」。
 
 **预期价到没到**（`app.expected_reached`）
 
@@ -641,6 +669,8 @@ pixi run shot           # 出图在 tmp/out/，每个场景深色/浅色各一�
 | 设置窗口的排版、标签、提示语 | `settings.FIELDS` / `settings.SECTIONS`；改完 `pixi run shot settings` 出图看一眼 |
 | 设置改完"当场生效"的范围 | `app.ApplyConfig()`：启动时算好存下来的那几处都在里头（高亮秒数与画刷、两处提示、自动抓取定时器） |
 | 缓存要多存一个字段 | `store.ITEM_COLUMNS`，老库由 `_ensure_item_columns()` 自动补列 |
+| 店铺怎么查、什么时候重查 | `app.PollerThread._attach_shop()` / `CachedShopItemIds()`、`client.fetch_item()`、`parser.parse_item_shop()`；缓存三列在 `store.ITEM_COLUMNS` |
+| 商品名前面那个徽标、第二行店名 | `app.NameDelegate`（绘制）与 `app.ApplyNameCell` / `ShopOf`（填数据）、`app.NAME_SELF_ROLE` 等 role；徽标底色在 `theme.SELF_BADGE_COLOR` |
 | 要发一个新请求 / 改连接与超时的行为 | `net.py`（不许在别处直接 `requests.get`，否则又变回一次一张新连接）；拦网络的测试在 `tests/conftest.py` 的 `_offline` |
 | 缩略图的尺寸、并发数、磁盘缓存上限 | `app.IMAGE_SIZE` / `IMAGE_SUFFIX` / `IMAGE_WORKERS`（改 `IMAGE_SIZE` 会让盘上旧缓存自动作废）、`thumbs.MAX_FILES` |
 | 成交判「新增」的算法 | `app.new_deals()` / `_aged_from()` |
