@@ -42,6 +42,7 @@ def test_parse_error_structure():
         "image_url": None,
         "sold_out": False,
         "stock_count": None,
+        "item_id": None,
     }
 
 
@@ -354,7 +355,7 @@ def test_result_structure_is_always_the_same(resp):
     result = parser.parse_cluster(resp)
     assert set(result) == {
         "ok", "error", "name", "price", "reference_price", "avg_price",
-        "deals", "image_url", "sold_out", "stock_count",
+        "deals", "image_url", "sold_out", "stock_count", "item_id",
     }
     assert isinstance(result["ok"], bool)
     assert isinstance(result["sold_out"], bool)
@@ -651,3 +652,99 @@ def test_age_bounds_covers_a_whole_bucket():
     """上界必须盖满整格，差一秒就会把同一条成交判成新的。"""
     lower, upper = parser.age_bounds("9小时前")
     assert upper - lower == 3600 - 1  # 小时这一格整整 3600 秒，闭区间少 1
+
+
+# ---------------- item_id 与店铺 ----------------
+
+# 这几条口径全部来自实测（见 dev_notes/261101_市集店铺信息调查.md）：
+#   merchantId == 0 -> 会员购自营；!= 0 -> shopInfoVO.shopName；
+#   shopVO.shopName 是「会员购 」这个壳，selfSold 恒 true，两个都不能用
+
+
+def _item_response(merchant_id=0, shop_name=None, code=0):
+    data = {
+        "shopVO": {"shopId": 2233, "shopName": "会员购 ", "purchaseSaleMode": 4},
+        "merchantId": merchant_id,
+        "selfSold": True,  # 实测恒为 true，不能用来判自营
+        "brandName": "Vsinger",
+    }
+    if shop_name is not None:
+        data["shopInfoVO"] = {"shopName": shop_name, "shopFace": "//x.test/s.png"}
+    return {"success": code == 0, "data": data if code == 0 else None,
+            "code": code, "message": "商品不存在或被删除" if code else "0"}
+
+
+def test_cluster_response_carries_the_item_id():
+    """店铺只能靠 reportParams.item_id 再查一次，解析时得把它带出来。"""
+    resp = _base_response()
+    resp["data"]["reportParams"] = {"item_id": "13662015", "sku_id": "1020064708"}
+    assert parser.parse_cluster(resp)["item_id"] == "13662015"
+
+    # 数字和字符串都要认（同一个字段接口两种写法都出现过），空/非法当没有
+    for value, expected in ((13662015, "13662015"), (" 13662015 ", "13662015"), ("", None)):
+        resp = _base_response()
+        resp["data"]["reportParams"] = {"item_id": value}
+        assert parser.parse_cluster(resp)["item_id"] == expected
+
+
+def test_parse_item_shop_self_sold():
+    """merchantId == 0 就是会员购自营：没有店名，也不该把「会员购 」当成店名。"""
+    result = parser.parse_item_shop(_item_response(merchant_id=0))
+    assert result["ok"] is True
+    assert result["self_sold"] is True
+    assert result["shop"] is None
+    assert result["gone"] is False
+
+
+def test_parse_item_shop_merchant_name():
+    """商家商品：店名只认 shopInfoVO.shopName（shopVO 那个恒为「会员购 」）。"""
+    result = parser.parse_item_shop(_item_response(merchant_id=4141564, shop_name="Vsinger官方旗舰店"))
+    assert result["ok"] is True
+    assert result["self_sold"] is False
+    assert result["shop"] == "Vsinger官方旗舰店"
+
+    # "0" 也是自营（字符串和数字两种写法都见过）
+    assert parser.parse_item_shop(_item_response(merchant_id="0"))["self_sold"] is True
+
+
+def test_parse_item_shop_gone_is_an_answer():
+    """商品被删除是确定答案（不再是"没问到"），调用方据此记一笔就不再问。"""
+    result = parser.parse_item_shop(_item_response(code=81100001))
+    assert result["ok"] is True
+    assert result["gone"] is True
+    assert result["shop"] is None and result["self_sold"] is None
+    assert result["error"] == "商品不存在或被删除"
+
+
+def test_parse_item_shop_other_errors_are_retryable():
+    """认不出来的错误码不算问出结果：下轮还得再试。"""
+    result = parser.parse_item_shop(_item_response(code=81103006))
+    assert result["ok"] is False
+    assert result["error"] and "81103006" in result["error"]
+
+
+@pytest.mark.parametrize("resp", [None, [], 42, {"code": 0}, {"code": 0, "data": []}])
+def test_parse_item_shop_bad_response(resp):
+    """响应坏掉时返回失败而不是抛异常，界面层照常跑。"""
+    result = parser.parse_item_shop(resp)
+    assert result["ok"] is False
+    assert result["error"]
+    assert set(result) == {"ok", "error", "shop", "self_sold", "gone"}
+
+
+def test_parse_item_shop_strips_and_drops_blank_names():
+    """店名两端的空白要剥掉（接口给过「会员购 」这种带尾随空格的），空白只算没有。"""
+    assert parser.parse_item_shop(_item_response(123, " Vsinger官方旗舰店 "))["shop"] == "Vsinger官方旗舰店"
+    blank = parser.parse_item_shop(_item_response(123, "   "))
+    assert blank["ok"] is True and blank["shop"] is None
+
+
+def test_parse_item_shop_without_merchant_id_falls_back_to_the_name():
+    """merchantId 缺失时只能看店名：有店名按商家算，什么都没有就当"没看出来"。"""
+    with_shop = _item_response(merchant_id=None, shop_name="幻梦模玩")
+    result = parser.parse_item_shop(with_shop)
+    assert result["self_sold"] is False and result["shop"] == "幻梦模玩"
+
+    empty = parser.parse_item_shop(_item_response(merchant_id=None))
+    assert empty["ok"] is True
+    assert empty["shop"] is None and empty["self_sold"] is None

@@ -16,6 +16,10 @@ RECENT_DEALS_COUNT = 3  # 近 N 次成交，可调（网页一次返回多条，
 
 SOLD_OUT_STATE = 2  # clusterPurchaseButton.buttonState：2 就是「已售罄」
 
+# items/info 的「商品不存在或被删除」。它是**答案**而不是错误：这件商品已经
+# 问不出店铺了，记下来别再反复问（见 parse_item_shop）
+ITEM_GONE_CODE = 81100001
+
 # 购买按钮文案里的剩余件数（形如「最低价仅1件」）。同一处还会出现「当前最低价」
 # 和「已售罄」两种没带数字的文案，那两种都当"没有件数可报"。
 _STOCK_COUNT_RE = re.compile(r"仅\s*(\d+)\s*件")
@@ -164,6 +168,7 @@ def parse_cluster(resp: dict) -> dict:
         "image_url": None,
         "sold_out": False,
         "stock_count": None,
+        "item_id": None,
     }
 
     # 调用方传进来的不一定是 dict（None/列表/数字），直接按"查询失败"处理
@@ -180,6 +185,9 @@ def parse_cluster(resp: dict) -> dict:
 
     # 商品名
     result["name"] = _clean_text(_dig(data, "clusterBasicInfoFloorVO", "clusterName"))
+
+    # 会员购主商品 ID：店铺只能靠它再查一次 items/info（见 parse_item_shop）
+    result["item_id"] = _clean_id(_dig(data, "reportParams", "item_id"))
 
     # 价格区：firstPrice 是「现价」，price 是划线那个「原价」。
     # 注意售罄时接口整组不返回 price/priceSymbol，此时 firstPrice 装的就是原价
@@ -238,6 +246,90 @@ def parse_cluster(resp: dict) -> dict:
         result["error"] = "接口没有返回该商品的数据（clusterId 可能已失效）"
 
     return _normalize_result(result)
+
+
+def parse_item_shop(resp) -> dict:
+    """解析 items/info 响应里的售卖店铺，返回固定结构。
+
+    取数口径（抽样 143 件验证，见 dev_notes/261101_市集店铺信息调查.md）：
+      merchantId == 0  -> 会员购自营（shop 为 None、self_sold 为 True）
+      merchantId != 0  -> 商家店铺名 shopInfoVO.shopName（self_sold 为 False）
+      code == 81100001 -> 商品已被删除（两者都是 None，gone 为 True）
+
+    不能用的两个字段：shopVO.shopName 恒为「会员购 」（市集商品的壳）、
+    selfSold 恒为 true，拿它们判店铺只会把每件商品都认成会员购自营。
+
+    ok 表示"这次有定论"：连「商品没了」「认不出店铺」都算定论（调用方据此
+    记一笔别再问）；只有响应坏了、或回了个不认识的错误码才是 ok=False，
+    那才是下轮该重试的。
+    """
+    result = {"ok": True, "error": None, "shop": None, "self_sold": None, "gone": False}
+
+    if not isinstance(resp, dict):
+        return _normalize_shop(
+            {"ok": False, "error": f"响应格式异常（{type(resp).__name__}），不是 JSON 对象"}
+        )
+
+    code = resp.get("code")
+    if code != 0:
+        message = _clean_text(resp.get("message"))
+        if code == ITEM_GONE_CODE:
+            # 商品被删/下架：问不出店铺了，但这是个确定的答案
+            return _normalize_shop({"gone": True, "error": message})
+        return _normalize_shop(
+            {"ok": False, "error": f"接口返回失败 (code={code}, message={message})"}
+        )
+
+    data = resp.get("data")
+    if not isinstance(data, dict):
+        return _normalize_shop({"ok": False, "error": "响应缺少 data 字段"})
+
+    merchant_id = _clean_id(data.get("merchantId"))
+    if merchant_id == "0":
+        return _normalize_shop({"self_sold": True})
+
+    shop = _clean_text(_dig(data, "shopInfoVO", "shopName"))
+    if merchant_id is not None:
+        return _normalize_shop({"shop": shop, "self_sold": False})
+    # 连 merchantId 都没有：只能看店名。有店名就按商家算，什么都没有就当"没看出来"
+    if shop is not None:
+        return _normalize_shop({"shop": shop, "self_sold": False})
+    return _normalize_shop({})
+
+
+def _normalize_shop(result: dict) -> dict:
+    """店铺结果的出口兜底：固定键与类型，界面层不必再判空。
+
+    ok 默认 True：调用点只在"这次没问出结果"时才显式写 ``{"ok": False}``，
+    其余都是查到的（自营、商家、商品已删）——默认 False 会让每条成功的结果
+    都变成失败。
+    """
+    ok = result.get("ok", True) is not False
+    error = _clean_text(result.get("error"))
+    if not ok and not error:
+        error = "未知错误"
+    self_sold = result.get("self_sold")
+    return {
+        "ok": ok,
+        "error": error,
+        "shop": _clean_text(result.get("shop")) if ok else None,
+        "self_sold": self_sold if ok and isinstance(self_sold, bool) else None,
+        "gone": bool(result.get("gone")) if ok else False,
+    }
+
+
+def _clean_id(value) -> str | None:
+    """纯数字 ID（clusterId / itemsId / merchantId）归一成字符串；其余返回 None。
+
+    统一成字符串是因为 JSON 里同一个字段可能给数字也可能给字符串，而 0 和 "0"
+    在判断「是不是自营」时必须是同一个东西。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    text = _clean_text(value)
+    return text if text is not None and text.isdigit() else None
 
 
 def _dig(d, *path):
@@ -374,4 +466,5 @@ def _normalize_result(result: dict) -> dict:
         "image_url": _clean_text(result.get("image_url")),
         "sold_out": bool(result.get("sold_out")),
         "stock_count": _positive_int(result.get("stock_count")),
+        "item_id": _clean_id(result.get("item_id")),
     }
