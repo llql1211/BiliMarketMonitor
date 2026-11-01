@@ -45,6 +45,22 @@ def posted(monkeypatch):
     return calls, state
 
 
+@pytest.fixture
+def gotten(monkeypatch):
+    """替换 net.get_response（查店铺那条 GET），返回 (调用记录, 可控状态)。"""
+    calls = []
+    state = {"response": FakeResponse(), "error": None}
+
+    def _get(url, **kwargs):
+        calls.append({"url": url, "kwargs": kwargs})
+        if state["error"] is not None:
+            raise state["error"]
+        return state["response"]
+
+    monkeypatch.setattr(net, "get_response", _get)
+    return calls, state
+
+
 def test_success_returns_payload(posted):
     """成功时原样返回接口的 JSON dict。"""
     calls, state = posted
@@ -204,3 +220,84 @@ def test_invalid_timeout_falls_back_to_default(posted, timeout):
 def test_api_error_is_exception():
     """ApiError 必须是普通异常，调用方 except 得住。"""
     assert issubclass(client.ApiError, Exception)
+
+
+# ---------------- fetch_item（查店铺那条） ----------------
+
+
+def test_fetch_item_request_shape(gotten):
+    """地址、参数、伪装 headers 都要对，v 是毫秒时间戳（防缓存）。"""
+    calls, state = gotten
+    payload = {"success": True, "code": 0, "data": {"merchantId": 0}}
+    state["response"] = FakeResponse(payload)
+
+    assert client.fetch_item("13662015") == payload
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["url"] == client.ITEM_API_URL
+    params = call["kwargs"]["params"]
+    assert params["itemsId"] == "13662015"
+    assert params["shopId"] == 0
+    assert params["itemsVersion"] == ""
+    assert isinstance(params["v"], int) and params["v"] > 0
+    headers = call["kwargs"]["headers"]
+    assert "User-Agent" in headers and "Referer" in headers
+    assert call["kwargs"]["timeout"] == 10.0
+
+
+def test_fetch_item_treats_business_failure_as_an_answer(gotten):
+    """商品被删（success=false, code=81100001）是答案不是异常：交给 parser 判。"""
+    _, state = gotten
+    payload = {"success": False, "code": 81100001, "message": "商品不存在或被删除", "data": None}
+    state["response"] = FakeResponse(payload)
+
+    assert client.fetch_item("13662015") == payload
+
+
+def test_fetch_item_http_error_raises(gotten):
+    """非 200 仍然是传输层失败：抛 ApiError，调用方下轮重试。"""
+    _, state = gotten
+    state["response"] = FakeResponse(status_code=502)
+
+    with pytest.raises(client.ApiError) as excinfo:
+        client.fetch_item("13662015")
+    assert "502" in str(excinfo.value)
+
+
+def test_fetch_item_bad_json_raises(gotten):
+    """被风控页面截胡（不是 JSON）→ ApiError。"""
+    _, state = gotten
+    state["response"] = FakeResponse(json_error=ValueError("Expecting value"))
+
+    with pytest.raises(client.ApiError) as excinfo:
+        client.fetch_item("13662015")
+    assert "JSON" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("payload", [[], 42, "not-an-object"])
+def test_fetch_item_non_dict_json_raises(gotten, payload):
+    """JSON 本身不是对象 → ApiError，不能是 AttributeError。"""
+    _, state = gotten
+    state["response"] = FakeResponse(payload)
+
+    with pytest.raises(client.ApiError):
+        client.fetch_item("13662015")
+
+
+@pytest.mark.parametrize("item_id", ["", "   ", "abc", None, True, "12a34"])
+def test_invalid_item_id_never_reaches_the_network(gotten, item_id):
+    """itemsId 不合法时直接报错，不发无效请求。"""
+    calls, _ = gotten
+
+    with pytest.raises(client.ApiError) as excinfo:
+        client.fetch_item(item_id)
+    assert calls == []
+    assert "itemsId" in str(excinfo.value)
+
+
+def test_int_item_id_is_stringified(gotten):
+    """itemsId 传 int 也要转成字符串发出去（reportParams 里给的就是字符串）。"""
+    calls, _ = gotten
+    client.fetch_item(13662015)
+    assert calls[0]["kwargs"]["params"]["itemsId"] == "13662015"

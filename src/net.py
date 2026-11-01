@@ -39,6 +39,14 @@ def get(url: str, timeout: float) -> bytes:
     return session().get(url, timeout=timeout).content
 
 
+def get_response(url: str, **kwargs) -> requests.Response:
+    """GET 并返回原始响应（接口调用方要自己看状态码和 JSON）。
+
+    跟 ``get`` 分开：拉图只关心字节，接口调用还得看状态码、解析 JSON。
+    """
+    return session().get(url, **kwargs)
+
+
 def post(url: str, **kwargs) -> requests.Response:
     """POST 并返回原始响应（接口调用方要自己看状态码和 JSON）。"""
     return session().post(url, **kwargs)
