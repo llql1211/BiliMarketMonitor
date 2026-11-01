@@ -1501,7 +1501,7 @@ def test_fill_row_marks_self_sold(window):
 
 
 def test_fill_row_marks_a_shop_that_could_not_be_checked(window):
-    """查过了却认不出店铺（商品被删）：不画第二行，但悬停提示要说清楚。"""
+    """查过了却认不出店铺（商品被删）：第二行写占位而不是空着，提示里说明原因。"""
     w = window("10000008780 | 甲\n")
     w.store.upsert_item(
         "10000008780", "甲", None,
@@ -1511,8 +1511,22 @@ def test_fill_row_marks_a_shop_that_could_not_be_checked(window):
 
     cell = w.table.item(0, app_module.COL_NAME)
     assert cell.data(app_module.NAME_SELF_ROLE) is False
-    assert cell.data(app_module.NAME_SHOP_ROLE) is None
+    assert cell.data(app_module.NAME_SHOP_ROLE) == app_module.UNKNOWN_SHOP_LINE
     assert "商品可能已下架" in cell.toolTip()
+
+
+def test_fill_row_prefers_the_badge_over_the_unknown_placeholder(window):
+    """商品已删但服务标签说自营：给徽标，不要「店铺未知」那个占位。"""
+    w = window("10000008780 | 甲\n")
+    w.store.upsert_item(
+        "10000008780", "甲", None,
+        shop={"item_id": "13662015", "name": None, "self": True},
+    )
+    w.LoadWatchlist(w.watchlist_path)
+
+    cell = w.table.item(0, app_module.COL_NAME)
+    assert cell.data(app_module.NAME_SELF_ROLE) is True
+    assert cell.data(app_module.NAME_SHOP_ROLE) is None
 
 
 def test_result_ready_saves_the_shop(window):
@@ -5577,6 +5591,92 @@ def test_poller_reports_a_gone_item_as_an_answer(qapp, monkeypatch, join_thread)
     assert results[0]["shop"] == {
         "item_id": "13662015", "name": None, "self": None,
     }
+
+
+def test_poller_fills_in_self_from_the_service_tags_when_the_item_is_gone(
+    qapp, monkeypatch, join_thread
+):
+    """商品已删、问不出店铺，但 cluster 的标签说「自营 / 官仓直发」：徽标照给。
+
+    10000012731 就是这种：cluster 活得好好的，reportParams 指向的主商品却已经
+    回 81100001，标签是这时唯一还能说明"这单是谁卖的"的东西。
+    """
+    resp = raw_ok(name="甲")
+    resp["data"]["reportParams"] = {"item_id": "13662015"}
+    resp["data"]["clusterServiceFloorVO"] = {
+        "services": [
+            {"type": "self", "name": "自营", "style": 1},
+            {"type": "direct", "name": "官仓直发", "style": 1},
+        ]
+    }
+    monkeypatch.setattr(client, "fetch_cluster", _fetch_by_id({"1": resp}))
+
+    thread = app_module.PollerThread(
+        _tasks(["1"]), 0.01, 0.01, 1.0,
+        shop_item_ids={"1": None},
+        fetch_item=lambda item_id, timeout=None: item_payload(code=81100001),
+    )
+    results = []
+    thread.result_ready.connect(lambda row, res: results.append(res))
+
+    thread.start()
+    assert join_thread(thread)
+
+    assert results[0]["shop"] == {"item_id": "13662015", "name": None, "self": True}
+
+
+def test_poller_does_not_invent_self_without_the_tags(qapp, monkeypatch, join_thread):
+    """没标签的商品删了就是删了：别把"不知道"写成"自营"。"""
+    resp = raw_ok(name="甲")
+    resp["data"]["reportParams"] = {"item_id": "13662015"}
+    monkeypatch.setattr(client, "fetch_cluster", _fetch_by_id({"1": resp}))
+
+    thread = app_module.PollerThread(
+        _tasks(["1"]), 0.01, 0.01, 1.0,
+        shop_item_ids={"1": None},
+        fetch_item=lambda item_id, timeout=None: item_payload(code=81100001),
+    )
+    results = []
+    thread.result_ready.connect(lambda row, res: results.append(res))
+
+    thread.start()
+    assert join_thread(thread)
+
+    assert results[0]["shop"] == {"item_id": "13662015", "name": None, "self": None}
+
+
+def test_result_ready_backfills_self_from_tags_for_an_already_checked_row(window):
+    """早先查过、当时没认出店铺的行：这轮标签说自营，补进缓存，重启后也有徽标。"""
+    w = window("10000008780 | 甲\n")
+    w.store.upsert_item(
+        "10000008780", "甲", None,
+        shop={"item_id": "13662015", "name": None, "self": None},
+    )
+    w.LoadWatchlist(w.watchlist_path)
+    assert w.table.item(0, app_module.COL_NAME).data(app_module.NAME_SELF_ROLE) is False
+
+    result = result_ok(name="甲")
+    result["item_id"] = "13662015"
+    result["self_hint"] = True
+    w.OnResultReady(0, result)
+
+    assert w.store.get_item("10000008780")["shop_self"] == 1
+    assert w.table.item(0, app_module.COL_NAME).data(app_module.NAME_SELF_ROLE) is True
+
+
+def test_result_ready_does_not_fake_a_checked_row_from_the_tags(window):
+    """还没查过店铺的行不按标签记账：那样会把 item_id 记成"查过了"，反而不再去问。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    result = result_ok(name="甲")
+    result["item_id"] = "13662015"
+    result["self_hint"] = True
+    w.OnResultReady(0, result)
+
+    record = w.store.get_item("10000008780")
+    assert record["shop_item_id"] is None
+    assert record["shop_self"] is None
 
 
 def test_cached_shop_item_ids_only_covers_the_given_tasks(window):

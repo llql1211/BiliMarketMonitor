@@ -252,7 +252,8 @@ SELF_BADGE_HEIGHT = 17   # 徽标高：比正文字矮一点，别比商品名�
 SELF_BADGE_RADIUS = 3
 SHOP_LINE_GAP = 2        # 名字和店名之间空多少
 MIN_SHOP_POINT_SIZE = 7.0  # 徽标/店名比正文小一档，但不小于这个点数（再小就成糊点）
-UNKNOWN_SHOP_TEXT = "未知"
+UNKNOWN_SHOP_TEXT = "未知"        # 悬停提示里的说法：「店铺：未知（商品可能已下架）」
+UNKNOWN_SHOP_LINE = "店铺未知"    # 第二行那个占位：查过但认不出，别留一片空白
 
 # 「现价」列一律左对齐：涨跌和剩余件数两截的落点都是从文本区左边算起的（见 segment_rect）
 PRICE_ALIGN = Qt.AlignLeft | Qt.AlignVCenter
@@ -1171,10 +1172,15 @@ class PollerThread(QThread):
         parsed = parser.parse_item_shop(raw)
         if not parsed["ok"]:
             return
+        self_sold = parsed["self_sold"]
+        if self_sold is None and result.get("self_hint"):
+            # 商品已删、问不出店铺，但 cluster 的服务标签说「自营 / 官仓直发」：
+            # 徽标照给，别让这一行既没徽标也没店名（见 parser._self_hint）
+            self_sold = True
         shop = {
             "item_id": item_id,
             "name": parsed["shop"],
-            "self": parsed["self_sold"],
+            "self": self_sold,
         }
         self._shop_results[item_id] = shop
         result["shop"] = shop
@@ -3066,13 +3072,19 @@ class MainWindow(QMainWindow):
         )
         shop, self_sold, checked = self.ShopOf(values, record)
 
+        # 第二行写什么：有店名就是店名；自营只有徽标；查过却认不出（商品已删）
+        # 写个占位，免得那一行空着让人以为漏抓了
+        shop_line = shop or (
+            UNKNOWN_SHOP_LINE if checked and self_sold is not True else None
+        )
+
         cell = self.table.item(row, COL_NAME)
         if cell is None:
             cell = self.MakeCell("")
             self.table.setItem(row, COL_NAME, cell)
         cell.setText(name_text)
         cell.setData(NAME_SELF_ROLE, self_sold is True)
-        cell.setData(NAME_SHOP_ROLE, shop)
+        cell.setData(NAME_SHOP_ROLE, shop_line)
         # 店名的颜色按主题选，跟「原价」那格同一个弱化色；换主题时 RenderTable
         # 会重走这里，所以只有这一处定义
         cell.setData(NAME_SHOP_COLOR_ROLE, theme.muted_color(self.dark))
@@ -3604,6 +3616,12 @@ class MainWindow(QMainWindow):
                 )
             # 第一次抓到的新商品写入缓存；已缓存的也顺手刷新名称、缩略图和价格。
             # 返回的时刻就是这轮成交快照的抓取时刻，下面初始化基线时要拿它当锚点
+            shop = result.get("shop")
+            if shop is None and result.get("self_hint") and previous.get("shop_item_id"):
+                # 早先查过、当时没认出店铺（商品已删）的行：现在 cluster 的标签说
+                # 自营，把这条补进缓存，重启后不必等一轮抓取就能显示徽标。
+                # 没查过的行不补——那会把 item_id 记成"查过了"，反而不再去问
+                shop = {"item_id": previous["shop_item_id"], "name": None, "self": True}
             fetched_at = self.store.upsert_item(
                 cluster_id,
                 result["name"],
@@ -3615,7 +3633,7 @@ class MainWindow(QMainWindow):
                 stock_count=result["stock_count"],
                 lowest_price=new_lowest,
                 deals=result["deals"],
-                shop=result.get("shop"),
+                shop=shop,
             )
             # 这件商品还没有确认基线（新加进来的，或者库里从没确认过）：把这次抓到的
             # 样子记成基线，往后累积才有"相对什么"可比。这一笔不算确认——全局那个
