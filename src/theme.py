@@ -53,6 +53,11 @@ FAVORITE_COLOR_DARK = "#f0c419"
 LINK_COLOR_LIGHT = "#0b62c4"
 LINK_COLOR_DARK = "#6cb6ff"
 
+# 「自营」徽标的底色。深浅共用一个粉：它是品牌色，不该随主题漂移。
+# 比会员购原版 #fb7299 压暗了一档——白字压在原版上只有 2.6:1（读不清），
+# 这一档是 4.5:1，刚好够 WCAG 对小字的底线
+SELF_BADGE_COLOR = "#d6396f"
+
 DARK_QSS = """
 QWidget {
     background-color: #1e1f22;
@@ -373,6 +378,11 @@ def deal_highlight_color(text) -> QColor:
 def muted_color(dark: bool) -> QColor:
     """次要信息的弱化色（「原价」这类"有就行、别抢眼"的内容用它）。"""
     return QColor(MUTED_COLOR_DARK if dark else MUTED_COLOR_LIGHT)
+
+
+def self_badge_color() -> QColor:
+    """「自营」徽标的底色（不随主题变，见 SELF_BADGE_COLOR）。"""
+    return QColor(SELF_BADGE_COLOR)
 
 
 def price_delta_color(change: int, dark: bool) -> QColor:

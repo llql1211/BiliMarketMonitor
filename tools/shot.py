@@ -215,6 +215,39 @@ def seed_lowest_prices(skip=3, count=4, factor=0.85):
         db.close()
 
 
+def seed_shops():
+    """给沙盒缓存里的头几行塞店铺，好让表格场景看得到徽标和第二行店名。
+
+    三种状态各来几行：商家（第二行是店名）、自营（徽标，没有第二行）、查过但
+    认不出（商品已删，两行都不画）。真实数据里要有店铺得先抓过一轮，出图不能
+    真去联网，所以照线上一模一样的结果手写一份——要看的是样式，不是接口。
+
+    只动沙盒副本，真实缓存一个字都不改（跟 seed_expected_prices 同一个出发点）。
+    """
+    import links
+    import store
+
+    path = links.default_watchlist_path()
+    if not os.path.exists(path):
+        return
+    entries = links.load_links(path)
+
+    samples = (
+        {"item_id": "1000000001", "name": "Vsinger官方旗舰店", "self": False},
+        {"item_id": "1000000002", "name": None, "self": True},
+        {"item_id": "1000000003", "name": "幻梦模玩", "self": False},
+        {"item_id": "1000000004", "name": "星社潮玩的小店", "self": False},
+        {"item_id": "1000000005", "name": None, "self": None},
+    )
+
+    db = store.Store(store.default_db_path())
+    try:
+        for entry, shop in zip(entries, samples):
+            db.upsert_item(entry.cluster_id, None, None, shop=shop)
+    finally:
+        db.close()
+
+
 def _amount(value) -> str:
     """60.0 -> "60"、60.5 -> "60.5"：别在清单里留一串没用的零。"""
     return f"{value:.2f}".rstrip("0").rstrip(".")
@@ -718,6 +751,7 @@ def main(argv):
     seed_expected_prices()
     seed_lowest_prices()
     seed_favorites()
+    seed_shops()
     seed_auto_poll()
     out.mkdir(parents=True, exist_ok=True)
 

@@ -34,12 +34,15 @@ from PyQt5.QtCore import (
 )
 from PyQt5.QtGui import (
     QBrush,
+    QColor,
     QCursor,
     QDrag,
+    QFont,
     QFontMetrics,
     QIcon,
     QKeySequence,
     QPainter,
+    QPalette,
     QPen,
     QPixmap,
 )
@@ -212,6 +215,14 @@ LOWEST_HEADER_TIP = (
     "现价正落在史低价上（没比它贵）时，这一格会变绿加粗"
 )
 
+# 「商品名」列头：说明名字前面的徽标和下面那行小字是什么
+NAME_HEADER_TIP = (
+    "名字前面标着「自营」的，是会员购自己卖的\n"
+    "名字下面那行小字是商家店铺名（自营商品不显示）\n"
+    "店铺按会员购主商品查一次就沿用；商品被删掉的显示「未知」\n"
+    "悬停在这一格上能看到完整名称、店铺和 clusterID"
+)
+
 EXPECTED_BAD_INPUT = "预期价格得是大于 0 的数字，比如 50。"
 EXPECTED_BAD_TITLE = "预期价格认不出来"
 
@@ -226,6 +237,22 @@ DELTA_GAP = " "                     # 现价与涨跌之间空一格
 
 STOCK_ROLE = Qt.UserRole + 3        # 涨跌后面那截剩余件数（形如「 · 3件」，间隔号带在它身上）
 STOCK_COLOR_ROLE = Qt.UserRole + 4  # 上面那截的颜色（弱化色，随主题走）
+
+# 「商品名」列（见 NameDelegate）：自营徽标 + 商品名，店名画在第二行。
+# 店名不占横向空间——1280 宽的窗口里商品名列只剩约 270px，店名和名字抢同一行
+# 会把名字挤掉一多半（量过：只剩 167px），而行高本来就跟着缩略图够两行
+NAME_SELF_ROLE = Qt.UserRole + 5        # 是否在名字前面画「自营」徽标
+NAME_SHOP_ROLE = Qt.UserRole + 6        # 第二行的店名；None 表示不画
+NAME_SHOP_COLOR_ROLE = Qt.UserRole + 7  # 店名的颜色（弱化色，随主题重算）
+
+SELF_BADGE_TEXT = "自营"
+SELF_BADGE_PAD = 6       # 徽标内部左右留白
+SELF_BADGE_GAP = 6       # 徽标和名字之间空多少
+SELF_BADGE_HEIGHT = 17   # 徽标高：比正文字矮一点，别比商品名还抢眼
+SELF_BADGE_RADIUS = 3
+SHOP_LINE_GAP = 2        # 名字和店名之间空多少
+MIN_SHOP_POINT_SIZE = 7.0  # 徽标/店名比正文小一档，但不小于这个点数（再小就成糊点）
+UNKNOWN_SHOP_TEXT = "未知"
 
 # 「现价」列一律左对齐：涨跌和剩余件数两截的落点都是从文本区左边算起的（见 segment_rect）
 PRICE_ALIGN = Qt.AlignLeft | Qt.AlignVCenter
@@ -1051,12 +1078,27 @@ class PollerThread(QThread):
     progress_changed = pyqtSignal(int, int)  # 当前第 x 条, 共 y 条
     finished_all = pyqtSignal()
 
-    def __init__(self, tasks, poll_interval, retry_interval, request_timeout):
+    def __init__(
+        self,
+        tasks,
+        poll_interval,
+        retry_interval,
+        request_timeout,
+        shop_item_ids=None,
+        fetch_item=None,
+    ):
         super().__init__()
         self.tasks = tasks
         self.poll_interval = poll_interval
         self.retry_interval = retry_interval
         self.request_timeout = request_timeout
+        # 缓存里那份店铺对应哪个 itemsId（clusterId -> itemsId）。跟这次解析出来的
+        # 一样就不再问——店铺挂在会员购主商品上，几乎不变，问一次能用很久
+        self.shop_item_ids = dict(shop_item_ids or {})
+        self.fetch_item = fetch_item or client.fetch_item
+        # 这一轮里已经问过的 itemsId -> 店铺结果：同一件主商品可能对应好几个
+        # cluster（换个规格就是另一个），问一次就够
+        self._shop_results = {}
         self._stop = False
         self._paused = False
 
@@ -1097,10 +1139,45 @@ class PollerThread(QThread):
                         self._sleep(self.retry_interval)
 
             if result is not None:
+                self._attach_shop(entry, result)
                 self.result_ready.emit(row, result)
             if i < total - 1:
                 self._sleep(self.poll_interval)
         self.finished_all.emit()
+
+    def _attach_shop(self, entry, result):
+        """顺手把售卖店铺查回来，挂进 result["shop"]（见 client.fetch_item）。
+
+        只在必要时问：item_id 跟缓存里那份不一样才查。同一件主商品可能对应好几个
+        cluster（换个规格就是另一个 cluster），店铺却只有一个，所以按 itemsId 复用。
+
+        查不到就不带 shop：主线程按"这次没查到"处理（缓存里那份原样留着），下轮
+        还会再问一次——网络闪断不该让某件商品永远没有店铺。唯独"商品已被删除"是
+        确定的答案，这个由 parse_item_shop 判成 shop/self 都为 None，照样带回去，
+        主线程记下 item_id 就不再问了。
+        """
+        if not result["ok"]:
+            return
+        item_id = result.get("item_id")
+        if not item_id or self.shop_item_ids.get(entry.cluster_id) == item_id:
+            return
+        if item_id in self._shop_results:
+            result["shop"] = self._shop_results[item_id]  # 这一轮已经问过同一件主商品
+            return
+        try:
+            raw = self.fetch_item(item_id, self.request_timeout)
+        except client.ApiError:
+            return  # 传输层失败：下轮再试，别把"没问到"写成"没有店铺"
+        parsed = parser.parse_item_shop(raw)
+        if not parsed["ok"]:
+            return
+        shop = {
+            "item_id": item_id,
+            "name": parsed["shop"],
+            "self": parsed["self_sold"],
+        }
+        self._shop_results[item_id] = shop
+        result["shop"] = shop
 
     def _wait_if_paused(self):
         """暂停期间原地等着，直到 resume() 或 stop()。"""
@@ -1327,19 +1404,150 @@ class PriceDeltaDelegate(QStyledItemDelegate):
         painter.restore()
 
 
-def name_tooltip(head, cluster_id) -> str:
-    """「商品名」格的悬停提示：名称（抓失败时是失败原因）+ clusterID。
+class NameDelegate(QStyledItemDelegate):
+    """「商品名」列的绘制：自营商品名字前挂个「自营」徽标，店名另起一行弱化显示。
+
+    为什么要自己画：一个 QTableWidgetItem 只有一种前景色、一行字，而这里要
+    「徽标 + 名字」同一行、店名第二行还跟名字不同色。行高是跟着缩略图走的
+    （IMAGE_SIZE + 8），本来就够两行，第二行不额外占横向空间——商品名列是最窄的
+    一列，店名挤在同一行会把名字砍掉一多半。
+
+    文字全由这里摆（交给基类的文本先清空），背景、隔行色、选中态、焦点框仍然
+    交给基类：主题一换，这一格跟别的列一起变。
+    """
+
+    def paint(self, painter, option, index):
+        style_option = QStyleOptionViewItem(option)
+        self.initStyleOption(style_option, index)
+        name = style_option.text
+        # 基类只管背景/选中态/焦点框：文字自己摆，不让它再画一遍
+        style_option.text = ""
+        style = option.widget.style() if option.widget else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, style_option, painter, option.widget)
+
+        # 基类给文字留的那块地方：列宽、内边距都跟别的列一致，别在这儿另定一套
+        rect = style.subElementRect(
+            QStyle.SE_ItemViewItemText, style_option, option.widget
+        )
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+
+        font = style_option.font
+        name_metrics = QFontMetrics(font)
+        shop = index.data(NAME_SHOP_ROLE) or ""
+        shop_font = QFont(font)
+        shop_font.setPointSizeF(max(MIN_SHOP_POINT_SIZE, font.pointSizeF() - 1.0))
+        shop_metrics = QFontMetrics(shop_font)
+        self_sold = bool(index.data(NAME_SELF_ROLE))
+        selected = bool(option.state & QStyle.State_Selected)
+
+        text_color = style_option.palette.color(
+            QPalette.HighlightedText if selected else QPalette.Text
+        )
+        shop_color = index.data(NAME_SHOP_COLOR_ROLE)
+        if selected:
+            # 蓝底上灰字会糊：选中时店名改用高亮字色，只压一点透明度
+            shop_color = QColor(text_color)
+            shop_color.setAlpha(200)
+        elif not isinstance(shop_color, QColor):
+            shop_color = style_option.palette.color(QPalette.Mid)
+
+        name_h = name_metrics.height()
+        shop_h = shop_metrics.height() if shop else 0
+        block_h = name_h + (SHOP_LINE_GAP + shop_h if shop else 0)
+        top = rect.top() + max(0, (rect.height() - block_h) // 2)
+
+        badge_w = 0
+        if self_sold:
+            badge_font = QFont(font)
+            badge_font.setBold(True)
+            badge_font.setPointSizeF(max(MIN_SHOP_POINT_SIZE, font.pointSizeF() - 1.0))
+            badge_w = (
+                QFontMetrics(badge_font).horizontalAdvance(SELF_BADGE_TEXT)
+                + SELF_BADGE_PAD * 2
+            )
+            # 窄到放不下「徽标 + 一点点名字」时就只留名字：徽标画到格子外面，
+            # 会盖住旁边那一列
+            if badge_w + SELF_BADGE_GAP >= rect.width():
+                badge_w = 0
+            else:
+                badge_h = min(name_h, SELF_BADGE_HEIGHT)
+                badge_rect = QRect(
+                    rect.left(), top + (name_h - badge_h) // 2, badge_w, badge_h
+                )
+                painter.save()
+                painter.setRenderHint(QPainter.Antialiasing, True)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(theme.self_badge_color())
+                painter.drawRoundedRect(
+                    badge_rect, SELF_BADGE_RADIUS, SELF_BADGE_RADIUS
+                )
+                painter.setFont(badge_font)
+                painter.setPen(QColor("#ffffff"))
+                painter.drawText(badge_rect, Qt.AlignCenter, SELF_BADGE_TEXT)
+                painter.restore()
+
+        # 名字：给徽标让出位置，放不下就省略号（完整名字在悬停提示里）
+        name_left = rect.left() + (badge_w + SELF_BADGE_GAP if badge_w else 0)
+        name_rect = QRect(name_left, top, max(0, rect.right() - name_left + 1), name_h)
+        painter.save()
+        painter.setFont(font)
+        painter.setPen(text_color)
+        painter.drawText(
+            name_rect,
+            Qt.AlignLeft | Qt.AlignVCenter,
+            name_metrics.elidedText(name, Qt.ElideRight, name_rect.width()),
+        )
+        if shop:
+            shop_rect = QRect(
+                rect.left(), top + name_h + SHOP_LINE_GAP, rect.width(), shop_h
+            )
+            painter.setFont(shop_font)
+            painter.setPen(shop_color)
+            painter.drawText(
+                shop_rect,
+                Qt.AlignLeft | Qt.AlignVCenter,
+                shop_metrics.elidedText(shop, Qt.ElideRight, shop_rect.width()),
+            )
+        painter.restore()
+
+
+def shop_line_text(shop, self_sold, checked=False) -> str:
+    """悬停提示里的「店铺：…」那一行；没有可说的返回空串。
+
+    checked 表示这件商品的店铺"问过了"：问过却没有店名（自营、或商品已被删除），
+    只有后者需要明说——自营那一行已经在名字前面标着了。
+    """
+    if self_sold is True:
+        return "店铺：会员购（自营）"
+    if shop:
+        return f"店铺：{shop}"
+    if self_sold is False:
+        return f"店铺：{UNKNOWN_SHOP_TEXT}"  # 是商家，但接口没给店名
+    if checked:
+        return f"店铺：{UNKNOWN_SHOP_TEXT}（商品可能已下架）"
+    return ""
+
+
+def name_tooltip(head, cluster_id, shop=None, self_sold=None, checked=False) -> str:
+    """「商品名」格的悬停提示：名称（抓失败时是失败原因）+ 店铺 + clusterID。
 
     ID 没有单独一列（那点宽度给了商品名，见 HEADERS），这里是界面上唯一看得见、
     又能选中复制它的去处，所以首屏和抓取回填两处改名字的地方都走这里拼——分头拼
     早晚会只改一处，抓着抓着提示就变了样。head 还是占位符（…/—）时只报 ID，
     免得弹一句没信息量的提示。
 
-    分两行：复制的时候上面那行是名字，下面那行是能直接粘进 watchlist.txt 的 ID。
+    店铺那行只在有话说时才出现（见 shop_line_text）：还没查过的商品弹一句
+    「店铺：未知」只会让人以为查失败了。
     """
     if head in ("", NO_DATA_TEXT, PENDING_TEXT):
         head = ""
-    return f"{head}\n{cluster_id}" if head else str(cluster_id)
+    lines = [head] if head else []
+    shop_line = shop_line_text(shop, self_sold, checked)
+    if shop_line:
+        lines.append(shop_line)
+    lines.append(str(cluster_id))  # 最后一行：能直接粘进 watchlist.txt
+    return "\n".join(lines)
 
 
 class PreviewArea(QScrollArea):
@@ -2118,6 +2326,8 @@ class MainWindow(QMainWindow):
         self.table.setHorizontalHeaderLabels(HEADERS)
         # 现价列自己画：现价和涨跌要两截颜色（见 PriceDeltaDelegate）
         self.table.setItemDelegateForColumn(COL_PRICE, PriceDeltaDelegate(self.table))
+        # 商品名列也自己画：自营徽标 + 第二行的店名（见 NameDelegate）
+        self.table.setItemDelegateForColumn(COL_NAME, NameDelegate(self.table))
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -2159,6 +2369,7 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeaderItem(COL_LOW).setToolTip(LOWEST_HEADER_TIP)
         self.table.horizontalHeaderItem(COL_EXPECT).setToolTip(EXPECTED_HEADER_TIP)
         self.table.horizontalHeaderItem(COL_AVG).setToolTip(AVG_HEADER_TIP)
+        self.table.horizontalHeaderItem(COL_NAME).setToolTip(NAME_HEADER_TIP)
         self.table.cellClicked.connect(self.OnCellClick)
         self.table.cellDoubleClicked.connect(self.OnCellDoubleClick)
         self.table.rows_dropped.connect(self.OnRowsDropped)
@@ -2809,27 +3020,12 @@ class MainWindow(QMainWindow):
 
     def FillRow(self, row, item):
         """填充一行：优先显示本次抓到的值，其次缓存，最后留待抓取。"""
-        values = item["values"] or {}
         record = item["record"] or {}
         cluster_id = item["entry"].cluster_id
 
         self.table.setRowHeight(row, IMAGE_SIZE + 8)
 
-        name_text = (
-            values.get("name")
-            or record.get("name")
-            or item["entry"].name
-            or (FAILED_TEXT if values and not values.get("ok") else PENDING_TEXT)
-        )
-        # 抓失败时，提示里报的是失败原因（比重复一遍名称有用），名称仍留在格子里
-        tip_head = (
-            (values.get("error") or "未知错误")
-            if values and not values.get("ok")
-            else name_text
-        )
-        self.table.setItem(
-            row, COL_NAME, self.MakeCell(name_text, tooltip=name_tooltip(tip_head, cluster_id))
-        )
+        self.ApplyNameCell(row, item)
 
         self.SetFavoriteCell(row, item)
         self.SetPriceCells(row, item)
@@ -2845,6 +3041,72 @@ class MainWindow(QMainWindow):
         link_item = self.MakeCell("打开", tooltip=url, align=Qt.AlignCenter)
         link_item.setData(Qt.UserRole, url)
         self.table.setItem(row, COL_LINK, link_item)
+
+    def ApplyNameCell(self, row, item):
+        """重画商品名那一格：名字、自营徽标、第二行店名、悬停提示，四处一起改。
+
+        首屏渲染（FillRow）和抓取回填（OnResultReady）都走这里：徽标和店名是同一份
+        数据的两种画法，分头写早晚会留下"名字换了、徽标没换"这种半截状态。
+        """
+        values = item["values"] or {}
+        record = item["record"] or {}
+        cluster_id = item["entry"].cluster_id
+
+        name_text = (
+            values.get("name")
+            or record.get("name")
+            or item["entry"].name
+            or (FAILED_TEXT if values and not values.get("ok") else PENDING_TEXT)
+        )
+        # 抓失败时，提示里报的是失败原因（比重复一遍名称有用），名称仍留在格子里
+        tip_head = (
+            (values.get("error") or "未知错误")
+            if values and not values.get("ok")
+            else name_text
+        )
+        shop, self_sold, checked = self.ShopOf(values, record)
+
+        cell = self.table.item(row, COL_NAME)
+        if cell is None:
+            cell = self.MakeCell("")
+            self.table.setItem(row, COL_NAME, cell)
+        cell.setText(name_text)
+        cell.setData(NAME_SELF_ROLE, self_sold is True)
+        cell.setData(NAME_SHOP_ROLE, shop)
+        # 店名的颜色按主题选，跟「原价」那格同一个弱化色；换主题时 RenderTable
+        # 会重走这里，所以只有这一处定义
+        cell.setData(NAME_SHOP_COLOR_ROLE, theme.muted_color(self.dark))
+        cell.setToolTip(name_tooltip(tip_head, cluster_id, shop, self_sold, checked))
+
+    @staticmethod
+    def ShopOf(values, record):
+        """这一行该显示的 (店名, 是否自营, 查没查过)。
+
+        本次抓到的优先（values["shop"]），其次缓存里的三列。缓存中 shop_self 为
+        None 有两种意思：还没查过（shop_item_id 也空），和查过了但认不出（商品已被
+        删除）——后者要在悬停提示里说明，所以"查没查过"单独返回一项。
+
+        自营商品没有店名：那件商品是会员购自己卖的，名字前面有徽标就够了。
+        """
+        shop = (values or {}).get("shop")
+        if isinstance(shop, dict):
+            name = shop.get("name")
+            self_sold = shop.get("self")
+            return (
+                name if isinstance(name, str) and name else None,
+                self_sold if isinstance(self_sold, bool) else None,
+                True,
+            )
+        record = record or {}
+        self_sold = record.get("shop_self")
+        if self_sold is not None and not isinstance(self_sold, bool):
+            self_sold = bool(self_sold)  # 缓存里存的是 0 / 1
+        name = record.get("shop_name")
+        return (
+            name if isinstance(name, str) and name else None,
+            self_sold,
+            bool(record.get("shop_item_id")),
+        )
 
     def SetDealCells(self, row, item):
         """填「成交①/②/③」三格，够新鲜的那几条加粗 + 高亮色。
@@ -3205,6 +3467,19 @@ class MainWindow(QMainWindow):
             return "自动抓取"
         return f"自动抓取（{AUTO_SCOPE_LABELS.get(scope, scope)}）"
 
+    def CachedShopItemIds(self, tasks):
+        """这批任务里，缓存中那份店铺各自对应哪个 itemsId（clusterId -> itemsId）。
+
+        轮询线程拿它判断"这件商品的店铺还用不用再问"：一样就不问。只算这次要抓的
+        那几行——部分抓取时不必把所有商品的店铺都扫一遍。
+        """
+        ids = {}
+        for row, entry in tasks:
+            if 0 <= row < len(self.rows):
+                record = self.rows[row]["record"] or {}
+                ids[entry.cluster_id] = record.get("shop_item_id")
+        return ids
+
     def StartFetch(self, tasks, source="manual"):
         """两个抓取入口共用的起跑：复位本轮状态、清价、建轮询线程。
 
@@ -3236,6 +3511,7 @@ class MainWindow(QMainWindow):
             self.config["poll_interval_seconds"],
             self.config["retry_interval_seconds"],
             self.config["request_timeout_seconds"],
+            shop_item_ids=self.CachedShopItemIds(tasks),
         )
         self.poller.result_ready.connect(self.OnResultReady)
         self.poller.progress_changed.connect(self.OnProgress)
@@ -3339,6 +3615,7 @@ class MainWindow(QMainWindow):
                 stock_count=result["stock_count"],
                 lowest_price=new_lowest,
                 deals=result["deals"],
+                shop=result.get("shop"),
             )
             # 这件商品还没有确认基线（新加进来的，或者库里从没确认过）：把这次抓到的
             # 样子记成基线，往后累积才有"相对什么"可比。这一笔不算确认——全局那个
@@ -3380,17 +3657,12 @@ class MainWindow(QMainWindow):
         self.UpdateUpdatedLabel()
         self.UpdateAckLabel()
 
-        # 名称：接口返回的才是最新的；失败时如果原本没有名字，标出来而不是留个"…"
-        name_item = self.table.item(row, COL_NAME)
+        # 名称/自营徽标/店名/提示一起重画：抓取回填和首屏走同一段（见 ApplyNameCell），
+        # 失败时如果原本没有名字，那里也会标出失败而不是留个"…"
+        self.ApplyNameCell(row, item)
         cluster_id = item["entry"].cluster_id
         if result["ok"] and result["name"]:
-            name_item.setText(result["name"])
-            name_item.setToolTip(name_tooltip(result["name"], cluster_id))  # 跟着新名字走
             item["entry"].name = result["name"]
-        elif not result["ok"]:
-            name_item.setToolTip(name_tooltip(result["error"] or "未知错误", cluster_id))
-            if name_item.text() == PENDING_TEXT:
-                name_item.setText(FAILED_TEXT)
         if result["ok"] and result["image_url"]:
             img_item = self.table.item(row, COL_IMG)
             if img_item is not None and img_item.icon().isNull():
@@ -3490,6 +3762,7 @@ class MainWindow(QMainWindow):
             self.config["poll_interval_seconds"],
             self.config["retry_interval_seconds"],
             self.config["request_timeout_seconds"],
+            shop_item_ids=self.CachedShopItemIds(tasks),
         )
         self.poller.result_ready.connect(self.OnResultReady)
         self.poller.progress_changed.connect(self.OnProgress)

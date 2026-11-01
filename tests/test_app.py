@@ -110,6 +110,23 @@ def result_fail(message="HTTP 500"):
     return parser.parse_error(client.ApiError(message))
 
 
+def item_payload(merchant_id=0, shop_name=None, code=0):
+    """items/info 的响应（店铺那条）：口径见 dev_notes/261101_市集店铺信息调查.md。"""
+    data = {
+        "shopVO": {"shopId": 2233, "shopName": "会员购 ", "purchaseSaleMode": 4},
+        "merchantId": merchant_id,
+        "selfSold": True,  # 实测恒为 true，不能用来判自营
+    }
+    if shop_name is not None:
+        data["shopInfoVO"] = {"shopName": shop_name}
+    return {
+        "success": code == 0,
+        "data": data if code == 0 else None,
+        "code": code,
+        "message": "商品不存在或被删除" if code else "0",
+    }
+
+
 def _assert_subtitle(text, total, failures=0):
     """断言总结副标题里的件数（和失败数）。
 
@@ -1432,6 +1449,136 @@ def test_name_tooltip_carries_the_cluster_id(window):
     bare = window("10000000002\n")
     bare.LoadWatchlist(bare.watchlist_path)
     assert bare.table.item(0, app_module.COL_NAME).toolTip() == "10000000002"
+
+
+# ---------------- 店铺（自营徽标 + 第二行店名） ----------------
+
+
+def test_name_tooltip_carries_the_shop():
+    """店铺那一行只在有话说时出现：商家给店名、自营给「会员购（自营）」、
+    查过但认不出（商品已删）说明一下；没查过的干脆不提，免得像是查失败了。"""
+    assert app_module.name_tooltip("甲", "1", "Vsinger官方旗舰店", False, True) == (
+        "甲\n店铺：Vsinger官方旗舰店\n1"
+    )
+    assert app_module.name_tooltip("甲", "1", None, True, True) == (
+        "甲\n店铺：会员购（自营）\n1"
+    )
+    assert app_module.name_tooltip("甲", "1", None, None, True) == (
+        "甲\n店铺：未知（商品可能已下架）\n1"
+    )
+    assert app_module.name_tooltip("甲", "1") == "甲\n1"
+
+
+def test_fill_row_shows_the_shop_from_cache(window):
+    """首屏就用缓存里的店名：不必等抓一轮才看得见（缓存是上次查到的）。"""
+    w = window("10000008780 | 甲\n")
+    w.store.upsert_item(
+        "10000008780", "甲", None,
+        shop={"item_id": "13662015", "name": "Vsinger官方旗舰店", "self": False},
+    )
+    w.LoadWatchlist(w.watchlist_path)
+
+    cell = w.table.item(0, app_module.COL_NAME)
+    assert cell.text() == "甲"  # 格子里仍是名字，店名由 delegate 画在第二行
+    assert cell.data(app_module.NAME_SHOP_ROLE) == "Vsinger官方旗舰店"
+    assert cell.data(app_module.NAME_SELF_ROLE) is False
+    assert cell.toolTip() == "甲\n店铺：Vsinger官方旗舰店\n10000008780"
+
+
+def test_fill_row_marks_self_sold(window):
+    """自营商品：名字前面挂徽标，没有第二行（不画一个空的店名）。"""
+    w = window("10000008780 | 甲\n")
+    w.store.upsert_item(
+        "10000008780", "甲", None,
+        shop={"item_id": "13662015", "name": None, "self": True},
+    )
+    w.LoadWatchlist(w.watchlist_path)
+
+    cell = w.table.item(0, app_module.COL_NAME)
+    assert cell.data(app_module.NAME_SELF_ROLE) is True
+    assert cell.data(app_module.NAME_SHOP_ROLE) is None
+    assert "会员购（自营）" in cell.toolTip()
+
+
+def test_fill_row_marks_a_shop_that_could_not_be_checked(window):
+    """查过了却认不出店铺（商品被删）：不画第二行，但悬停提示要说清楚。"""
+    w = window("10000008780 | 甲\n")
+    w.store.upsert_item(
+        "10000008780", "甲", None,
+        shop={"item_id": "13662015", "name": None, "self": None},
+    )
+    w.LoadWatchlist(w.watchlist_path)
+
+    cell = w.table.item(0, app_module.COL_NAME)
+    assert cell.data(app_module.NAME_SELF_ROLE) is False
+    assert cell.data(app_module.NAME_SHOP_ROLE) is None
+    assert "商品可能已下架" in cell.toolTip()
+
+
+def test_result_ready_saves_the_shop(window):
+    """抓取回填：店铺跟着结果一起写进缓存，格子和提示立刻跟着变。"""
+    w = window("10000008780\n")
+    w.LoadWatchlist(w.watchlist_path)
+
+    result = result_ok(name="甲")
+    result["item_id"] = "13662015"
+    result["shop"] = {"item_id": "13662015", "name": "幻梦模玩", "self": False}
+    w.OnResultReady(0, result)
+
+    cell = w.table.item(0, app_module.COL_NAME)
+    assert cell.data(app_module.NAME_SHOP_ROLE) == "幻梦模玩"
+    assert "店铺：幻梦模玩" in cell.toolTip()
+    record = w.store.get_item("10000008780")
+    assert record["shop_name"] == "幻梦模玩"
+    assert record["shop_self"] == 0
+    assert record["shop_item_id"] == "13662015"
+
+
+def test_result_ready_without_a_shop_keeps_the_cached_one(window):
+    """这次没查到店铺（网络抖了一下）：缓存里那份照旧显示，不能被清空。"""
+    w = window("10000008780 | 甲\n")
+    w.store.upsert_item(
+        "10000008780", "甲", None,
+        shop={"item_id": "13662015", "name": "幻梦模玩", "self": False},
+    )
+    w.LoadWatchlist(w.watchlist_path)
+
+    w.OnResultReady(0, result_ok(name="甲"))
+
+    assert w.table.item(0, app_module.COL_NAME).data(app_module.NAME_SHOP_ROLE) == "幻梦模玩"
+    assert w.store.get_item("10000008780")["shop_name"] == "幻梦模玩"
+
+
+def test_painting_a_name_cell_with_shop_does_not_blow_up(window, qapp):
+    """整条绘制路径真走一遍（离屏渲染看不到字，但崩了会立刻现形）。"""
+    w = window("10000008780\n")
+    w.store.upsert_item(
+        "10000008780", "很长的商品名，长到需要省略号，免得画到格子外面去", None,
+        shop={"item_id": "13662015", "name": "Vsinger官方旗舰店", "self": False},
+    )
+    w.LoadWatchlist(w.watchlist_path)
+    w.show()
+    qapp.processEvents()
+
+    w.table.viewport().grab()
+
+    assert w.table.item(0, app_module.COL_NAME).data(app_module.NAME_SHOP_ROLE)
+
+
+def test_painting_a_name_cell_with_the_badge_does_not_blow_up(window, qapp):
+    """自营徽标那条路也真画一遍：圆角矩形 + 白字，坐标算错会立刻现形。"""
+    w = window("10000008780\n")
+    w.store.upsert_item(
+        "10000008780", "甲", None,
+        shop={"item_id": "13662015", "name": None, "self": True},
+    )
+    w.LoadWatchlist(w.watchlist_path)
+    w.show()
+    qapp.processEvents()
+
+    w.table.viewport().grab()
+
+    assert w.table.item(0, app_module.COL_NAME).data(app_module.NAME_SELF_ROLE) is True
 
 
 def test_segment_rect_sits_right_after_the_price(qapp):
@@ -5310,6 +5457,144 @@ def test_poller_emits_results_in_order_with_progress(qapp, monkeypatch, join_thr
     assert progress == [(1, 2), (2, 2)]
     assert done == [True]
     assert log == ["1", "2"]
+
+
+def test_poller_looks_up_the_shop_once_per_item_id(qapp, monkeypatch, join_thread):
+    """店铺按 itemsId 查一次：同一件主商品对应好几个 cluster 时也只问一次。"""
+    shop_calls = []
+
+    def _fake_item(item_id, timeout=None):
+        shop_calls.append(item_id)
+        return item_payload(merchant_id=4141564, shop_name="Vsinger官方旗舰店")
+
+    resp = raw_ok(name="甲")
+    resp["data"]["reportParams"] = {"item_id": "13662015", "sku_id": "1"}
+    monkeypatch.setattr(client, "fetch_cluster", _fetch_by_id({"1": resp, "2": resp}))
+
+    thread = app_module.PollerThread(
+        _tasks(["1", "2"]), 0.01, 0.01, 1.0,
+        shop_item_ids={"1": None, "2": None}, fetch_item=_fake_item,
+    )
+    results = []
+    thread.result_ready.connect(lambda row, res: results.append(res))
+
+    thread.start()
+    assert join_thread(thread)
+
+    assert shop_calls == ["13662015"]
+    assert [r["shop"]["name"] for r in results] == ["Vsinger官方旗舰店"] * 2
+    assert all(r["shop"]["self"] is False for r in results)
+
+
+def test_poller_skips_the_shop_when_the_item_id_is_unchanged(qapp, monkeypatch, join_thread):
+    """缓存里那份店铺对应的 itemsId 没变就不再问（店铺几乎不变，省一次请求）。"""
+    shop_calls = []
+
+    def _fake_item(item_id, timeout=None):
+        shop_calls.append(item_id)
+        return item_payload(merchant_id=0)
+
+    resp = raw_ok(name="甲")
+    resp["data"]["reportParams"] = {"item_id": "13662015"}
+    monkeypatch.setattr(client, "fetch_cluster", _fetch_by_id({"1": resp}))
+
+    thread = app_module.PollerThread(
+        _tasks(["1"]), 0.01, 0.01, 1.0,
+        shop_item_ids={"1": "13662015"}, fetch_item=_fake_item,
+    )
+    results = []
+    thread.result_ready.connect(lambda row, res: results.append(res))
+
+    thread.start()
+    assert join_thread(thread)
+
+    assert shop_calls == []
+    assert "shop" not in results[0]
+
+
+def test_poller_does_not_look_up_the_shop_for_a_failed_cluster(qapp, monkeypatch, join_thread):
+    """价格都没抓到就没什么可查的：失败的行不带店铺请求。"""
+    shop_calls = []
+
+    def _fake_item(item_id, timeout=None):
+        shop_calls.append(item_id)
+        return item_payload(merchant_id=0)
+
+    monkeypatch.setattr(
+        client, "fetch_cluster", _fetch_by_id({"1": client.ApiError("HTTP 503")})
+    )
+
+    thread = app_module.PollerThread(
+        _tasks(["1"]), 0.01, 0.01, 1.0,
+        shop_item_ids={"1": None}, fetch_item=_fake_item,
+    )
+    thread.start()
+    assert join_thread(thread)
+
+    assert shop_calls == []
+
+
+def test_poller_drops_the_shop_when_the_lookup_fails(qapp, monkeypatch, join_thread):
+    """查店铺失败只影响店铺：这一行的价格结果照常回传，下轮再问。"""
+    def _broken_item(item_id, timeout=None):
+        raise client.ApiError("网络请求失败")
+
+    resp = raw_ok(name="甲")
+    resp["data"]["reportParams"] = {"item_id": "13662015"}
+    monkeypatch.setattr(client, "fetch_cluster", _fetch_by_id({"1": resp}))
+
+    thread = app_module.PollerThread(
+        _tasks(["1"]), 0.01, 0.01, 1.0,
+        shop_item_ids={"1": None}, fetch_item=_broken_item,
+    )
+    results = []
+    thread.result_ready.connect(lambda row, res: results.append(res))
+
+    thread.start()
+    assert join_thread(thread)
+
+    assert results[0]["ok"] is True and results[0]["name"] == "甲"
+    assert "shop" not in results[0]
+
+
+def test_poller_reports_a_gone_item_as_an_answer(qapp, monkeypatch, join_thread):
+    """商品被删（81100001）也要带回去：主线程记下 itemsId，往后不再问。"""
+    resp = raw_ok(name="甲")
+    resp["data"]["reportParams"] = {"item_id": "13662015"}
+    monkeypatch.setattr(client, "fetch_cluster", _fetch_by_id({"1": resp}))
+
+    thread = app_module.PollerThread(
+        _tasks(["1"]), 0.01, 0.01, 1.0,
+        shop_item_ids={"1": None},
+        fetch_item=lambda item_id, timeout=None: item_payload(code=81100001),
+    )
+    results = []
+    thread.result_ready.connect(lambda row, res: results.append(res))
+
+    thread.start()
+    assert join_thread(thread)
+
+    assert results[0]["shop"] == {
+        "item_id": "13662015", "name": None, "self": None,
+    }
+
+
+def test_cached_shop_item_ids_only_covers_the_given_tasks(window):
+    """只算这次要抓的那几行：部分抓取时不必把所有商品的店铺都扫一遍。"""
+    w = window("10000008780 | 甲\n10000000002 | 乙\n")
+    w.store.upsert_item(
+        "10000008780", "甲", None,
+        shop={"item_id": "13662015", "name": "幻梦模玩", "self": False},
+    )
+    w.LoadWatchlist(w.watchlist_path)
+
+    tasks = [(0, w.rows[0]["entry"])]
+    assert w.CachedShopItemIds(tasks) == {"10000008780": "13662015"}
+
+    both = [(0, w.rows[0]["entry"]), (1, w.rows[1]["entry"])]
+    assert w.CachedShopItemIds(both) == {
+        "10000008780": "13662015", "10000000002": None,
+    }
 
 
 def test_poller_retries_once_after_failure(qapp, monkeypatch, join_thread):
