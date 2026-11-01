@@ -384,8 +384,13 @@ GET https://mall.bilibili.com/mall-c-search/items/info?itemsId=<item_id>&shopId=
 
 省钱的两条：店铺挂在**主商品**上、几乎不变，所以只在 `item_id` 跟缓存里记的不一样时才查
 （`app.PollerThread._attach_shop` + `app.CachedShopItemIds`）；同一轮里多件 cluster 共用一个
-`item_id` 也只问一次。缓存里存成三列（`store.ITEM_COLUMNS`）：`shop_item_id` / `shop_name` / `shop_self`，
-`shop_item_id` 有值就表示"这件问过了"，商品已删的那种也靠它避免每轮重问。
+`item_id` 也只问一次。缓存里存成四列（`store.ITEM_COLUMNS`）：`shop_item_id` / `shop_name` /
+`shop_self` / `shop_checked_at`，`shop_item_id` 有值就表示"这件问过了"。
+
+**「问过但认不出」会过期**：回 `81100001` 的行店名和自营标记都是空，这种结论隔
+`app.SHOP_RECHECK_DAYS`（7）天重问一次（`shop_recheck_due`）——商品可能重新上架、接口也
+可能偶发误报，一次"已删"不该把一行永久钉死。问出了结果的（有店名，或确认自营/商家）
+不管放多久都不再问；没问过的行不写 `shop_checked_at`，自然会去问。
 
 显示上不加列：商品名列本来就最窄（1280 宽只剩约 270px），店名挤在同一行会把名字砍掉一多半。
 于是那一列自绘（`app.NameDelegate`）：自营在名字前挂个「自营」徽标，商家的店名画在**第二行**
@@ -674,7 +679,7 @@ pixi run shot           # 出图在 tmp/out/，每个场景深色/浅色各一�
 | 设置窗口的排版、标签、提示语 | `settings.FIELDS` / `settings.SECTIONS`；改完 `pixi run shot settings` 出图看一眼 |
 | 设置改完"当场生效"的范围 | `app.ApplyConfig()`：启动时算好存下来的那几处都在里头（高亮秒数与画刷、两处提示、自动抓取定时器） |
 | 缓存要多存一个字段 | `store.ITEM_COLUMNS`，老库由 `_ensure_item_columns()` 自动补列 |
-| 店铺怎么查、什么时候重查 | `app.PollerThread._attach_shop()` / `CachedShopItemIds()`、`client.fetch_item()`、`parser.parse_item_shop()`；缓存三列在 `store.ITEM_COLUMNS` |
+| 店铺怎么查、什么时候重查 | `app.PollerThread._attach_shop()` / `CachedShopItemIds()`、`client.fetch_item()`、`parser.parse_item_shop()`；"问过但认不出"隔 `app.SHOP_RECHECK_DAYS` 天重问；缓存四列在 `store.ITEM_COLUMNS` |
 | 「主商品已删」的行怎么标自营 | `parser._self_hint()`（读 `clusterServiceFloorVO.services`）；并进店铺结果在 `PollerThread._attach_shop`，旧缓存靠 `OnResultReady` 补 |
 | 商品名前面那个徽标、第二行店名 | `app.NameDelegate`（绘制）与 `app.ApplyNameCell` / `ShopOf`（填数据）、`app.NAME_SELF_ROLE` 等 role；徽标底色在 `theme.SELF_BADGE_COLOR` |
 | 要发一个新请求 / 改连接与超时的行为 | `net.py`（不许在别处直接 `requests.get`，否则又变回一次一张新连接）；拦网络的测试在 `tests/conftest.py` 的 `_offline` |
