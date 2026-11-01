@@ -375,8 +375,12 @@ GET https://mall.bilibili.com/mall-c-search/items/info?itemsId=<item_id>&shopId=
 - **不能用**的两个字段：`shopVO.shopName` 恒为 `「会员购 」`（市集商品的壳）、`selfSold` 恒为 true。
 - `code == 81100001`（商品不存在或被删除）也是**答案**不是失败：记下 `item_id`，往后不再问。
 - 抽样 143 件：16% 的商品已删；自营/商家各 60 件，`merchantId` 一刀切得干干净净。
-  「自营 / 官仓直发」那组服务标签命中即自营（27/27 无假阳性），但只覆盖 45% 的自营商品，
-  只当徽标的补充证据，不当判据。来龙去脉记在 `dev_notes/261101_市集店铺信息调查.md`（开发笔记不入库）。
+  来龙去脉记在 `dev_notes/261101_市集店铺信息调查.md`（开发笔记不入库）。
+- **主商品已删时的兜底**：退回 `cluster_info` 的服务标签（`parser._self_hint`），命中
+  `type=self/direct`（即「自营 / 官仓直发」）就按自营算。抽样 120 件里带这组标签的 27 件
+  全是自营、商家零例，可以放心用；但它只覆盖约一半自营商品，**没有标签不代表是商家**。
+  这种行在界面上仍然给「自营」徽标（`app.PollerThread._attach_shop` 把 `self_hint` 并进
+  店铺结果），标签也没有的写「店铺未知」，不留空白。
 
 省钱的两条：店铺挂在**主商品**上、几乎不变，所以只在 `item_id` 跟缓存里记的不一样时才查
 （`app.PollerThread._attach_shop` + `app.CachedShopItemIds`）；同一轮里多件 cluster 共用一个
@@ -387,6 +391,7 @@ GET https://mall.bilibili.com/mall-c-search/items/info?itemsId=<item_id>&shopId=
 于是那一列自绘（`app.NameDelegate`）：自营在名字前挂个「自营」徽标，商家的店名画在**第二行**
 （弱化色）。行高是跟着缩略图走的，第二行不额外占地方。悬停提示里另有一行「店铺：…」
 （`app.name_tooltip`），自营写「会员购（自营）」，查过却认不出（商品已删）写「未知（商品可能已下架）」。
+查过、认不出、也不是自营的行，第二行写「店铺未知」——空着会让人以为漏抓了。
 
 **预期价到没到**（`app.expected_reached`）
 
@@ -670,6 +675,7 @@ pixi run shot           # 出图在 tmp/out/，每个场景深色/浅色各一�
 | 设置改完"当场生效"的范围 | `app.ApplyConfig()`：启动时算好存下来的那几处都在里头（高亮秒数与画刷、两处提示、自动抓取定时器） |
 | 缓存要多存一个字段 | `store.ITEM_COLUMNS`，老库由 `_ensure_item_columns()` 自动补列 |
 | 店铺怎么查、什么时候重查 | `app.PollerThread._attach_shop()` / `CachedShopItemIds()`、`client.fetch_item()`、`parser.parse_item_shop()`；缓存三列在 `store.ITEM_COLUMNS` |
+| 「主商品已删」的行怎么标自营 | `parser._self_hint()`（读 `clusterServiceFloorVO.services`）；并进店铺结果在 `PollerThread._attach_shop`，旧缓存靠 `OnResultReady` 补 |
 | 商品名前面那个徽标、第二行店名 | `app.NameDelegate`（绘制）与 `app.ApplyNameCell` / `ShopOf`（填数据）、`app.NAME_SELF_ROLE` 等 role；徽标底色在 `theme.SELF_BADGE_COLOR` |
 | 要发一个新请求 / 改连接与超时的行为 | `net.py`（不许在别处直接 `requests.get`，否则又变回一次一张新连接）；拦网络的测试在 `tests/conftest.py` 的 `_offline` |
 | 缩略图的尺寸、并发数、磁盘缓存上限 | `app.IMAGE_SIZE` / `IMAGE_SUFFIX` / `IMAGE_WORKERS`（改 `IMAGE_SIZE` 会让盘上旧缓存自动作废）、`thumbs.MAX_FILES` |
