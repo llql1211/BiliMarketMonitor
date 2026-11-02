@@ -510,14 +510,19 @@ GET https://mall.bilibili.com/mall-c-search/items/info?itemsId=<item_id>&shopId=
 
 - **三个判据是本轮那三个的翻版**，判据口径一字不差，只是基准换成基线：
   `ack_change` 把基线包成 `previous` 直接调 `price_change`；`ack_new_deals` 把
-  `ack_deals_json` + `ack_deals_updated_at` 当基准交给 `new_deals`（`elapsed` 是**那份成交快照
-  抓回来之后**到现在的秒数）；`ack_reached` 在本轮到价的基础上再要求**确认时没到价**——它跟
-  通知那边一样是边沿，不然确认过一次之后它会一直报。
+  `ack_deals_json` + `ack_deals_updated_at` 当基准交给 `new_deals`（`elapsed` 是**当前那份成交
+  快照的抓取时刻**减去基线那份的抓取时刻，见下一条）；`ack_reached` 在本轮到价的基础上再要求
+  **确认时没到价**——它跟通知那边一样是边沿，不然确认过一次之后它会一直报。
 - **成交快照的锚点不是确认时刻**：用户完全可能隔几小时才点确认，而快照里的「刚刚」说的是
   抓取那一刻。拿 `ack_at` 算 `elapsed` 会把那几小时漏掉，老成交像变年轻了似的，下一轮又被
   报成「新增」——这正是「已读之后下一次抓取还包含这次成交」那个 bug。所以 `acknowledge()` /
   `init_ack_if_empty()` 会单独记 `ack_deals_updated_at`（就是写缓存时那个 `deals_updated_at`），
   老缓存没这列时 `ack_new_deals` 退回 `ack_at`，行为跟升级前一样。
+- **两轮之间的间隔要拿两份快照的时刻相减**（`app._elapsed_between`），不能用 `_elapsed_since`
+  那种"到现在的秒数"：当前这份成交也可能已经放了几分钟（刚点完确认没再抓、或最近一轮失败），
+  把这段时间重复加进年龄里，同一批成交就会落不进原来的年龄格，刚确认完又冒出一批「新增成交」，
+  顶部那句「未确认 N 项变化」也就清不掉。现在这份比基线还旧（时钟倒挂、手改过库）时按认不出来
+  处理，宁可漏报。
 - **售罄、认不出数字一律不参与价格比较**，跟 `price_delta` / `expected_reached` 同规矩：
   售罄行的"现价"是原价，两边售罄就不比；确认时的价认不出来就退化成"不比"，
   不拿猜出来的数当基准。

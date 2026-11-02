@@ -542,17 +542,19 @@ def ack_new_deals(record):
     """自上次确认以来新出现的成交（基准是确认那一刻存下的那份快照）。
 
     判定整条复用 new_deals：把 previous 换成 ack_deals_json、elapsed 换成
-    "那份快照抓回来之后到现在"，_aged_from 一个字不用改。这份基线跟 ack_at 一起
-    存在缓存里，关掉程序再开还接着算——累积能跨轮就是靠它落了库。
+    "当前这份快照比基线又晚了多久"，_aged_from 一个字不用改。这份基线跟 ack_at
+    一起存在缓存里，关掉程序再开还接着算——累积能跨轮就是靠它落了库。
 
     锚点用 ack_deals_updated_at（快照**抓回来**的时刻），不是 ack_at（用户**点确认**
     的时刻）：用户完全可能隔很久才点确认，拿确认时刻算间隔会把那几小时漏掉，老成交
     在下一轮就被当成"变年轻了"重新报成新增——这正是"已读之后下一次抓取还包含这次
     成交记录"那个 bug。老缓存没有这一列时退回 ack_at，行为跟以前一样。
 
-    三种情况一条都不报（跟 new_deals 的"没有基准就不报"同一条规矩）：没确认过、
-    确认时没存下成交、或认不出那份基线是什么时候记的（elapsed 认不出来时
-    _elapsed_since 给 None，这里就闭嘴——宁可漏报，也不要把几条老成交说成"新增"）。
+    elapsed 是**两份快照各自的抓取时刻相减**，不是"基线抓回来到现在"：
+    当前 record 里的成交可能已经是几分钟、几小时前抓的了（刚点完确认没再抓，
+    或者最近一轮抓取失败），拿"现在"当它的年龄，等于把这段时间重复加了一遍，
+    刚确认完就会冒出一批"新增成交"——这正是「未确认 N 项变化」清不掉的那个 bug。
+    两边时刻只要有一个认不出来就闭嘴（宁可漏报，也不要把老成交说成"新增"）。
     """
     record = record or {}
     # 借用 cached_deals_of 的读取路径：它认的就是 deals_json + 它的抓取时刻这两格，
@@ -563,10 +565,10 @@ def ack_new_deals(record):
     )
     if not baseline:
         return []
-    elapsed = _elapsed_since(anchor)
+    current, current_anchor = store.cached_deals_of(record)
+    elapsed = _elapsed_between(current_anchor, anchor)
     if elapsed is None:
         return []
-    current, _ = store.cached_deals_of(record)  # 当前这组（它的时刻用不上）
     return new_deals(current, baseline, elapsed)
 
 
@@ -694,6 +696,21 @@ def _elapsed_since(anchor):
     if stamp is None:
         return None
     return max(0.0, (datetime.now() - stamp).total_seconds())
+
+
+def _elapsed_between(later, earlier):
+    """两个缓存时刻之间差了多少秒（later - earlier）；认不出或倒过来都返回 None。
+
+    判"两份成交快照之间过了多久"要用它，不能用 _elapsed_since：后者算到"现在"，
+    只对**刚抓回来**的那份成立。当前这份可能放了一阵子（见 ack_new_deals）。
+    负数说明缓存里的时刻倒挂了（手改过库、时钟跳过），一律当认不出来。
+    """
+    end = _parse_stamp(later)
+    start = _parse_stamp(earlier)
+    if end is None or start is None:
+        return None
+    seconds = (end - start).total_seconds()
+    return seconds if seconds >= 0 else None
 
 
 def _reaged_deals(deals, elapsed):

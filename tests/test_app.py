@@ -2399,7 +2399,7 @@ def test_last_summary_button_does_not_widen_the_window(window):
 
 
 def _row(price=None, sold_out=0, ack=None, deals=None, ack_deals=None, ack_at=CACHED_AT,
-         ack_deals_at=None):
+         ack_deals_at=None, deals_at=None):
     """一条缓存记录（只摆判定用到的那几格）。
 
     ack 给确认基线那组的现价 (price_text, sold_out)，跟 store 里那两格同名同义；
@@ -2407,12 +2407,15 @@ def _row(price=None, sold_out=0, ack=None, deals=None, ack_deals=None, ack_at=CA
 
     ack_deals_at 是基线里那份成交快照**抓回来**的时刻（store 的
     ack_deals_updated_at）；不给就跟 ack_at 一致，等价于"确认时顺手抓的"。
+    deals_at 是当前这组成交抓回来的时刻（store 的 deals_updated_at）；不给也跟
+    ack_at 一致。判"两轮之间过了多久"靠它与 ack_deals_at 相减，所以当前成交比确认
+    新一轮时得单独给（见 test_ack_new_deals_stays_quiet_when_the_user_confirms_late）。
     """
     record = {
         "price_text": price,
         "sold_out": sold_out,
         "deals_json": json.dumps(deals) if deals is not None else None,
-        "deals_updated_at": ack_at,
+        "deals_updated_at": deals_at if deals_at else ack_at,
     }
     ack_price, ack_sold_out = ack if ack else (None, 0)
     record["ack_price_text"] = ack_price
@@ -2484,6 +2487,32 @@ def test_ack_new_deals_stays_quiet_when_the_user_confirms_late():
         ack_deals=[{"price": "¥44", "time": "刚刚"}],
         ack_at=stamp(1800),
         ack_deals_at=stamp(2400),
+        deals_at=stamp(0),  # 现在这一轮，同一条成交已经 40 分钟前
+    )
+
+    assert app_module.ack_new_deals(record) == []
+
+
+def test_ack_new_deals_stays_quiet_when_the_snapshot_has_been_sitting_for_a_while():
+    """回归：确认时基线跟当前是同一份快照，放多久都不该冒出「新增成交」。
+
+    现场：抓完 5 分钟后点确认，「未确认 8 项变化」一直清不掉。根因是 elapsed 拿
+    "基线抓回来到现在"算，把当前这份也当成了刚抓的——可它其实也放了 5 分钟，
+    这段时间被重复加了一遍，「27分钟前」那条就落不进原来的年龄格了。两份快照
+    一个字节都不差，elapsed 本来就该是 0（见 app.ack_new_deals）。
+    """
+    now = datetime.now()
+    fetched = (now - timedelta(minutes=5)).isoformat(timespec="seconds")
+    deals = [{"price": "¥21", "time": "27分钟前"}]
+
+    record = _row(
+        "¥24",
+        ack=("¥24", 0),
+        deals=deals,
+        ack_deals=deals,
+        ack_at=now.isoformat(timespec="seconds"),
+        ack_deals_at=fetched,
+        deals_at=fetched,
     )
 
     assert app_module.ack_new_deals(record) == []
@@ -2661,6 +2690,32 @@ def test_confirming_clears_the_block_and_flips_the_label(window, monkeypatch, wa
     # 成交快照的锚点跟着"抓回来的时刻"走，不是确认时刻（见 ack_new_deals）
     row = w.store.get_item("10000008780")
     assert row["ack_deals_updated_at"] == row["deals_updated_at"]
+
+
+def test_recent_deals_do_not_resurface_just_because_the_snapshot_is_old(window):
+    """回归：抓完放几分钟再看，同一批成交不许变成「未确认」。
+
+    现场：抓完 5 分钟才点确认，顶部那句「未确认 8 项变化」怎么都清不掉。这批成交
+    在确认基线里已经有了，只是当前快照也放了几分钟——拿"基线抓回来到现在"当两轮
+    间隔，把这段时间重复算了一遍，重算后的年龄格就对不上了（见 ack_new_deals）。
+    """
+    w = window("10000008780 | 甲\n")
+    w.LoadWatchlist(w.watchlist_path)
+    w.OnResultReady(0, _fetched("¥24", avg="¥30", deals=1, deal_times=["27分钟前"]))
+    fetched = (datetime.now() - timedelta(minutes=5)).isoformat(timespec="seconds")
+    w.store.conn.execute(
+        "UPDATE items SET deals_updated_at = ?, ack_deals_updated_at = ? "
+        "WHERE cluster_id = ?",
+        (fetched, fetched, "10000008780"),
+    )
+    w.store.conn.commit()
+    w.rows[0]["record"] = w.store.get_item("10000008780")
+
+    w.UpdateAckLabel()
+    assert w.ack_label.text() == app_module.ACK_NONE_TEXT  # 基线里本来就有这条
+
+    w.OnAcknowledge()
+    assert w.ack_label.text().startswith(app_module.ACK_DONE_PREFIX)
 
 
 def test_confirmation_survives_a_restart(window, monkeypatch, wait_until):
