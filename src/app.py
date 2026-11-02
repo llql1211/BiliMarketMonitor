@@ -2188,6 +2188,7 @@ class MainWindow(QMainWindow):
         # （几个商品用同一张图是常事，行号在这儿只当"贴哪儿"用，重排后要核对）
         self.pending_images = {}
         self.poller = None
+        self._orphan_pollers = []  # 换线程时没能当场等到的那些，等它们自己收尾（见 _RetirePoller）
         self.names_learned = False  # 本次抓取是否学到了新名称（决定要不要回写清单）
         self.poller_stopped = False  # 本次抓取是否被「停止抓取」中止
         self.last_unparsed = 0   # 上次读清单时认不出的行数（见 OnRefreshList 的重写判据）
@@ -3537,6 +3538,42 @@ class MainWindow(QMainWindow):
             ids[entry.cluster_id] = item_id
         return ids
 
+    def _RetirePoller(self):
+        """换新抓取线程之前，先把上一个送走。
+
+        finished_all 是排队投递到主线程的：信号送到的时候，那个线程的 run() 刚
+        返回，OS 线程还在做最后的收尾。这一刻把 self.poller 指向新线程，旧 QThread
+        的最后一个引用就没了——PyQt 会当场销毁一个还在跑的线程，Qt 随即 qFatal
+        （进程一声不响地退出）。补抓那条路必然走到这里（上一轮刚跑完就换线程），
+        所以等它几毫秒。等不到就先留着引用，别去销毁还在跑的东西。
+        """
+        old = self.poller
+        if old is None:
+            return
+        if old.wait(2000):
+            return  # 已经收干净了，引用可以放手
+        self._orphan_pollers.append(old)
+        old.finished.connect(lambda o=old: self._orphan_pollers.remove(o))
+
+    def _ClosePollers(self):
+        """关窗前把抓取线程掐断：先断信号，再喊停。
+
+        线程的 finished_all 是排队投递到主线程的，窗口关掉之后它才到：那会儿
+        store 已经关了、窗口也正在销毁，槽里接着开一轮补抓，就留下一个还在跑的
+        QThread；窗口一死，它的最后一个引用也没了，PyQt 当场销毁一个还在跑的
+        线程，Qt 直接 qFatal（进程一声不响地退出，测试里表现为 worker 突然消失）。
+        """
+        for poller in [self.poller, *self._orphan_pollers]:
+            if poller is None:
+                continue
+            try:
+                poller.result_ready.disconnect(self.OnResultReady)
+                poller.progress_changed.disconnect(self.OnProgress)
+                poller.finished_all.disconnect(self.OnPollFinished)
+                poller.stop()
+            except (TypeError, RuntimeError):
+                pass  # 已经断过 / 对象已经销毁，都不用再收拾
+
     def StartFetch(self, tasks, source="manual"):
         """两个抓取入口共用的起跑：复位本轮状态、清价、建轮询线程。
 
@@ -3563,6 +3600,7 @@ class MainWindow(QMainWindow):
         # 价格不该跟着空一整轮
         self.ClearPrices([row for row, _ in tasks])
         self.SetBusy(True)
+        self._RetirePoller()
         self.poller = PollerThread(
             tasks,
             self.config["poll_interval_seconds"],
@@ -3820,6 +3858,7 @@ class MainWindow(QMainWindow):
             return False
         self.run_retried = True
         self.run_retry_pass = True
+        self._RetirePoller()
         self.poller = PollerThread(
             tasks,
             self.config["poll_interval_seconds"],
@@ -4421,6 +4460,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """退出前把自动抓取停掉、缓存连接关掉：SQLite 的写入要落盘，文件句柄也别留着。"""
         self.auto_poll_timer.stop()
+        self._ClosePollers()
         self.store.close()
         # 拉图的线程也停一停：它们收尾后还会往这个窗口发信号，而槽里抛异常在
         # PyQt 下是直接 abort 进程的（同 AckAt）；排着队的那几百张也就此丢掉
