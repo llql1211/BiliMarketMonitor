@@ -6763,7 +6763,7 @@ def test_cached_deal_without_an_anchor_shows_price_only(window):
         ("刚刚", 0, "刚刚"),
         ("刚刚", 120, "2分钟前"),
         ("2小时前", 3600, "3小时前"),
-        ("8天前", 86400, "1周前"),  # 满一周就说「周」，跟接口自己的说法一致
+        ("8天前", 86400, "9天前"),  # 市集只说「天」，跨过一周也不改口说「1周前」
     ],
 )
 def test_reaged_deals_shift_by_the_elapsed(text, elapsed, expected):
@@ -6772,7 +6772,7 @@ def test_reaged_deals_shift_by_the_elapsed(text, elapsed, expected):
 
     assert aged[0]["time"] == expected
     # 显示的说法和判定用的年龄得对得上：精确年龄要落在那句话的区间里
-    # （「1周前」说的是"一周多、不到两周"，见 parser.age_bounds）
+    # （「9天前」说的是"九天多、不到十天"，见 parser.age_bounds）
     lower, upper = parser.age_bounds(expected)
     assert lower <= aged[0]["age_seconds"] <= upper
 
