@@ -28,6 +28,7 @@ shot = "python tools/shot.py"
 # 把 test feature 并进默认环境，`pixi run test` 和 `pixi run start` 共用一个环境。
 [tool.pixi.feature.test.pypi-dependencies]
 pytest = ">=8"
+pytest-xdist = ">=3.8"
 
 [tool.pixi.feature.test.tasks]
 test = "python -m pytest"
@@ -39,3 +40,6 @@ default = { features = ["default", "test"], solve-group = "default" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# 默认并行：1302 个用例串行要四十多秒，8 个进程十三四秒（这台 8 核的机器）。
+# 想串行看输出就在命令后加 `-n 0`，想换并发数写 `-n 4`。
+addopts = "-n 8"

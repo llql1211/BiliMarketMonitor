@@ -43,6 +43,8 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/7f/3e/5db95bcf282c52709639744ca2a8b149baccf648e39c8cc87553df9eae0c/urllib3-2.7.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/a0/14/8a053f71df81a02c843afd50157020eb86a8f748698eab087b4716a40aca/pyqt5_sip-12.19.0-cp314-cp314-win_amd64.whl
       - pypi: https://files.pythonhosted.org/packages/a0/f4/c67b0b3f1b9245e8d266f0f112c500d50e5b4e83cb6f3b71b6528104182a/requests-2.34.2-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/ab/84/02fc1827e8cdded4aa65baef11296a9bbe595c474f0d6d758af082d849fd/execnet-2.1.2-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/ca/31/d4e37e9e550c2b92a9cbc2e4d0b7420a27224968580b5a447f420847c975/pytest_xdist-3.8.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/cb/b1/3846dd7f199d53cb17f49cba7e651e9ce294d8497c8c150530ed11865bb8/iniconfig-2.3.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/d1/d6/3965ed04c63042e047cb6a3e6ed1a63a35087b6a609aa3a15ed8ac56c221/colorama-0.4.6-py2.py3-none-any.whl
 packages:
@@ -429,6 +431,27 @@ packages:
   - pysocks>=1.5.6,!=1.5.7 ; extra == 'socks'
   - chardet>=3.0.2,<8 ; extra == 'use-chardet-on-py3'
   requires_python: '>=3.10'
+- pypi: https://files.pythonhosted.org/packages/ab/84/02fc1827e8cdded4aa65baef11296a9bbe595c474f0d6d758af082d849fd/execnet-2.1.2-py3-none-any.whl
+  name: execnet
+  version: 2.1.2
+  sha256: 67fba928dd5a544b783f6056f449e5e3931a5c378b128bc18501f7ea79e296ec
+  requires_dist:
+  - hatch ; extra == 'testing'
+  - pre-commit ; extra == 'testing'
+  - pytest ; extra == 'testing'
+  - tox ; extra == 'testing'
+  requires_python: '>=3.8'
+- pypi: https://files.pythonhosted.org/packages/ca/31/d4e37e9e550c2b92a9cbc2e4d0b7420a27224968580b5a447f420847c975/pytest_xdist-3.8.0-py3-none-any.whl
+  name: pytest-xdist
+  version: 3.8.0
+  sha256: 202ca578cfeb7370784a8c33d6d05bc6e13b4f25b5053c30a152269fd10f0b88
+  requires_dist:
+  - execnet>=2.1
+  - pytest>=7.0.0
+  - filelock ; extra == 'testing'
+  - psutil>=3.0 ; extra == 'psutil'
+  - setproctitle ; extra == 'setproctitle'
+  requires_python: '>=3.9'
 - pypi: https://files.pythonhosted.org/packages/cb/b1/3846dd7f199d53cb17f49cba7e651e9ce294d8497c8c150530ed11865bb8/iniconfig-2.3.0-py3-none-any.whl
   name: iniconfig
   version: 2.3.0
