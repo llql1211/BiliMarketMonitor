@@ -46,15 +46,58 @@ request_timeout_seconds = 1.0
 
 # ---------------- 真实数据看门狗 ----------------
 
+# 监视器开着的时候，这几样是它自己在写：每抓一轮就落一次盘，指纹必然变。
+# 拿它们跟测试写入做区分是不可能的，所以程序开着时干脆不比这几样。
+_APP_WRITES_WHILE_RUNNING = ("cache.db", "watchlist.txt", "thumbs/")
 
-def _snapshot(path: pathlib.Path):
-    """目录内容指纹：相对路径 -> sha256（目录不存在时为空）。"""
+
+def _app_is_running() -> bool:
+    """监视器开着吗——它一直挂着 data/cache.db，独占打开会失败。
+
+    这是唯一能把自己写入和测试写入分开的办法：SQLite 自己是以共享方式打开
+    cache.db 的，所以这个探测对测试进程自己无害，只有在别的进程正拿着它时
+    才会撞上 ERROR_SHARING_VIOLATION。
+    """
+    db = REAL_DATA / "cache.db"
+    if not db.exists() or os.name != "nt":
+        return False
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    handle = kernel32.CreateFileW(
+        str(db), 0x80000000, 0, None, 3, 0x80, None  # GENERIC_READ / OPEN_EXISTING
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        return ctypes.get_last_error() == 32  # ERROR_SHARING_VIOLATION
+    kernel32.CloseHandle(handle)
+    return False
+
+
+def _snapshot(path: pathlib.Path, ignore=()):
+    """目录内容指纹：相对路径 -> sha256（目录不存在时为空）。
+
+    ignore 里的名字（以 ``/`` 结尾表示目录）不参与比对。
+    """
     if not path.exists():
         return {}
+
+    def skipped(name: str) -> bool:
+        return any(
+            name == rule or (rule.endswith("/") and name.startswith(rule))
+            for rule in ignore
+        )
+
     return {
         str(p.relative_to(path)): hashlib.sha256(p.read_bytes()).hexdigest()
         for p in sorted(path.rglob("*"))
-        if p.is_file()
+        if p.is_file() and not skipped(str(p.relative_to(path)))
     }
 
 
@@ -64,10 +107,20 @@ def _guard_real_data():
 
     这是为一次真实事故加的保险——早期测试直接构造 MainWindow，
     store.sync() 的「以清单为准」语义把用户的 cache.db 清空过。
+
+    但监视器开着的时候，它自己每隔几秒就往 cache.db / watchlist.txt 写一笔，
+    指纹必然变；不把这几样摘出去的话，开着程序跑测试次次都是红的（而且跑得
+    越久越容易红）。摘掉之后测试真写进去的那些文件仍旧照死里查。
     """
-    before = _snapshot(REAL_DATA)
+    ignore = _APP_WRITES_WHILE_RUNNING if _app_is_running() else ()
+    if ignore:
+        print(
+            f"\n[conftest] 监视器正开着，本次跳过它自己会写的 {list(ignore)}；"
+            "其余文件照旧校验"
+        )
+    before = _snapshot(REAL_DATA, ignore)
     yield
-    after = _snapshot(REAL_DATA)
+    after = _snapshot(REAL_DATA, ignore)
     changed = sorted(
         name
         for name in set(before) | set(after)
@@ -143,6 +196,50 @@ def data_files(tmp_path, monkeypatch):
     return data_dir
 
 
+def flush_deferred_deletes(app):
+    """让 deleteLater 排着的控件当场销毁。
+
+    Qt 的 deleteLater 只由事件循环兑现，光调 processEvents 不算数。攒下来的
+    窗口会一直留在 QApplication 里，之后每次 setStyleSheet（换主题）都要把它们
+    全部重新 polish 一遍——套件里曾经因此单次 apply_theme 涨到 3 秒。
+    """
+    from PyQt5.QtCore import QCoreApplication, QEvent
+
+    app.processEvents()
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    app.processEvents()
+
+
+def _widget_count():
+    """当前 QApplication 里还活着的控件数（没有 QApplication 时为 0）。"""
+    from PyQt5.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    return 0 if app is None else len(app.allWidgets())
+
+
+@pytest.fixture(autouse=True)
+def _no_widget_leak():
+    """用例之间不许攒窗口：留下的控件会让后面每个用例都变慢。
+
+    这条是本套件最容易踩的性能坑，也是唯一会「一处泄漏、全局变慢」的地方：
+    test_settings 的对话框忘了真正销毁时，每个用例漏 76 个控件，28 个用例攒到
+    2100 个，接着 test_theme 里的 apply_theme 从 0.01 秒涨到 3 秒，多跑 11 秒。
+    所以这里把它变成会失败的断言，而不是一句口头约定。
+    """
+    before = _widget_count()
+    yield
+    after = _widget_count()
+    assert after <= before + WIDGET_LEAK_SLACK, (
+        f"这个用例留下了 {after - before} 个控件（{before} -> {after}）。\n"
+        "请在自己的 fixture 里 close() + deleteLater()，再用 "
+        "conftest.flush_deferred_deletes(qapp) 把删除兑现。"
+    )
+
+
+WIDGET_LEAK_SLACK = 10
+
+
 @pytest.fixture
 def window(qapp, data_files):
     """构造 MainWindow 的工厂，并在 teardown 收干净线程与窗口。
@@ -164,8 +261,6 @@ def window(qapp, data_files):
 
     yield _make
 
-    from PyQt5.QtCore import QCoreApplication, QEvent
-
     for win in made:
         if win.poller is not None and win.poller.isRunning():
             win.poller.stop()
@@ -178,14 +273,10 @@ def window(qapp, data_files):
     # 1) processEvents 把 stop() 之后队列里的 finished_all 送出去——PollerThread
     #    最后一句就是 emit，主线程的 OnPollFinished 收到后会写回 watchlist.txt；
     #    拖到 monkeypatch 撤了再送，写的就是用户真实的 data/ 了。
-    # 2) sendPostedEvents(DeferredDelete)：Qt 的 deleteLater 只由事件循环兑现，
-    #    processEvents 不管，光调它窗口一个都不会析构。攒上几百个之后，
-    #    每次 apply_theme 的 setStyleSheet 都要重新 polish 全部控件（几百毫秒），
-    #    整个套件会从十几秒拖到两分钟以上。顺序是先送信号再析构：析构也不该
-    #    发生在 monkeypatch 撤了之后（closeEvent 里有 store.close()）。
-    qapp.processEvents()
-    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-    qapp.processEvents()
+    # 2) 把 deleteLater 兑现——光调 processEvents 窗口一个都不会析构。顺序是
+    #    先送信号再析构：析构也不该发生在 monkeypatch 撤了之后（closeEvent 里
+    #    有 store.close()）。留下的控件为什么要命，见 flush_deferred_deletes。
+    flush_deferred_deletes(qapp)
 
 
 # ---------------- 拦下副作用 ----------------

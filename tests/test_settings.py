@@ -9,6 +9,7 @@ from PyQt5.QtCore import QPoint, QRect
 from PyQt5.QtWidgets import QCheckBox, QLineEdit
 
 import config
+import conftest
 import settings
 import theme
 
@@ -31,6 +32,10 @@ def dialog(qapp):
         item.close()
         item.deleteLater()
     qapp.processEvents()
+    # deleteLater 不靠 processEvents 兑现，对话框会一直留在 QApplication 里：
+    # 一个设置窗口 76 个控件，几十个用例攒出两千个，后面每次 apply_theme 都要
+    # 把它们全部重新 polish 一遍（单次 3 秒）。见 conftest.flush_deferred_deletes。
+    conftest.flush_deferred_deletes(qapp)
 
 
 # ---------------- 字段表 ----------------
