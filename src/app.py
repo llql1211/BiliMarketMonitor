@@ -108,11 +108,12 @@ ZOOM_MAX = 4.0    # 最多放到铺满的 4 倍；720 的图再往上就是马�
 ROW_NUMBER_PADDING = 16  # 序号槽左右留白，免得数字贴着分隔线
 
 # 拖拽排序时的自动滚动（见 ReorderableTable）：光标进到可视区上下这么宽的一条里就
-# 自己滚，越靠边滚得越快。Qt 自带的那套在自定义 QDrag 下不生效，只能自己接管
+# 自己滚，越靠边滚得越快。Qt 自带的那套在自定义 QDrag 下不生效，只能自己接管。
+# 速度：一行 104px，贴着边缘每秒约 270px ≈ 2.6 行——比这更快就刹不住车，落点对不准
 DRAG_SCROLL_EDGE = 40
 DRAG_SCROLL_INTERVAL_MS = 30
-DRAG_SCROLL_MIN_STEP = 4
-DRAG_SCROLL_MAX_STEP = 24
+DRAG_SCROLL_MIN_STEP = 2
+DRAG_SCROLL_MAX_STEP = 8
 
 COL_FAVORITE = 0
 COL_IMG, COL_NAME, COL_PRICE, COL_LOW, COL_EXPECT, COL_REF, COL_AVG = (

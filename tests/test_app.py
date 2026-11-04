@@ -4371,6 +4371,24 @@ def test_autoscroll_stops_away_from_the_edges(window, qapp):
     assert table._drag_step == 0
 
 
+def test_autoscroll_at_the_edge_is_slow_enough_to_aim(window, qapp):
+    """贴着边缘也得慢慢滚：一秒两三行，再快就冲过头、落点对不准（用户反馈过快）。"""
+    w = _loaded(window, *_many_rows())
+    w.show()
+    qapp.processEvents()
+    table = w.table
+    table.dragMoveEvent(
+        QDragMoveEvent(
+            QPoint(10, table.viewport().height() - 1), Qt.MoveAction, QMimeData(),
+            Qt.LeftButton, Qt.NoModifier,
+        )
+    )
+
+    per_second = table._drag_step * 1000 / app_module.DRAG_SCROLL_INTERVAL_MS
+    assert table._drag_step > 0
+    assert per_second < table.rowHeight(0) * 3  # 一行 104px，别一秒就滚过三行
+
+
 def test_autoscroll_stops_on_drop(window, qapp, monkeypatch):
     """松手后定时器必须停：留着它，下一次拖到一半就自己滚起来了。"""
     w = _loaded(window, *_many_rows())

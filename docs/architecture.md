@@ -558,6 +558,9 @@ GET https://mall.bilibili.com/mall-c-search/items/info?itemsId=<item_id>&shopId=
   改成 `dragMoveEvent` 里按光标到上下边缘的距离算方向和速度，`QTimer` 每 30ms 滚一格。
   越靠边越快（`DRAG_SCROLL_MAX_STEP`），到顶/到底或回到中间就停；每次 tick 还用同一个光标
   位置重算落点，横线才会跟着滚动后的行一起挪。
+- **速度往慢里给**：一行 104px，贴边一秒约 2.6 行（`DRAG_SCROLL_MAX_STEP` 8 × 1000/30ms）。
+  早先给到 24（一秒近 8 行），实测"一碰边就飞过去"，落点根本对不准；`tests/test_app.py`
+  里钉了上限，改常量时别又调回去。
 - **停的地方要全**：`dropEvent`、`dragLeaveEvent`、`startDrag` 的 `exec_()` 返回之后都调
   `_stop_drag_scroll()`。漏一条，下一次拖到一半页面就自己滚起来。
 
