@@ -4325,7 +4325,8 @@ def test_dragging_near_the_bottom_scrolls_the_view(window, qapp):
         assert table._drag_scroll.isActive()
         assert table._drag_step > 0  # 越靠边越快，但方向都是往下
         before = bar.value()
-        table._on_drag_scroll()
+        for _ in range(10):  # 慢档一个 tick 不够一像素，得多滚几格才看得出动静
+            table._on_drag_scroll()
         assert bar.value() > before
 
 
@@ -4372,7 +4373,7 @@ def test_autoscroll_stops_away_from_the_edges(window, qapp):
 
 
 def test_autoscroll_at_the_edge_is_slow_enough_to_aim(window, qapp):
-    """贴着边缘也得慢慢滚：一秒两三行，再快就冲过头、落点对不准（用户反馈过快）。"""
+    """贴着边缘也得慢慢滚：一秒不到一行，再快就冲过头、落点对不准（用户反馈过快）。"""
     w = _loaded(window, *_many_rows())
     w.show()
     qapp.processEvents()
@@ -4386,7 +4387,44 @@ def test_autoscroll_at_the_edge_is_slow_enough_to_aim(window, qapp):
 
     per_second = table._drag_step * 1000 / app_module.DRAG_SCROLL_INTERVAL_MS
     assert table._drag_step > 0
-    assert per_second < table.rowHeight(0) * 3  # 一行 104px，别一秒就滚过三行
+    assert per_second < table.rowHeight(0)  # 一行 104px，一秒别滚过一整行
+
+
+def test_autoscroll_supports_sub_pixel_steps(window, qapp):
+    """一格不到一像素时攒着，攒够一像素再滚：慢档要能低到 0.1px/tick 那种。"""
+    w = _loaded(window, *_many_rows())
+    w.show()
+    qapp.processEvents()
+    table = w.table
+    bar = table.verticalScrollBar()
+    bar.setValue(0)
+    table._drag_pos = QPoint(10, table.viewport().height() - 1)
+    table._drag_step = 0.25
+
+    before = bar.value()
+    for _ in range(3):
+        table._on_drag_scroll()
+    assert bar.value() == before  # 0.75px，还不够一格
+    table._on_drag_scroll()
+    assert bar.value() == before + 1  # 攒到 1px 才动
+    assert table._drag_rest == pytest.approx(0.0)
+
+
+def test_autoscroll_clears_the_sub_pixel_remainder_on_stop(window, qapp):
+    """松手时零头也得清掉：留到下次拖拽，开局就多滚一下。"""
+    w = _loaded(window, *_many_rows())
+    w.show()
+    qapp.processEvents()
+    table = w.table
+    table._drag_pos = QPoint(10, table.viewport().height() - 1)
+    table._drag_step = 0.5
+    table._on_drag_scroll()
+    assert table._drag_rest == pytest.approx(0.5)
+
+    table._stop_drag_scroll()
+
+    assert table._drag_rest == 0.0
+    assert table._drag_step == 0.0
 
 
 def test_autoscroll_stops_on_drop(window, qapp, monkeypatch):

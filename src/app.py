@@ -109,11 +109,13 @@ ROW_NUMBER_PADDING = 16  # 序号槽左右留白，免得数字贴着分隔线
 
 # 拖拽排序时的自动滚动（见 ReorderableTable）：光标进到可视区上下这么宽的一条里就
 # 自己滚，越靠边滚得越快。Qt 自带的那套在自定义 QDrag 下不生效，只能自己接管。
-# 速度：一行 104px，贴着边缘每秒约 270px ≈ 2.6 行——比这更快就刹不住车，落点对不准
+# 速度是"每 tick 滚多少像素"，可以带小数：一行 104px，贴边 0.6px/tick ≈ 0.2 行/秒，
+# 刚进边缘 0.25px/tick ≈ 0.08 行/秒。一个 tick 攒不够一像素的零头会留到下次（见
+# _on_drag_scroll），所以给 0.1 也照样滚得动，只是更慢
 DRAG_SCROLL_EDGE = 40
 DRAG_SCROLL_INTERVAL_MS = 30
-DRAG_SCROLL_MIN_STEP = 2
-DRAG_SCROLL_MAX_STEP = 8
+DRAG_SCROLL_MIN_STEP = 0.25
+DRAG_SCROLL_MAX_STEP = 0.6
 
 COL_FAVORITE = 0
 COL_IMG, COL_NAME, COL_PRICE, COL_LOW, COL_EXPECT, COL_REF, COL_AVG = (
@@ -1996,7 +1998,8 @@ class ReorderableTable(QTableWidget):
         # 拖到窗口边缘时页面纹丝不动，够不着屏幕外的行
         self.setAutoScroll(False)  # 关掉它，免得两边同时滚（或者只有它不滚）
         self._drag_pos = None      # 拖动中光标在可视区里的位置，滚动 tick 靠它更新落点
-        self._drag_step = 0        # 每个 tick 滚多少像素；负数向上、正数向下
+        self._drag_step = 0.0      # 每个 tick 滚多少像素（可带小数）；负数向上、正数向下
+        self._drag_rest = 0.0      # 攒着还没滚的零头，见 _on_drag_scroll
         self._drag_scroll = QTimer(self)
         self._drag_scroll.setInterval(DRAG_SCROLL_INTERVAL_MS)
         self._drag_scroll.timeout.connect(self._on_drag_scroll)
@@ -2112,33 +2115,46 @@ class ReorderableTable(QTableWidget):
             step = self._drag_scroll_step(depth)
         else:
             self._drag_scroll.stop()
-            self._drag_step = 0
+            self._drag_step = 0.0
+            self._drag_rest = 0.0  # 半路停了，零头作废，免得再压回边缘时先蹦一像素
             return
         self._drag_step = step
         if not self._drag_scroll.isActive():
             self._drag_scroll.start()
 
     @staticmethod
-    def _drag_scroll_step(depth) -> int:
-        """光标陷进边缘多深（像素）→ 每个 tick 滚多少：线性加速，并留个下限。"""
+    def _drag_scroll_step(depth) -> float:
+        """光标陷进边缘多深（像素）→ 每个 tick 滚多少像素：线性加速。
+
+        返回浮点数，可以小于 1——慢档本来就是"好几个 tick 才挪一像素"，交给
+        _on_drag_scroll 攒着滚。MIN_STEP 是刚进边缘那一档，MAX_STEP 是贴死边缘那一档，
+        两档之间按陷进去的深度线性过渡。
+        """
         ratio = min(1.0, max(0.0, depth) / DRAG_SCROLL_EDGE)
-        return max(
-            DRAG_SCROLL_MIN_STEP, int(round(DRAG_SCROLL_MAX_STEP * ratio))
-        )
+        return DRAG_SCROLL_MIN_STEP + (
+            DRAG_SCROLL_MAX_STEP - DRAG_SCROLL_MIN_STEP
+        ) * ratio
 
     def _on_drag_scroll(self):
-        """定时器 tick：滚一格，并按新的滚动位置重算落点（光标没动，行动了）。"""
+        """定时器 tick：滚一格，并按新的滚动位置重算落点（光标没动，行动了）。
+
+        一格常常不到一像素，所以零头得攒着：每次都 int(round()) 的话，慢档会全被
+        抹成 0，页面压根不动。
+        """
         if self._drag_pos is None:
             self._drag_scroll.stop()
             return
         bar = self.verticalScrollBar()
-        before = bar.value()
-        bar.setValue(before + self._drag_step)
+        want = self._drag_step + self._drag_rest
+        pixels = int(want)  # 朝零取整：正负都不会冲过一像素，零头留到下次
+        self._drag_rest = want - pixels
+        if pixels:
+            bar.setValue(bar.value() + pixels)
         hit_edge = (
             (self._drag_step < 0 and bar.value() == bar.minimum())
             or (self._drag_step > 0 and bar.value() == bar.maximum())
         )
-        if bar.value() == before or hit_edge:
+        if hit_edge:
             self._drag_scroll.stop()  # 到顶/到底了，再滚也是空转
         # 滚动之后光标下面是别的行了，那条横线得跟着挪
         self._set_drop_hint(self._drop_target(self._drag_pos))
@@ -2147,7 +2163,8 @@ class ReorderableTable(QTableWidget):
         """收掉自动滚动和拖动中的光标位置（松手、离开、取消拖拽都走这儿）。"""
         self._drag_scroll.stop()
         self._drag_pos = None
-        self._drag_step = 0
+        self._drag_step = 0.0
+        self._drag_rest = 0.0
 
     # ---------------- 内部 ----------------
 
