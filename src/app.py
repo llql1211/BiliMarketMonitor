@@ -176,6 +176,13 @@ AUTO_POLL_LABEL_TIP = (
     "关掉时显示「自动：关」；这几项在「设置」窗口里改，改完就重挂定时器"
 )
 AUTO_POLL_EMPTY_TEXT = "自动抓取：本次范围内没有商品，已跳过"
+# 定时器每次最多等这么久（毫秒）：到没到点按 auto_poll_due 上记的时刻算，
+# 定时器只负责隔一会儿醒来看一眼。系统一睡过去，QTimer 的等待是不走表的——
+# 恢复后它还要把剩下的那段等完，30 分钟的间隔就真再等半小时；而记下的到期
+# 时刻按真实流逝的时间走（monotonic + 墙钟兜底），睡眠那段照样算在内。
+# 切短以后，恢复时最多晚这么久就能补上到点的那一拍
+# （见 ScheduleAutoPoll / AutoPollDue / OnAutoPoll）
+AUTO_POLL_WAKE_MS = 30_000
 
 # 企业微信推送（配置项见 config.DEFAULTS 的 notify_* 八项）
 # 成功那句文案由 notifier 自己发过来（见 Notifier._work），这里只管显示
@@ -2263,6 +2270,10 @@ class MainWindow(QMainWindow):
         # 不用周期定时器，是因为某一拍正撞上抓取时要额外写「跳过但别忘挂下一拍」，
         # 而单次触发天然就是「上一轮结束到下一轮开始」
         self.fetch_source = "manual"  # 这一轮是谁发起的：manual / auto
+        # 下一拍到期的时刻：monotonic 是主口径，墙钟给休眠/改系统时间兜底
+        # （判据见 AutoPollDue）。None = 没挂。
+        self.auto_poll_due = None
+        self.auto_poll_due_wall = None
         self.auto_poll_timer = QTimer(self)
         self.auto_poll_timer.setSingleShot(True)
         self.auto_poll_timer.timeout.connect(self.OnAutoPoll)
@@ -3498,20 +3509,65 @@ class MainWindow(QMainWindow):
 
         单次触发 + 每轮收尾重挂，所以间隔指的是「上一轮结束到下一轮开始」，
         某轮抓得慢只会让下一轮顺延，不会叠上来。
+
+        到期时刻另记下来（见 AutoPollDue），定时器只负责隔 AUTO_POLL_WAKE_MS
+        醒来看一眼到没到：这样系统休眠再唤醒时，睡过去的那段也算进间隔里，
+        到点的这一拍立刻补上，而不是从头再等一个完整间隔（理由见 AUTO_POLL_WAKE_MS）。
         """
         if not self.config["auto_poll_enabled"]:
+            self.auto_poll_due = None
+            self.auto_poll_due_wall = None
+            self.auto_poll_timer.stop()
             return
-        # 至少 1 毫秒：config 只要求间隔大于 0，写成 0.0001 分钟的话 int() 会算成 0，
-        # 而 Qt 里 0 毫秒的意思是「尽快触发」，就成了空转
-        milliseconds = max(1, int(self.config["auto_poll_interval_minutes"] * 60_000))
-        self.auto_poll_timer.start(milliseconds)
+        seconds = self.config["auto_poll_interval_minutes"] * 60
+        self.auto_poll_due = time.monotonic() + seconds
+        self.auto_poll_due_wall = time.time() + seconds
+        self.ArmAutoPollTimer()
+
+    def AutoPollDue(self) -> bool:
+        """到点没有：两个钟里任一走过间隔都算。
+
+        - monotonic 是主口径：不受改系统时间影响，间隔按真实流逝算。
+        - 墙钟兜底：系统休眠时 monotonic 未必走表（各机器/各版本不一样），
+          而墙钟一定把睡过去的那段算在内。只往「更早」的方向放宽，所以
+          把系统时间往回调不会把这一拍拖后，往前调最多多抓一轮。
+        """
+        if self.auto_poll_due is None or self.auto_poll_due_wall is None:
+            return False
+        return (
+            time.monotonic() >= self.auto_poll_due
+            or time.time() >= self.auto_poll_due_wall
+        )
+
+    def ArmAutoPollTimer(self):
+        """按距到期还剩多久挂一次定时器，单次等待不超过 AUTO_POLL_WAKE_MS。
+
+        两个钟取早的那个：已经到点（休眠回来、或者被别的事耽搁过）就挂 1 毫秒
+        ——Qt 里 0 毫秒是「尽快触发」，会空转，所以下限取 1。
+        """
+        if self.auto_poll_due is None or self.auto_poll_due_wall is None:
+            return
+        remaining = min(
+            self.auto_poll_due - time.monotonic(),
+            self.auto_poll_due_wall - time.time(),
+        )
+        milliseconds = int(remaining * 1000) + 1 if remaining > 0 else 1
+        self.auto_poll_timer.start(min(max(1, milliseconds), AUTO_POLL_WAKE_MS))
 
     def OnAutoPoll(self):
-        """自动抓取的那一拍：正在抓就跳过，没商品可抓就报一声再挂下一拍。"""
+        """自动抓取的那一拍：还没到点就接着等，到点了才动手。"""
+        if self.auto_poll_due is None:
+            return  # 定时器已经摘掉了（设置里关掉、关窗口），没什么可做的
+        if not self.AutoPollDue():
+            # 定时器只是按 AUTO_POLL_WAKE_MS 醒来看一眼，真正的到期时刻在 due 上
+            self.ArmAutoPollTimer()
+            return
         if self.IsPolling():
             # 手动在抓，这一拍跳过。不在这儿重挂——正在跑的那轮收尾时会挂，
             # 两边都挂的话定时器上会挂出两拍来
             return
+        self.auto_poll_due = None
+        self.auto_poll_due_wall = None
         tasks = self.AutoPollTasks()
         if not tasks:
             self.progress_label.setText(AUTO_POLL_EMPTY_TEXT)
@@ -4495,6 +4551,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """退出前把自动抓取停掉、缓存连接关掉：SQLite 的写入要落盘，文件句柄也别留着。"""
         self.auto_poll_timer.stop()
+        self.auto_poll_due = None
+        self.auto_poll_due_wall = None
         self._ClosePollers()
         self.store.close()
         # 拉图的线程也停一停：它们收尾后还会往这个窗口发信号，而槽里抛异常在

@@ -2862,8 +2862,8 @@ def test_ack_label_does_not_widen_the_window(window):
 # ---------------- 自动抓取 ----------------
 #
 # 定时器是单次触发的，每轮收尾重挂（见 ScheduleAutoPoll）。所以用例都不等真定时器
-# 到期——间隔在配置里写成 30 分钟，那一拍由用例自己调 OnAutoPoll 触发，跑完再断言
-# 定时器有没有被重新挂上。
+# 到期——到期时刻记在 auto_poll_due 上，用例把它摆成「已经到点」再自己调
+# OnAutoPoll，跑完再断言定时器有没有被重新挂上。
 
 
 def _auto_toml(**overrides):
@@ -2881,6 +2881,20 @@ def _auto_toml(**overrides):
 def _row_ids(tasks):
     """[(行号, LinkEntry)] 里的 clusterId 列表，断言抓了哪几件用。"""
     return [entry.cluster_id for _, entry in tasks]
+
+
+def _due_now(w):
+    """把「这一拍已经到期」摆出来：定时器停掉（到期的单次定时器就是停着的），
+    两个钟的到期时刻都挪到过去一秒。"""
+    w.auto_poll_timer.stop()
+    w.auto_poll_due = time.monotonic() - 1
+    w.auto_poll_due_wall = time.time() - 1
+
+
+def _due_in(w):
+    """距下一拍还有多少秒：两个钟取早的那个（跟 ArmAutoPollTimer 一个口径）。"""
+    return min(w.auto_poll_due - time.monotonic(),
+               w.auto_poll_due_wall - time.time())
 
 
 def test_auto_poll_tasks_scope_all(window):
@@ -2929,7 +2943,7 @@ def test_auto_poll_skips_the_tick_while_polling(window, monkeypatch):
     w.LoadWatchlist(w.watchlist_path)
     made = _record_pollers(monkeypatch)
     w.poller = FakePoller()  # 手动那一轮还在跑
-    w.auto_poll_timer.stop()  # 这一拍已经到期（到期的单次定时器就是这个状态）
+    _due_now(w)  # 这一拍已经到期
 
     w.OnAutoPoll()
 
@@ -2944,6 +2958,7 @@ def test_auto_poll_with_nothing_in_scope_skips_and_reschedules(window, monkeypat
     ))
     w.LoadWatchlist(w.watchlist_path)
     made = _record_pollers(monkeypatch)
+    _due_now(w)
 
     w.OnAutoPoll()
 
@@ -2959,6 +2974,7 @@ def test_auto_poll_starts_a_fetch_of_the_scoped_rows(window, monkeypatch):
     ))
     w.LoadWatchlist(w.watchlist_path)
     made = _record_pollers(monkeypatch)
+    _due_now(w)
 
     w.OnAutoPoll()
 
@@ -2970,9 +2986,99 @@ def test_auto_poll_starts_a_fetch_of_the_scoped_rows(window, monkeypatch):
 def test_auto_poll_interval_is_read_as_minutes(window):
     """间隔按分钟算。写错单位的话 30 秒一次，接口会被打爆。"""
     w = window("10000008780 | 甲\n", config_toml=_auto_toml())
+    assert 1798 < _due_in(w) <= 1800  # 30 分钟
     assert w.auto_poll_timer.isActive()
-    assert w.auto_poll_timer.interval() == 30 * 60_000
     assert w.auto_poll_timer.isSingleShot()
+    assert w.auto_poll_timer.interval() == app_module.AUTO_POLL_WAKE_MS
+
+
+def test_auto_poll_timer_wakes_up_well_before_the_interval(window):
+    """一次等待切得比间隔短：系统睡一觉醒来，定时器不会还傻等整整一个间隔。
+
+    QTimer 的等待不把休眠那段算进去，间隔 30 分钟就真再等半小时；切成
+    AUTO_POLL_WAKE_MS 以后最多晚这么久就能发现已经到点。
+    """
+    w = window("10000008780 | 甲\n", config_toml=_auto_toml())
+    assert w.auto_poll_timer.interval() <= app_module.AUTO_POLL_WAKE_MS
+    assert w.auto_poll_timer.interval() < 30 * 60_000
+
+
+def test_auto_poll_catches_up_right_after_a_sleep(window, monkeypatch):
+    """睡过去的这段也算进间隔：醒来定时器一响，到点的那一拍立刻补上。"""
+    w = window("10000008780 | 甲\n", config_toml=_auto_toml())
+    w.LoadWatchlist(w.watchlist_path)
+    made = _record_pollers(monkeypatch)
+    w.auto_poll_timer.stop()
+    # 8 小时前就该跑的那一拍
+    w.auto_poll_due = time.monotonic() - 8 * 3600
+    w.auto_poll_due_wall = time.time() - 8 * 3600
+
+    w.OnAutoPoll()
+
+    assert len(made) == 1
+    assert _row_ids(made[0].tasks) == ["10000008780"]
+
+
+def test_auto_poll_catches_up_when_only_the_wall_clock_saw_the_sleep(
+        window, monkeypatch):
+    """monotonic 不走表（有些机器休眠时它就不动）时靠墙钟兜底。
+
+    这是「睡了一夜，醒来半小时都不抓」那个毛病的正身：QTimer 和 monotonic
+    都没算睡过去的那段，只有墙钟知道已经过了 8 小时。
+    """
+    w = window("10000008780 | 甲\n", config_toml=_auto_toml())
+    w.LoadWatchlist(w.watchlist_path)
+    made = _record_pollers(monkeypatch)
+    w.auto_poll_timer.stop()
+    w.auto_poll_due = time.monotonic() + 1800   # monotonic 说还没到
+    w.auto_poll_due_wall = time.time() - 8 * 3600  # 墙钟说早过了
+
+    w.OnAutoPoll()
+
+    assert len(made) == 1
+
+
+def test_auto_poll_is_not_delayed_by_a_wall_clock_that_jumped_back(
+        window, monkeypatch):
+    """系统时间被调回过去：还有 monotonic 撑着，不会把这一拍拖后。"""
+    w = window("10000008780 | 甲\n", config_toml=_auto_toml())
+    w.LoadWatchlist(w.watchlist_path)
+    made = _record_pollers(monkeypatch)
+    w.auto_poll_timer.stop()
+    w.auto_poll_due = time.monotonic() - 1
+    w.auto_poll_due_wall = time.time() + 24 * 3600
+
+    w.OnAutoPoll()
+
+    assert len(made) == 1
+
+
+def test_auto_poll_woken_early_keeps_waiting(window, monkeypatch):
+    """定时器提前醒来看一眼（还没到点）：不抓，按剩下的时间接着等。"""
+    w = window("10000008780 | 甲\n", config_toml=_auto_toml())
+    made = _record_pollers(monkeypatch)
+    w.auto_poll_timer.stop()
+    w.auto_poll_due = time.monotonic() + 300  # 还有 5 分钟
+    w.auto_poll_due_wall = time.time() + 300
+
+    w.OnAutoPoll()
+
+    assert made == []  # 没提前抓
+    assert w.auto_poll_timer.isActive()
+    assert w.auto_poll_timer.interval() <= app_module.AUTO_POLL_WAKE_MS
+    assert 298 < _due_in(w) <= 300  # 到期时刻没被顺延
+
+
+def test_auto_poll_fires_on_its_own_from_the_event_loop(window, monkeypatch,
+                                                        wait_until):
+    """真的靠定时器跑一拍（不是用例直接调 OnAutoPoll）：间隔调小，等它自己响。"""
+    w = window("10000008780 | 甲\n", config_toml=_auto_toml(
+        auto_poll_interval_minutes="0.02",  # 1.2 秒
+    ))
+    w.LoadWatchlist(w.watchlist_path)
+    made = _record_pollers(monkeypatch)
+
+    assert wait_until(lambda: len(made) == 1)
 
 
 def test_auto_poll_disabled_leaves_the_timer_idle(window):
@@ -3035,6 +3141,7 @@ def test_poll_finished_reschedules_the_timer(window):
     w.OnPollFinished()
 
     assert w.auto_poll_timer.isActive()
+    assert 1798 < _due_in(w) <= 1800  # 间隔从这一轮收尾算起
 
 
 def test_poll_finished_reschedules_even_after_a_manual_stop(window):
@@ -3057,6 +3164,8 @@ def test_auto_poll_disabled_does_not_reschedule(window):
     w.OnPollFinished()
 
     assert not w.auto_poll_timer.isActive()
+    assert w.auto_poll_due is None
+    assert w.auto_poll_due_wall is None
 
 
 def test_auto_poll_run_does_not_pop_a_summary(window, monkeypatch, wait_until):
@@ -3068,6 +3177,7 @@ def test_auto_poll_run_does_not_pop_a_summary(window, monkeypatch, wait_until):
     )
     monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
 
+    _due_now(w)
     w.OnAutoPoll()
     assert _wait_run(w, wait_until)
 
@@ -3087,6 +3197,7 @@ def test_auto_poll_pops_a_summary_when_asked(window, monkeypatch, wait_until):
     )
     monkeypatch.setattr(w.image_fetcher, "fetch", lambda row, url: None)
 
+    _due_now(w)
     w.OnAutoPoll()
     assert _wait_run(w, wait_until)
 
@@ -3115,6 +3226,8 @@ def test_close_event_stops_the_timer(window):
     assert w.auto_poll_timer.isActive()
     w.close()
     assert not w.auto_poll_timer.isActive()
+    assert w.auto_poll_due is None
+    assert w.auto_poll_due_wall is None
 
 
 # ---------------- 状态栏 ----------------
@@ -4826,7 +4939,8 @@ def test_settings_reschedule_the_auto_poll_timer(window, monkeypatch):
     w.OnOpenSettings()
 
     assert w.auto_poll_timer.isActive()
-    assert w.auto_poll_timer.interval() == 15 * 60_000
+    assert 898 < _due_in(w) <= 900  # 15 分钟
+    assert w.auto_poll_timer.interval() == app_module.AUTO_POLL_WAKE_MS
     assert w.auto_poll_label.text() == "自动：15 分钟 / 全部"
 
 
@@ -4840,6 +4954,8 @@ def test_settings_stops_the_auto_poll_timer_when_switched_off(window, monkeypatc
     w.OnOpenSettings()
 
     assert not w.auto_poll_timer.isActive()
+    assert w.auto_poll_due is None
+    assert w.auto_poll_due_wall is None
     assert w.auto_poll_label.text() == app_module.AUTO_POLL_OFF_TEXT
 
 

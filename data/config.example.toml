@@ -28,7 +28,8 @@ deal_highlight_color = "#e07000"
 # 是否启动定时抓取
 auto_poll_enabled = false
 
-# 定时抓取间隔（分钟）
+# 定时抓取间隔（分钟），从上一轮结束算起。
+# 间隔按真实流逝的时间算：电脑休眠再唤醒后，到点的那一轮会立刻补上
 auto_poll_interval_minutes = 30
 
 # 定时抓取的范围，取值只能为：
