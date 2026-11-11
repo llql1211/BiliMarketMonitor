@@ -136,6 +136,11 @@ FIELDS = (
         "auto", hint="30",
     ),
     Field(
+        "auto_poll_wake_seconds", "到点核对间隔（秒）", NUMBER,
+        "每隔多久核对一次是否到点，也是休眠唤醒后最晚多久补抓",
+        "auto", hint="60",
+    ),
+    Field(
         "auto_poll_scope", "抓取范围", ENUM,
         "定时抓取只抓这个范围里的商品",
         "auto", choices=(("全部商品", "all"), ("仅收藏", "favorite"), ("仅售罄", "sold_out")),

@@ -318,32 +318,36 @@ def test_unknown_key_still_rejected_with_registry(data_files):
 
 
 def test_auto_poll_defaults_are_off(data_files):
-    """两份配置都没写时的默认值：不自动抓、30 分钟、全部、不弹总结。"""
+    """两份配置都没写时的默认值：不自动抓、30 分钟、60 秒核对、全部、不弹总结。"""
     _remove(data_files, "config.example.toml", "config.toml")
     cfg, _ = config.load_config()
     assert cfg["auto_poll_enabled"] is False
     assert cfg["auto_poll_interval_minutes"] == 30.0
+    assert cfg["auto_poll_wake_seconds"] == 60.0
     assert cfg["auto_poll_scope"] == "all"
     assert cfg["auto_poll_show_summary"] is False
 
 
 def test_auto_poll_user_config_overrides_example(data_files):
-    """四项都能被 config.toml 覆盖，且压过 example 里的值。"""
+    """五项都能被 config.toml 覆盖，且压过 example 里的值。"""
     _write(data_files, "config.example.toml", (
         "auto_poll_enabled = false\n"
         "auto_poll_interval_minutes = 60\n"
+        "auto_poll_wake_seconds = 120\n"
         'auto_poll_scope = "all"\n'
         "auto_poll_show_summary = false\n"
     ))
     _write(data_files, "config.toml", (
         "auto_poll_enabled = true\n"
         "auto_poll_interval_minutes = 5\n"
+        "auto_poll_wake_seconds = 15\n"
         'auto_poll_scope = "favorite"\n'
         "auto_poll_show_summary = true\n"
     ))
     cfg, warnings = config.load_config()
     assert cfg["auto_poll_enabled"] is True
     assert cfg["auto_poll_interval_minutes"] == 5.0
+    assert cfg["auto_poll_wake_seconds"] == 15.0
     assert cfg["auto_poll_scope"] == "favorite"
     assert cfg["auto_poll_show_summary"] is True
     assert not [w for w in warnings if "auto_poll" in w]
@@ -384,6 +388,47 @@ def test_auto_poll_scope_falls_back_to_default(data_files, raw_value):
     cfg, warnings = config.load_config()
     assert cfg["auto_poll_scope"] == "all"
     assert any("auto_poll_scope" in w for w in warnings)
+
+
+@pytest.mark.parametrize("raw_value, expected", [
+    ("1", 1.0),
+    ("60", 60.0),
+    ("120.5", 120.5),
+    ("3600", 3600.0),  # 上限本身是合法值
+])
+def test_auto_poll_wake_seconds_accepted(data_files, raw_value, expected):
+    """核对间隔收 1 秒～1 小时：它同时是「休眠后最晚多久补抓」的上限。"""
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", f"auto_poll_wake_seconds = {raw_value}\n")
+    cfg, warnings = config.load_config()
+    assert cfg["auto_poll_wake_seconds"] == expected
+    assert not [w for w in warnings if "auto_poll_wake_seconds" in w]
+
+
+@pytest.mark.parametrize(
+    "raw_value, expected_keyword",
+    [
+        ("0", "必须大于 0"),
+        ("-5", "必须大于 0"),
+        # 再小就是让主线程空转：一天下来空醒几百万次
+        ("0.5", "必须在 1 到 3600 秒之间"),
+        # 再大还不如去调粗 auto_poll_interval_minutes
+        ("3601", "必须在 1 到 3600 秒之间"),
+        ("inf", "必须是有限数字"),
+        ("nan", "必须是有限数字"),
+        ('"60"', "不是数字"),
+        ("true", "不是数字"),
+    ],
+)
+def test_auto_poll_wake_seconds_rejected(data_files, raw_value, expected_keyword):
+    """越界/非数字一律退回默认值并说清原因。"""
+    _remove(data_files, "config.example.toml")
+    _write(data_files, "config.toml", f"auto_poll_wake_seconds = {raw_value}\n")
+    cfg, warnings = config.load_config()
+    assert cfg["auto_poll_wake_seconds"] == config.DEFAULTS["auto_poll_wake_seconds"]
+    assert any(
+        expected_keyword in w and "auto_poll_wake_seconds" in w for w in warnings
+    )
 
 
 @pytest.mark.parametrize(

@@ -220,13 +220,13 @@ data/watchlist.txt
     （槽里抛异常在 PyQt 下是直接 abort 进程的），排着队的那些也就此丢掉。
 - **`auto_poll_timer(QTimer)`**：自动抓取的节拍器，跑在**主线程**，它不是线程、也不发网络请求，
   到点只是在主线程里把一批任务交给 `PollerThread`——网络那部分照旧在子线程。
-  - **到期时刻另记在 `auto_poll_due` 上，定时器只负责隔 `AUTO_POLL_WAKE_MS`（30 秒）
-    醒来看一眼**（`AutoPollDue()` 判到没到）：系统休眠的时候 QTimer 的等待不走表，
-    恢复后它还要把剩下的那段等完——间隔 30 分钟就真再等半小时，这段时间一次都不抓。
-    到期时刻同时记 monotonic 和墙钟、**任一走过间隔就算到点**：monotonic 是主口径
-    （不受改系统时间影响），但有些机器休眠时它也不走表，墙钟一定把睡过去的那段算在内。
-    这样一来醒来后的第一眼就能发现「早该跑了」，到点的那一拍立刻补上；代价只是主线程
-    每 30 秒空醒一次。
+  - **到期时刻另记在 `auto_poll_due` 上，定时器只负责隔 `auto_poll_wake_seconds`
+    （默认 60 秒，设置窗口里可改）醒来看一眼**（`AutoPollDue()` 判到没到）：系统休眠的时候
+    QTimer 的等待不走表，恢复后它还要把剩下的那段等完——间隔 30 分钟就真再等半小时，
+    这段时间一次都不抓。到期时刻同时记 monotonic 和墙钟、**任一走过间隔就算到点**：
+    monotonic 是主口径（不受改系统时间影响），但有些机器休眠时它也不走表，墙钟一定把
+    睡过去的那段算在内。这样一来醒来后的第一眼就能发现「早该跑了」，到点的那一拍立刻补上。
+    代价是主线程每个核对间隔空醒一次（默认一分钟一次，只是看一眼时间再挂上，微秒级）。
   - **单次触发 + 每轮收尾重挂**，不用周期定时器。周期定时器每一拍都不管上一轮跑没跑完，
     撞上正在抓取的那一拍就得额外写「跳过这一拍，但别忘了挂下一拍」；单次触发的语义天然就是
     「上一轮结束到下一轮开始」，间隔因此从上一轮**结束**算起，慢轮次只会把下一轮往后推。
@@ -711,7 +711,7 @@ pixi run shot           # 出图在 tmp/out/，每个场景深色/浅色各一�
 | 累积确认（攒什么、什么时候清零、顶部那句话） | 判据 `app.ack_change()` / `ack_new_deals()` / `ack_reached()` / `BuildAckSummary()`；写入 `store.acknowledge()` / `init_ack_if_empty()`（列在 `ITEM_COLUMNS`）；按钮与那句提示在 `SummaryDialog.btn_ack` / `MainWindow.ack_label` |
 | 清单接受的写法 | `links.parse_line()` / `_split_fields()` |
 | 收藏的写回、回滚与星标 | 交互在 `app.ToggleFavorite()`；清单那段在 `links.parse_line()` / `_strip_favorite()`，缓存那列由 `store.sync()` / `set_favorite()` 写，星标颜色在 `theme.favorite_color()` |
-| 自动抓取的间隔、范围与总结开关 | `data/config.toml` 的 `auto_poll_*` 四项，校验在 `config.py`；调度在 `app.ScheduleAutoPoll()` / `OnAutoPoll()` / `AutoPollTasks()`；「一觉醒来补上错过的这一拍」靠 `app.AutoPollDue()`（monotonic + 墙钟两个期限）与一次等待上限 `AUTO_POLL_WAKE_MS` |
+| 自动抓取的间隔、范围与总结开关 | `data/config.toml` 的 `auto_poll_*` 五项，校验在 `config.py`；调度在 `app.ScheduleAutoPoll()` / `OnAutoPoll()` / `AutoPollTasks()`；「一觉醒来补上错过的这一拍」靠 `app.AutoPollDue()`（monotonic + 墙钟两个期限）与一次等待上限 `auto_poll_wake_seconds`（`app.AutoPollWakeMs()`） |
 | 企业微信推送的开关、地址、限流 | `data/config.toml` 的 `notify_*` 八项，校验在 `config.py`；正文在 `app.BuildNotifyMarkdown()`，发送在 `notifier.py` |
 | 推送消息长什么样 | `app.BuildNotifyMarkdown()`（分块与超长截断）+ `notifier._post_wecom()`（报文格式）；改完看 `status-notify*` 场景出图 |
 | 哪类变化才推（触发条件、边沿判据、合并口径） | `app.NotifyTags()`；开关是 `config.py` 里的 `notify_on_*` 五项；测试在 `tests/test_app.py` 的「触发判定」一节 |

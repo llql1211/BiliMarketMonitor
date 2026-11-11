@@ -33,6 +33,9 @@ DEFAULTS = {
     # 范围 all = 清单全部，favorite = 只抓收藏的，sold_out = 只抓缓存里记着售罄的
     "auto_poll_enabled": False,
     "auto_poll_interval_minutes": 30.0,
+    # 定时器每隔多久核对一次「到点没有」（秒）。它同时是「电脑休眠唤醒后最晚
+    # 多久补抓」的上限：定时器在休眠时不走，只能靠醒来后的那次核对发现已到点
+    "auto_poll_wake_seconds": 60.0,
     "auto_poll_scope": "all",
     "auto_poll_show_summary": False,
     # 企业微信推送：webhook 由用户自建的企业微信群机器人提供（地址格式见 notifier.py）。
@@ -327,6 +330,21 @@ def _check_positive_number(value, key, label, warnings):
     return _check_number(value, key, label, warnings, allow_zero=False)
 
 
+def _check_wake_seconds(value, key, label, warnings):
+    """核对间隔：1 秒起、最多 1 小时。
+
+    更小就是让主线程空转（1 秒已经是一天 8 万多次空醒）；更大还不如直接
+    把 auto_poll_interval_minutes 调粗——这个值只影响「多快发现已经到点」。
+    """
+    number = _check_positive_number(value, key, label, warnings)
+    if number is None:
+        return None
+    if not 1 <= number <= 3600:
+        warnings.append(f"{label}配置的 {key} 必须在 1 到 3600 秒之间，已忽略")
+        return None
+    return number
+
+
 def _check_non_negative_number(value, key, label, warnings):
     """允许 0：高亮阈值为 0 就是「关闭高亮」。"""
     return _check_number(value, key, label, warnings, allow_zero=True)
@@ -357,6 +375,7 @@ _VALIDATORS = {
     "deal_highlight_color": _check_color,
     "auto_poll_enabled": _check_bool,
     "auto_poll_interval_minutes": _check_positive_number,
+    "auto_poll_wake_seconds": _check_wake_seconds,
     "auto_poll_scope": _check_enum("all", "favorite", "sold_out"),
     "auto_poll_show_summary": _check_bool,
     "notify_enabled": _check_bool,

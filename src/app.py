@@ -167,22 +167,15 @@ FAVORITE_HEADER_TIP = (
     "存在 watchlist.txt 里（行尾那段 | *），跟着清单一起备份，抓取动不了它"
 )
 
-# 自动抓取（配置项见 config.DEFAULTS 的 auto_poll_* 四项）
+# 自动抓取（配置项见 config.DEFAULTS 的 auto_poll_* 五项）
 AUTO_SCOPE_LABELS = {"all": "全部", "favorite": "收藏", "sold_out": "售罄"}
 AUTO_POLL_OFF_TEXT = "自动：关"
 AUTO_POLL_LABEL_TIP = (
-    "自动抓取的状态，由 config.toml 里的 auto_poll_* 四项决定\n"
+    "自动抓取的状态，由 config.toml 里的 auto_poll_* 五项决定\n"
     "间隔从上一轮结束算起，所以不会因为某轮抓得慢就把下一轮叠上来\n"
     "关掉时显示「自动：关」；这几项在「设置」窗口里改，改完就重挂定时器"
 )
 AUTO_POLL_EMPTY_TEXT = "自动抓取：本次范围内没有商品，已跳过"
-# 定时器每次最多等这么久（毫秒）：到没到点按 auto_poll_due 上记的时刻算，
-# 定时器只负责隔一会儿醒来看一眼。系统一睡过去，QTimer 的等待是不走表的——
-# 恢复后它还要把剩下的那段等完，30 分钟的间隔就真再等半小时；而记下的到期
-# 时刻按真实流逝的时间走（monotonic + 墙钟兜底），睡眠那段照样算在内。
-# 切短以后，恢复时最多晚这么久就能补上到点的那一拍
-# （见 ScheduleAutoPoll / AutoPollDue / OnAutoPoll）
-AUTO_POLL_WAKE_MS = 30_000
 
 # 企业微信推送（配置项见 config.DEFAULTS 的 notify_* 八项）
 # 成功那句文案由 notifier 自己发过来（见 Notifier._work），这里只管显示
@@ -3510,9 +3503,9 @@ class MainWindow(QMainWindow):
         单次触发 + 每轮收尾重挂，所以间隔指的是「上一轮结束到下一轮开始」，
         某轮抓得慢只会让下一轮顺延，不会叠上来。
 
-        到期时刻另记下来（见 AutoPollDue），定时器只负责隔 AUTO_POLL_WAKE_MS
+        到期时刻另记下来（见 AutoPollDue），定时器只负责隔 auto_poll_wake_seconds
         醒来看一眼到没到：这样系统休眠再唤醒时，睡过去的那段也算进间隔里，
-        到点的这一拍立刻补上，而不是从头再等一个完整间隔（理由见 AUTO_POLL_WAKE_MS）。
+        到点的这一拍立刻补上，而不是从头再等一个完整间隔。
         """
         if not self.config["auto_poll_enabled"]:
             self.auto_poll_due = None
@@ -3539,8 +3532,18 @@ class MainWindow(QMainWindow):
             or time.time() >= self.auto_poll_due_wall
         )
 
+    def AutoPollWakeMs(self) -> int:
+        """一次等待的上限（毫秒）：配置里的 auto_poll_wake_seconds。
+
+        它同时是「电脑休眠唤醒后最晚多久补抓」的上限——定时器在休眠时不走表，
+        只能靠醒来后的那一次核对发现已经到点。config 把它限在 1 秒～1 小时，
+        所以毫秒数不会大过 Qt 定时器的 int 范围；这里再兜一个下限，Qt 里
+        0 毫秒的意思是「尽快触发」，会空转。
+        """
+        return max(1, int(self.config["auto_poll_wake_seconds"] * 1000))
+
     def ArmAutoPollTimer(self):
-        """按距到期还剩多久挂一次定时器，单次等待不超过 AUTO_POLL_WAKE_MS。
+        """按距到期还剩多久挂一次定时器，单次等待不超过 AutoPollWakeMs()。
 
         两个钟取早的那个：已经到点（休眠回来、或者被别的事耽搁过）就挂 1 毫秒
         ——Qt 里 0 毫秒是「尽快触发」，会空转，所以下限取 1。
@@ -3552,14 +3555,14 @@ class MainWindow(QMainWindow):
             self.auto_poll_due_wall - time.time(),
         )
         milliseconds = int(remaining * 1000) + 1 if remaining > 0 else 1
-        self.auto_poll_timer.start(min(max(1, milliseconds), AUTO_POLL_WAKE_MS))
+        self.auto_poll_timer.start(min(max(1, milliseconds), self.AutoPollWakeMs()))
 
     def OnAutoPoll(self):
         """自动抓取的那一拍：还没到点就接着等，到点了才动手。"""
         if self.auto_poll_due is None:
             return  # 定时器已经摘掉了（设置里关掉、关窗口），没什么可做的
         if not self.AutoPollDue():
-            # 定时器只是按 AUTO_POLL_WAKE_MS 醒来看一眼，真正的到期时刻在 due 上
+            # 定时器只是按 auto_poll_wake_seconds 醒来看一眼，真正的到期时刻在 due 上
             self.ArmAutoPollTimer()
             return
         if self.IsPolling():

@@ -2871,6 +2871,7 @@ def _auto_toml(**overrides):
     values = {
         "auto_poll_enabled": "true",
         "auto_poll_interval_minutes": "30",
+        "auto_poll_wake_seconds": "60",
         "auto_poll_scope": '"all"',
         "auto_poll_show_summary": "false",
     }
@@ -2989,17 +2990,37 @@ def test_auto_poll_interval_is_read_as_minutes(window):
     assert 1798 < _due_in(w) <= 1800  # 30 分钟
     assert w.auto_poll_timer.isActive()
     assert w.auto_poll_timer.isSingleShot()
-    assert w.auto_poll_timer.interval() == app_module.AUTO_POLL_WAKE_MS
+    # 一次等待切成「核对间隔」那么短，不等满 30 分钟
+    assert w.auto_poll_timer.interval() == w.AutoPollWakeMs() == 60_000
+
+
+def test_auto_poll_wake_seconds_is_configurable(window):
+    """核对间隔可配：它决定一次等待多长，也决定休眠后最晚多久补抓。"""
+    w = window("10000008780 | 甲\n", config_toml=_auto_toml(
+        auto_poll_wake_seconds="120",
+    ))
+    assert w.AutoPollWakeMs() == 120_000
+    assert w.auto_poll_timer.interval() == 120_000
+
+
+def test_auto_poll_wake_is_still_capped_by_the_remaining_time(window):
+    """核对间隔比剩下的时间还长时，按剩下的时间挂（间隔本来就短时不该多等）。"""
+    w = window("10000008780 | 甲\n", config_toml=_auto_toml(
+        auto_poll_interval_minutes="0.05",  # 3 秒
+        auto_poll_wake_seconds="300",
+    ))
+    assert w.auto_poll_timer.interval() <= 3_001
+    assert w.auto_poll_timer.interval() < w.AutoPollWakeMs()
 
 
 def test_auto_poll_timer_wakes_up_well_before_the_interval(window):
     """一次等待切得比间隔短：系统睡一觉醒来，定时器不会还傻等整整一个间隔。
 
-    QTimer 的等待不把休眠那段算进去，间隔 30 分钟就真再等半小时；切成
-    AUTO_POLL_WAKE_MS 以后最多晚这么久就能发现已经到点。
+    QTimer 的等待不把休眠那段算进去，间隔 30 分钟就真再等半小时；按
+    auto_poll_wake_seconds 醒来核对一次，最多晚这么久就能发现已经到点。
     """
     w = window("10000008780 | 甲\n", config_toml=_auto_toml())
-    assert w.auto_poll_timer.interval() <= app_module.AUTO_POLL_WAKE_MS
+    assert w.auto_poll_timer.interval() == w.AutoPollWakeMs() == 60_000
     assert w.auto_poll_timer.interval() < 30 * 60_000
 
 
@@ -3065,7 +3086,7 @@ def test_auto_poll_woken_early_keeps_waiting(window, monkeypatch):
 
     assert made == []  # 没提前抓
     assert w.auto_poll_timer.isActive()
-    assert w.auto_poll_timer.interval() <= app_module.AUTO_POLL_WAKE_MS
+    assert w.auto_poll_timer.interval() <= w.AutoPollWakeMs()
     assert 298 < _due_in(w) <= 300  # 到期时刻没被顺延
 
 
@@ -4930,17 +4951,19 @@ def test_settings_apply_the_highlight_at_once(window, monkeypatch):
 
 
 def test_settings_reschedule_the_auto_poll_timer(window, monkeypatch):
-    """自动抓取的开关和间隔：定时器当场重挂，状态字跟着换。"""
+    """自动抓取的开关、间隔和核对间隔：定时器当场重挂，状态字跟着换。"""
     w = window("10000008780\n", config_toml="auto_poll_enabled = false\n")
     assert not w.auto_poll_timer.isActive()
-    _accept(monkeypatch, edits={"auto_poll_interval_minutes": "15"},
+    _accept(monkeypatch,
+            edits={"auto_poll_interval_minutes": "15",
+                   "auto_poll_wake_seconds": "90"},
             boxes={"auto_poll_enabled": True})
 
     w.OnOpenSettings()
 
     assert w.auto_poll_timer.isActive()
     assert 898 < _due_in(w) <= 900  # 15 分钟
-    assert w.auto_poll_timer.interval() == app_module.AUTO_POLL_WAKE_MS
+    assert w.auto_poll_timer.interval() == w.AutoPollWakeMs() == 90_000
     assert w.auto_poll_label.text() == "自动：15 分钟 / 全部"
 
 

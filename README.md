@@ -161,6 +161,7 @@ https://mall.bilibili.com/neul-next/resell/detail.html?clusterId=10000004245
 ```toml
 auto_poll_enabled = true          # 是否启用自动抓取
 auto_poll_interval_minutes = 30   # 自动抓取间隔（分钟），从上一轮结束算起
+auto_poll_wake_seconds = 60       # 每隔多少秒核对一次是否到点（也是休眠后最晚多久补抓）
 auto_poll_scope = "all"           # all / favorite / sold_out
 auto_poll_show_summary = false    # 自动抓取跑完是否弹总结
 ```
@@ -169,7 +170,7 @@ auto_poll_show_summary = false    # 自动抓取跑完是否弹总结
 - **`auto_poll_scope` 决定抓哪些**：`all` 是清单里全部商品；`favorite` 只抓收藏了的那几件；`sold_out` 只抓缓存里记着「已售罄」的——刚加进来、一轮都还没抓过的商品不算售罄，得先手动抓一轮进了缓存才算数。
 - **自动抓取跑完不弹总结**（配置里 `auto_poll_show_summary = true` 才弹），省得挂着的时候被窗口打断；手动抓取照旧每轮都弹。
 - **自动和手动不撞车**：自动那一拍要是正赶上手动抓取在跑，这一拍直接跳过，等当前这轮收尾再重新挂上。
-- **电脑休眠/待机回来会补上错过的这一拍**：间隔按真实流逝的时间算，睡过去的那几个小时也算在内；醒来后最多半分钟就会自己抓一轮，不会从头再等一个完整间隔。
+- **电脑休眠/待机回来会补上错过的这一拍**：间隔按真实流逝的时间算，睡过去的那几个小时也算在内；醒来后最多等一个「到点核对间隔」（默认 60 秒，见下面 `auto_poll_wake_seconds`）就会自己抓一轮，不会从头再等一个完整间隔。
 - 抓取时状态栏会写明是自动抓的、抓的哪一档，如 `自动抓取（收藏）3/12`；手动抓取还是原来的 `查询中 3/12`。
 - 关掉时窗口顶部那行字右边显示「自动：关」，打开后显示「自动：30 分钟 / 收藏」，扫一眼就能确认配置生效了。这几项在右上角的「设置」窗口里改，按「确定」当场重挂定时器；直接改 `config.toml` 的话要重启程序才读得到。
 
@@ -227,7 +228,7 @@ auto_poll_show_summary = false    # 自动抓取跑完是否弹总结
 | 页 | 装什么 |
 | :--- | :--- |
 | 基本设置 | 深色模式开关、详情页链接模板、抓取间隔、失败后重试间隔、请求超时、成交高亮的时限与颜色 |
-| 定时抓取 | `auto_poll_*` 四项 |
+| 定时抓取 | `auto_poll_*` 五项 |
 | 企业微信推送 | webhook 与 `notify_min_interval_seconds`，以及五个「通知内容设置」开关 |
 
 - 每一项的填写框左边有个带圈的 `?`，鼠标停上去说这一项是干什么的；输入框里的灰字是写法示例。
@@ -299,6 +300,7 @@ auto_poll_show_summary = false    # 自动抓取跑完是否弹总结
 | `deal_highlight_color` | `#e07000` | 高亮成交用的文字颜色，支持 `#rrggbb` 和颜色名（如 `orange`） |
 | `auto_poll_enabled` | `false` | 是否启用自动抓取。只认 `true` / `false`，写成 `1` 或 `"true"` 会被忽略并退回默认值 |
 | `auto_poll_interval_minutes` | `30` | 自动抓取间隔（分钟），从上一轮结束算起。必须大于 0 |
+| `auto_poll_wake_seconds` | `60` | 定时器每隔多久核对一次「到点没有」（秒），取值 1～3600。它也是电脑休眠唤醒后最晚多久补抓的上限：设小了醒来补得快、空醒得勤，设大了更省电、醒来可能要等这么久 |
 | `auto_poll_scope` | `"all"` | 自动抓取的范围：`all` 全部 / `favorite` 仅收藏 / `sold_out` 仅售罄。写错了按 `all` 处理 |
 | `auto_poll_show_summary` | `false` | 自动抓取跑完是否也弹抓取总结 |
 | `notify_enabled` | `false` | 是否启用企业微信推送。只认 `true` / `false` |

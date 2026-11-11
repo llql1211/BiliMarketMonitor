@@ -275,6 +275,17 @@ def test_an_out_of_range_value_is_refused_with_the_validator_reason(dialog):
     assert "间隔（分钟）：必须大于 0" in d.error_label.text()
 
 
+def test_the_wake_interval_range_is_refused_with_the_validator_reason(dialog):
+    """核对间隔有上下限：1 秒起（再小就是空转），1 小时封顶。"""
+    d = dialog()
+    d.editors["auto_poll_wake_seconds"].setText("0.5")
+
+    d.OnAccept()
+
+    assert d.result() != d.Accepted
+    assert "到点核对间隔（秒）：必须在 1 到 3600 秒之间" in d.error_label.text()
+
+
 def test_bad_values_do_not_leak_into_the_result(dialog):
     """一项不合格就整份不收：不能写出一份"一半新一半旧"的配置。"""
     d = dialog()
