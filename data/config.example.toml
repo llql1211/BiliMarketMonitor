@@ -23,6 +23,10 @@ deal_highlight_within_hours = 24
 # 文字颜色支持 RGB （如 #rrggbb）和颜色名（如 orange）。
 deal_highlight_color = "#e07000"
 
+# 是否按 watchlist 里的分类表头（「- 类别名」）分组显示。
+# 关闭时表格仍是以前的平铺视图；开启后每类开头多一行表头，顶部多一排跳转按钮。
+categories_enabled = false
+
 # ---------------- 定时抓取设置 ----------------
 
 # 是否启动定时抓取

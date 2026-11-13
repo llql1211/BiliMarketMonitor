@@ -95,6 +95,11 @@ FIELDS = (
         "basic", group="界面",
     ),
     Field(
+        "categories_enabled", "开启分类", BOOL,
+        "按 watchlist 里的「- 类别名」分组显示，表头上方多一排分类跳转按钮；默认关闭",
+        "basic", group="界面",
+    ),
+    Field(
         "detail_url_template", "详情页链接模板", TEXT,
         "拼「打开」用的详情页地址，必须含 {clusterId} 占位符",
         "basic", group="抓取与高亮", hint="https://…?clusterId={clusterId}",

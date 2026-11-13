@@ -29,6 +29,9 @@ DEFAULTS = {
     # 成交高亮：最近一次成交在多少小时内就加粗上色（0 = 关闭）
     "deal_highlight_within_hours": 24.0,
     "deal_highlight_color": "#e07000",
+    # 商品分类：开启后表格按 watchlist 里的「- 类别名」分组，并显示分类跳转按钮。
+    # 默认关闭，老清单（没有分类表头）的界面和以前完全一样
+    "categories_enabled": False,
     # 自动抓取：按固定间隔反复抓，间隔从上一轮结束算起；
     # 范围 all = 清单全部，favorite = 只抓收藏的，sold_out = 只抓缓存里记着售罄的
     "auto_poll_enabled": False,
@@ -373,6 +376,7 @@ _VALIDATORS = {
     "request_timeout_seconds": _check_positive_number,
     "deal_highlight_within_hours": _check_non_negative_number,
     "deal_highlight_color": _check_color,
+    "categories_enabled": _check_bool,
     "auto_poll_enabled": _check_bool,
     "auto_poll_interval_minutes": _check_positive_number,
     "auto_poll_wake_seconds": _check_wake_seconds,
