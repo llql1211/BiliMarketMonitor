@@ -603,6 +603,17 @@ def _main_categories(dark):
     return window
 
 
+@scene("main-categories-reload", settle=1.5)
+def _main_categories_reload(dark):
+    """窗口已经显示时再刷新一次清单：分类按钮不该因为重建而整排消失。"""
+    import links
+
+    window = _main_categories(dark)
+    window.show()
+    window.LoadWatchlist(links.default_watchlist_path())
+    return window
+
+
 def _status_window(dark):
     """真窗口，状态栏那行字留给调用方去写。
 

@@ -2783,6 +2783,9 @@ class MainWindow(QMainWindow):
             button.setToolTip(tip)
             button.clicked.connect(slot)
             self.category_layout.addWidget(button)
+            # 重画时窗口已经显示着，新按钮默认是 hidden；不显式 show 一下，
+            # layout 的 sizeHint 会把它当空气，分类按钮整排就塌成 0 高
+            button.show()
             self.category_buttons.append(button)
             return button
 

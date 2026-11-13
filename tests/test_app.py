@@ -7524,3 +7524,23 @@ def test_categories_add_pasted_sections(window, data_files, monkeypatch):
     text = (data_files / "watchlist.txt").read_text(encoding="utf-8")
     assert "- 新分类" in text
     assert "- 空的新分类" in text
+
+
+def test_categories_bar_survives_reload_and_save(window):
+    """刷新/重写清单后分类按钮不能整排消失（窗口已经显示着时新建的按钮默认隐藏）。"""
+    w = _category_window(window)
+    w.show()
+    assert w.category_buttons and w.category_scroll.isVisible()
+    assert w.category_bar.height() > 10
+    w.SaveWatchlist()
+    assert w.category_buttons and w.category_scroll.isVisible()
+    w.LoadWatchlist(w.watchlist_path)
+    w.show()
+    assert w.category_buttons and w.category_scroll.isVisible()
+    assert w.category_bar.height() > 10
+    assert w.category_buttons[0].isVisible()
+    w.RenderTable()
+    w.show()
+    assert w.category_buttons and w.category_scroll.isVisible()
+    assert w.category_bar.height() > 10
+    assert w.category_buttons[0].isVisible()
