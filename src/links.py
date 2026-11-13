@@ -1,8 +1,16 @@
 """监视清单读写：解析 watchlist.txt -> [LinkEntry]，并负责格式化写回。
 
-清单由程序格式化维护，每行形如：
+清单由程序格式化维护，商品行形如：
 
     <clusterId> | <商品名> | <预期价> | <收藏>
+
+分类用单独一行表示：
+
+    - 类别名
+
+从这行到下一个分类表头之间的商品都属于该类；第一个表头之前的商品归入
+「未归类」，并且「未归类」固定排在最后。分类顺序就是文件里的表头顺序，
+类内顺序就是文件里的行序。
 
 商品名未知时只写 clusterId；预期价和收藏都是用户自己设的，只有设过的行才写
 那一段，没设的行维持老样子（三段甚至一段），老清单原样读得进来。
@@ -38,12 +46,22 @@ _MAX_NAME_LEN = 100
 _MAX_PRICE_LEN = 20
 # 收藏标记：只认这一个字符，写在行尾单独一段里（见 _strip_favorite）
 _FAVORITE_MARK = "*"
+# 分类表头：单独一行，以 "-" 开头；商品行永远以 clusterId / 链接开头，不冲突
+_SECTION_MARK = "-"
+# 分类名长度上限：它要占满表格一整行，太长只会被截断
+_MAX_SECTION_LEN = 20
+# 没有归类的商品固定放在这个类里，而且永远排最后
+UNCLASSIFIED = "未归类"
+# 「全部」是界面上的虚拟入口，不能当真分类名
+ALL_CATEGORY = "全部"
 
 _HEADER = (
     "# 监视清单：每行格式 <clusterId> | <商品名> | <预期价> | <收藏>，"
     "名称未知时只写 clusterId，没设预期价的行不写第三段，没收藏的行不写第四段"
     "（收藏标记就是一个 *）",
-    "# 由程序维护，手工修改后点界面上的「刷新商品列表」同步",
+    "# 分类用单独一行「- 类别名」表示，其后的商品属于该类，直到下一个表头；"
+    "没有表头的商品归入「未归类」（固定最后）。"
+    "由程序维护，手工修改后点界面上的「刷新商品列表」同步",
 )
 
 
@@ -54,6 +72,7 @@ class LinkEntry:
     expected_price: str = ""  # 用户设的预期价，空串表示没设
     raw: str = ""             # 原始行，仅用于排查问题
     favorite: bool = False    # 用户打的收藏标记
+    category: str = UNCLASSIFIED  # 所属分类（清单里的 - 表头），没归类就是「未归类」
 
 
 def parse_line(line: str):
@@ -81,27 +100,65 @@ def parse_line(line: str):
     return None, None, "", False
 
 
-def load_links(path: str, notes=None, stats=None):
-    """读取清单，返回去重后的 LinkEntry 列表（保持文件里的顺序）。
+def parse_section(line: str):
+    """解析分类表头，返回清洗后的类别名。
 
-    同名条目以第一次出现的为准；文件里已有的名字会被保留。
+    不是分类表头返回 None；是表头但名字为空/用了保留名「全部」返回空串——
+    调用方据此区分「普通行」和「坏的分类表头」。商品行永远以 clusterId 或
+    链接开头，所以只看首字符 "-" 就够了。
+    """
+    if not isinstance(line, str):
+        return None
+    text = line.strip()
+    if not text.startswith(_SECTION_MARK):
+        return None
+    name = _clean_category(text[len(_SECTION_MARK):])
+    if not name or name == ALL_CATEGORY:
+        return ""
+    return name
+
+
+def load_links(path: str, notes=None, stats=None):
+    """读取清单，返回去重后的 LinkEntry 列表（保持文件里的商品顺序）。
+
+    分类表头 `- 类别名` 会切换后续商品所属的类；第一个表头之前的商品归入
+    「未归类」。空分类也会记进 stats["sections"]，调用方靠它保留用户建好但
+    暂时没商品的分类。同名条目以第一次出现的为准；文件里已有的名字会被保留。
 
     notes 传一个 list 时，读入过程中的异常情况会 append 进去（编码不对、
-    有认不出来的行），由调用方决定怎么提示；不传就只是静默降级。
+    有认不出来的行、分类表头无效），由调用方决定怎么提示；不传就只是静默降级。
     文件读不了（不存在 / 没权限）仍然抛 OSError，交给调用方兜底。
 
-    stats 传一个 dict 时，回填本次读入的统计（目前只有 unparsed：认不出商品 ID
-    的行数）。调用方要用这个数来判「能不能安全地把清单重写回去」——写回是按
-    解析结果重排的，认不出的行会被写没，所以那个数只有调用方知道该怎么用。
+    stats 回填：
+      unparsed       认不出的商品行 + 无效分类表头行数（>0 时不能安全重写）
+      sections       文件里出现过的分类，按首次出现顺序，含空分类
+      bad_sections   无效分类表头行数（空名字 / 保留名「全部」）
     """
     text, encoding_note = _read_text(path)
     if encoding_note:
         _note(notes, encoding_note)
 
     entries = []
+    sections = []
     seen = set()
+    seen_sections = set()
     unparsed = 0
+    bad_sections = 0
+    current = UNCLASSIFIED
     for line in text.splitlines():
+        section = parse_section(line)
+        if section is not None:
+            if not section:
+                bad_sections += 1
+                continue
+            if section not in seen_sections:
+                seen_sections.add(section)
+                sections.append(section)
+            else:
+                _note(notes, f"分类「{section}」在清单里出现了多次，已合并")
+            current = section
+            continue
+
         cluster_id, name, expected_price, favorite = parse_line(line)
         if cluster_id is None:
             # 空行/注释行是正常的，只有"看着有内容却认不出来"才算异常
@@ -112,7 +169,9 @@ def load_links(path: str, notes=None, stats=None):
             continue
         seen.add(cluster_id)
         entries.append(
-            LinkEntry(cluster_id, name, expected_price, line.strip(), favorite)
+            LinkEntry(
+                cluster_id, name, expected_price, line.strip(), favorite, current
+            )
         )
 
     if unparsed:
@@ -121,46 +180,77 @@ def load_links(path: str, notes=None, stats=None):
             f"watchlist 里有 {unparsed} 行认不出商品 ID，已跳过"
             f"（先手工改好这几行，清单才会被重写成规范格式）",
         )
+    if bad_sections:
+        _note(
+            notes,
+            f"watchlist 里有 {bad_sections} 行分类表头无效（空名字或用了保留名"
+            f"「{ALL_CATEGORY}」），已跳过（先改好，清单才会被重写）",
+        )
     if stats is not None:
-        stats["unparsed"] = unparsed
+        stats["unparsed"] = unparsed + bad_sections
+        stats["sections"] = sections
+        stats["bad_sections"] = bad_sections
     return entries
 
 
-def save_watchlist(path: str, items, notes=None) -> int:
+def save_watchlist(path: str, items, notes=None, sections=None) -> int:
     """按规范格式原子写回清单，返回被跳过的条目数。
 
-    items 为 [(clusterId, 商品名[, 预期价[, 收藏]])]，顺序即写入顺序；名称沿用
-    文件里已有的值，预期价和收藏省略等同于没设。条目形状不对/ID 不是纯数字的
-    跳过不写；名字和预期价里的 "|"、换行会被清洗掉（否则会写出一行坏清单，
-    下次读进来就全乱了）。
+    items 为 [(clusterId, 商品名[, 预期价[, 收藏[, 类别]]])]。不传 sections
+    且条目都不带类别时，写成老的无分类格式，顺序即 items 顺序；传了 sections
+    或条目带了类别，才写 `- 类别名` 表头，顺序按 sections（没有就按首次出现），
+    「未归类」固定最后。
+
+    名称沿用文件里已有的值，预期价和收藏省略等同于没设。条目形状不对/ID 不是
+    纯数字的跳过不写；名字、预期价、类别里的 "|"、换行会被清洗掉（否则会写出
+    一行坏清单，下次读进来就全乱了）。
 
     没设预期价时只写前两段（甚至只有 ID），没收藏时不写最后一段，免得老清单
     被一堆空尾巴撑开。收藏标记追加在最后一段的末尾，「收藏但没名字没价」的行
     写出来就是 `1001 | *`，读回来照样对得上。
     写前留一份 path + ".bak" 备份（只留第一次的），并用临时文件 + 替换避免写坏。
     """
-    lines = list(_HEADER) + [""]
+    records = []
     skipped = 0
+    sectioned = sections is not None
     for item in items or []:
-        cluster_id, name, expected_price, favorite = _split_item(item)
+        cluster_id, name, expected_price, favorite, category = _split_item(item)
         if cluster_id is None:
             skipped += 1
             continue
-        name = _clean_name(name)
-        expected_price = _clean_price(expected_price)
-        if not name and not expected_price:
-            line = cluster_id
-        elif not expected_price:
-            line = f"{cluster_id} | {name}"
-        else:
-            # 名称空着也得留出中间那段：解析是按位置认预期价的
-            line = f"{cluster_id} | {name} | {expected_price}"
-        if favorite:
-            line += f" | {_FAVORITE_MARK}"
-        lines.append(line)
+        if category is not None:
+            sectioned = True
+        records.append(
+            (
+                cluster_id,
+                _clean_name(name),
+                _clean_price(expected_price),
+                favorite,
+                _clean_category(category) if category is not None else UNCLASSIFIED,
+            )
+        )
 
     if skipped:
         _note(notes, f"有 {skipped} 条记录格式不对（ID 不是纯数字），已跳过不写入")
+
+    if sectioned:
+        ordered = _ordered_sections(sections, records)
+        grouped = {}
+        for record in records:
+            grouped.setdefault(record[4], []).append(record)
+        lines = list(_HEADER) + [""]
+        for section in ordered:
+            lines.append(f"{_SECTION_MARK} {section}")
+            for cluster_id, name, expected_price, favorite, _category in grouped.get(
+                section, []
+            ):
+                lines.append(
+                    _format_item(cluster_id, name, expected_price, favorite)
+                )
+    else:
+        lines = list(_HEADER) + [""]
+        for cluster_id, name, expected_price, favorite, _category in records:
+            lines.append(_format_item(cluster_id, name, expected_price, favorite))
 
     content = "\n".join(lines) + "\n"
 
@@ -270,24 +360,60 @@ def _strip_favorite(text: str):
 
 
 def _split_item(item):
-    """拆开 (clusterId, 名称[, 预期价[, 收藏]]) 并校验 ID。
+    """拆开 (clusterId, 名称[, 预期价[, 收藏[, 类别]]]) 并校验 ID。
 
-    形状不对返回 (None, "", "", False)。预期价和收藏都可以省略：只关心 ID 和
-    名称的调用方不用凑一串空字符串出来。
+    形状不对返回 (None, "", "", False, None)。预期价、收藏和类别都可以省略；
+    类别返回 None 表示“这条没带分类信息”，由 save_watchlist 决定写不写表头。
     """
     if not isinstance(item, (tuple, list)):
-        return None, "", "", False  # 字符串会被逐字拆开，正好挡在门外
+        return None, "", "", False, None  # 字符串会被逐字拆开，正好挡在门外
     if len(item) == 2:
         cluster_id, name = item
-        expected_price, favorite = "", False
+        expected_price, favorite, category = "", False, None
     elif len(item) == 3:
         cluster_id, name, expected_price = item
-        favorite = False
+        favorite, category = False, None
     elif len(item) == 4:
         cluster_id, name, expected_price, favorite = item
+        category = None
+    elif len(item) == 5:
+        cluster_id, name, expected_price, favorite, category = item
     else:
-        return None, "", "", False
-    return _clean_id(cluster_id), name, expected_price, _clean_favorite(favorite)
+        return None, "", "", False, None
+    return _clean_id(cluster_id), name, expected_price, _clean_favorite(favorite), category
+
+
+def _format_item(cluster_id, name, expected_price, favorite) -> str:
+    """把一个商品写成清单里的一行（各段按需省略，收藏标记在最后）。"""
+    if not name and not expected_price:
+        line = cluster_id
+    elif not expected_price:
+        line = f"{cluster_id} | {name}"
+    else:
+        # 名称空着也得留出中间那段：解析是按位置认预期价的
+        line = f"{cluster_id} | {name} | {expected_price}"
+    if favorite:
+        line += f" | {_FAVORITE_MARK}"
+    return line
+
+
+def _ordered_sections(sections, records):
+    """整理分类顺序：去重、丢掉保留名、把「未归类」固定到最后。
+
+    sections 是调用方给的顺序；为 None 时按记录里首次出现的顺序。
+    记录里出现但 sections 没列到的分类补在「未归类」之前，免得商品被写丢。
+    """
+    ordered = []
+    for section in sections or ():
+        name = _clean_category(section)
+        if not name or name == ALL_CATEGORY or name == UNCLASSIFIED or name in ordered:
+            continue
+        ordered.append(name)
+    for _cluster_id, _name, _price, _favorite, category in records:
+        if category not in ordered and category != UNCLASSIFIED:
+            ordered.append(category)
+    ordered.append(UNCLASSIFIED)
+    return ordered
 
 
 def _clean_id(cluster_id):
@@ -304,6 +430,14 @@ def _clean_name(name) -> str:
         return ""
     text = " ".join(name.replace("|", " ").split())
     return text[:_MAX_NAME_LEN]
+
+
+def _clean_category(name) -> str:
+    """分类名清洗：去掉会破坏清单格式的字符，压缩空白并限长。"""
+    if not isinstance(name, str):
+        return ""
+    text = " ".join(name.replace("|", " ").split())
+    return text[:_MAX_SECTION_LEN]
 
 
 def _clean_price(value) -> str:

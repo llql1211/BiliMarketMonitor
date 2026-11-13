@@ -101,6 +101,120 @@ def test_load_links_missing_file_raises(tmp_path):
         links.load_links(str(tmp_path / "no_such_watchlist.txt"))
 
 
+def test_load_links_categories_and_empty_sections(tmp_path):
+    """分类表头切换商品归属；空分类保留；表头之前的商品归入未归类。"""
+    path = tmp_path / "watchlist.txt"
+    path.write_text(
+        "1000 | 表头之前\n"
+        "- 明日方舟\n"
+        "1001 | 甲\n"
+        "1002 | 乙\n"
+        "- 初音未来\n"
+        "1003 | 丙\n"
+        "- 空分类\n"
+        "- 未归类\n"
+        "1004 | 丁\n",
+        encoding="utf-8",
+    )
+    stats = {}
+    entries = links.load_links(str(path), stats=stats)
+    assert [(e.cluster_id, e.category) for e in entries] == [
+        ("1000", links.UNCLASSIFIED),
+        ("1001", "明日方舟"),
+        ("1002", "明日方舟"),
+        ("1003", "初音未来"),
+        ("1004", links.UNCLASSIFIED),
+    ]
+    assert stats["sections"] == ["明日方舟", "初音未来", "空分类", links.UNCLASSIFIED]
+    assert stats["unparsed"] == 0
+
+
+def test_load_links_duplicate_category_merges(tmp_path):
+    """同名分类出现多次时合并，商品仍按文件顺序保留。"""
+    path = tmp_path / "watchlist.txt"
+    path.write_text(
+        "- 数码\n1001 | 甲\n- 手办\n1002 | 乙\n- 数码\n1003 | 丙\n",
+        encoding="utf-8",
+    )
+    notes = []
+    stats = {}
+    entries = links.load_links(str(path), notes, stats)
+    assert [e.cluster_id for e in entries] == ["1001", "1002", "1003"]
+    assert stats["sections"] == ["数码", "手办"]
+    assert any("多次" in note for note in notes)
+
+
+def test_load_links_bad_section_blocks_rewrite(tmp_path):
+    """空名字/保留名表头算坏行，进入 unparsed，避免重写时被抹掉。"""
+    path = tmp_path / "watchlist.txt"
+    path.write_text("-\n- 全部\n1001 | 甲\n", encoding="utf-8")
+    notes = []
+    stats = {}
+    entries = links.load_links(str(path), notes, stats)
+    assert [e.cluster_id for e in entries] == ["1001"]
+    assert stats["bad_sections"] == 2
+    assert stats["unparsed"] == 2
+    assert any("分类表头" in note for note in notes)
+
+
+def test_save_watchlist_categories_and_empty_sections(tmp_path):
+    """按 sections 顺序写表头（含空分类），未归类固定最后。"""
+    path = tmp_path / "watchlist.txt"
+    links.save_watchlist(
+        str(path),
+        [
+            ("1001", "甲", "", False, "明日方舟"),
+            ("1002", "乙", "", False, "初音未来"),
+            ("1003", "丙", "", False, links.UNCLASSIFIED),
+        ],
+        sections=["初音未来", "空分类", "明日方舟", links.UNCLASSIFIED],
+    )
+    body = [line for line in path.read_text(encoding="utf-8").split("\n") if line]
+    assert body[2:] == [
+        "- 初音未来",
+        "1002 | 乙",
+        "- 空分类",
+        "- 明日方舟",
+        "1001 | 甲",
+        "- 未归类",
+        "1003 | 丙",
+    ]
+
+
+def test_save_watchlist_category_roundtrip(tmp_path):
+    """分类写出去再读回来，归属和顺序都还在。"""
+    path = tmp_path / "watchlist.txt"
+    items = [
+        ("1001", "甲", "50", True, "明日方舟"),
+        ("1002", "乙", "", False, "初音未来"),
+        ("1003", "丙", "", False, links.UNCLASSIFIED),
+    ]
+    links.save_watchlist(str(path), items, sections=["明日方舟", "初音未来"])
+    entries = links.load_links(str(path))
+    assert [(e.cluster_id, e.category) for e in entries] == [
+        ("1001", "明日方舟"),
+        ("1002", "初音未来"),
+        ("1003", links.UNCLASSIFIED),
+    ]
+
+
+@pytest.mark.parametrize(
+    "line, expected",
+    [
+        ("- 明日方舟", "明日方舟"),
+        ("  -  初音 未来  ", "初音 未来"),
+        ("- 甲|乙", "甲 乙"),
+        ("- 全部", ""),
+        ("-", ""),
+        ("1001 | 甲", None),
+        ("# - 注释", None),
+    ],
+)
+def test_parse_section(line, expected):
+    """分类表头只认 "-" 开头；空名字和保留名返回空串。"""
+    assert links.parse_section(line) == expected
+
+
 # ---------------- save_watchlist ----------------
 
 
@@ -433,7 +547,7 @@ def test_save_watchlist_cleans_name_on_roundtrip(tmp_path):
     [
         "1001",                        # 字符串会被逐字拆开
         ("1001",),                     # 缺名称
-        ("1001", "a", "b", "c", "d"),  # 多一项
+        ("1001", "a", "b", "c", "d", "e"),  # 多一项
         ("abc", "名字"),                # ID 不是数字
         (None, "名字"),
         ("", "名字"),
