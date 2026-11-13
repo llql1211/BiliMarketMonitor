@@ -136,8 +136,8 @@ data/watchlist.txt
   或总开关关着就一个线程都不起；`last_notify_at` 管限流，间隔之内不重新计时也不丢队列。
 - **清单是唯一的跟踪标准**，缓存只是加速层。所以缓存丢了、坏了都能重新抓回来，
   而清单里的东西是不可再生的（尤其是预期价，那是抓不回来的用户意图）。
-- **每个改动了清单的动作都会立刻写回**：添加、删除选中、拖动排序、双击改预期价、
-  单击「收藏」列、「刷新列表」，以及抓取结束时学到了新商品名。写回失败会弹提示，不静默；
+- **每个改动了清单的动作都会立刻写回**：添加、删除选中、拖动排序（类内）、右键移动分类、
+  新建分类、双击改预期价、单击「收藏」列、「刷新列表」，以及抓取结束时学到了新商品名。写回失败会弹提示，不静默；
   界面上已经改掉的那格会跟着回滚（点亮的星变回空心），不留「界面上收藏了、文件里没有」
   这种只在下次启动才暴露的分歧。
   「暂停/停止抓取」不写回清单（抓了一半的进度只留在表格和缓存里）。
@@ -255,6 +255,9 @@ data/watchlist.txt
 
 - 格式 `<clusterId> | <商品名> | <预期价> | <收藏>`，四段都可省。读入时兼容分享链接（含
   `share_medium`、`bbid` 之类无关参数）和纯数字 ID，纯数字之外还认 `#` 注释行与空行。
+- 分类用单独一行 `- 类别名` 表示：它到下一个表头之间的商品都属于该类；第一个表头之前的
+  商品归「未归类」，且「未归类」固定排最后。空分类也保留（表头照样写回），否则用户建好
+  还没来得及放商品的分类会在下次保存时消失。分类顺序 = 表头顺序，类内顺序 = 行序。
 - 商品名未知时只写 ID；没设预期价的行不写那一段——免得老清单被一堆空尾巴撑开。
   收藏段追加在末尾，所以「收藏了，但没名字也没价」写出来是 `1001 | *`，读回来照样对得上。
 - 收藏那一段固定写一个 `*`。认的判据是**最后一段整个就是 `*`**：名字本身以星号结尾
@@ -262,6 +265,16 @@ data/watchlist.txt
   剥收藏要**先于**认预期价——`名字 | 50 | *` 剥掉末段之后，`50` 才是那个价格。
 - 写回是**原子**的：先写 `.tmp` 再 `os.replace`；覆盖前留一份 `.bak`（只留第一次那份）。
 - 名字和预期价里的 `|`、换行会被清洗掉，否则会写出一行坏清单，下次读进来全乱。
+- **分类只是清单的分组，不是第二份数据**：`config.categories_enabled` 默认关，关着时表格
+  仍是平铺的（文件里的表头照旧保留、写回时不会丢）；开着才在每组前插一行横跨整表的
+  表头，并在表格上方多一排跳转按钮（`全部` 最前、`未归类` 最后、`＋ 分类` 在末尾）。
+  表头行不是商品行，所以 `app` 里多了一层映射：`table_items`（表格行 -> 商品下标，
+  表头为 `None`）、`item_rows`（商品下标 -> 表格行）、`section_rows` / `section_ranges`
+  （分类 -> 表头行 / 商品区间）。凡是按行号读写表格的地方都必须先过 `ItemIndexAt()` /
+  `TableRowOfItem()`；直接用 `self.rows[row]` 会在开了分类后错位到表头上。
+- **换分类只走右键菜单**：选中商品 → 右键 →「移动到分类」→ 目标分类，追加到该类末尾。
+  拖拽仍是排序，但只允许在本分类内调整；跨类落点直接拒绝并在状态栏提示，免得把商品
+  拖到表头上、分类边界被悄悄改掉。
 
 **缓存 `cache.db`**（`store.py`）
 
@@ -558,8 +571,9 @@ GET https://mall.bilibili.com/mall-c-search/items/info?itemsId=<item_id>&shopId=
 **拖拽排序与自动滚动**（`app.ReorderableTable`）
 
 表格只是顺序的视图：`startDrag` 自己起一个 `QDrag`（绕开 Qt 内部 Move 会搬格子、删源行那套），
-拖动中画出落点横线，松手后只发 `rows_dropped(行号, 插入位置)`，真正改顺序的是
-`MainWindow.OnRowsDropped` → `move_rows()` → 写回清单。
+拖动中画出落点横线，松手后只发 `rows_dropped(表格行, 插入位置)`，真正改顺序的是
+`MainWindow.OnRowsDropped` → 换算成商品下标 → 只在本分类内 `move_rows()` → 写回清单。
+开了分类时表格行号里有表头，落点先用 `table_items` 映射；跨类落点直接拒绝。
 
 - **自动滚动自己做**：`setAutoScroll(False)` 关掉 Qt 自带的那套（自定义 `QDrag` 下它并不动），
   改成 `dragMoveEvent` 里按光标到上下边缘的距离算方向和速度，`QTimer` 每 30ms 滚一格。
@@ -656,7 +670,7 @@ pixi run test           # 等价于 pixi run python -m pytest
 
 | 测试文件 | 覆盖 |
 | --- | --- |
-| [tests/test_app.py](../tests/test_app.py) | 主窗口渲染与按钮流程、`PollerThread`、缩略图（内存/磁盘两层缓存、同一张图合并成一次下载、失败后重试、重排后不贴错行）、总结窗口、通知触发与合并、设置窗口的保存与即时生效 |
+| [tests/test_app.py](../tests/test_app.py) | 主窗口渲染与按钮流程、分类表头/行号映射/右键移动、`PollerThread`、缩略图（内存/磁盘两层缓存、同一张图合并成一次下载、失败后重试、重排后不贴错行）、总结窗口、通知触发与合并、设置窗口的保存与即时生效 |
 | [tests/test_client.py](../tests/test_client.py) | 请求形态与各类失败的统一出口 |
 | [tests/test_config.py](../tests/test_config.py) | 配置优先级、逐项校验、单值校验与写回（只改传进来的项、保留注释） |
 | [tests/test_links.py](../tests/test_links.py) | 清单解析、去重、规范化回写 |
@@ -709,7 +723,8 @@ pixi run shot           # 出图在 tmp/out/，每个场景深色/浅色各一�
 | 拖拽排序的落点、自动滚动速度与触发边距 | `app.ReorderableTable`（`dragMoveEvent` / `_update_drag_scroll` / `_on_drag_scroll`）；速度与边距是顶部 `DRAG_SCROLL_*` 常量 |
 | 史低价的只降不升规则 | `app.updated_lowest()` / `at_lowest()`；存的那一列在 `store.ITEM_COLUMNS` |
 | 累积确认（攒什么、什么时候清零、顶部那句话） | 判据 `app.ack_change()` / `ack_new_deals()` / `ack_reached()` / `BuildAckSummary()`；写入 `store.acknowledge()` / `init_ack_if_empty()`（列在 `ITEM_COLUMNS`）；按钮与那句提示在 `SummaryDialog.btn_ack` / `MainWindow.ack_label` |
-| 清单接受的写法 | `links.parse_line()` / `_split_fields()` |
+| 清单接受的写法 | `links.parse_line()` / `_split_fields()`；分类表头在 `links.parse_section()` |
+| 分类的显示、表头行、跳转按钮、右键移动 | `app.RenderTable()` / `FillHeaderRow()` / `UpdateCategoryBar()` / `OnTableContextMenu()` / `MoveSelectedToCategory()`；行号映射见 `ItemIndexAt()` / `TableRowOfItem()`；开关是 `config.categories_enabled`，样色在 `theme.section_*_color()` |
 | 收藏的写回、回滚与星标 | 交互在 `app.ToggleFavorite()`；清单那段在 `links.parse_line()` / `_strip_favorite()`，缓存那列由 `store.sync()` / `set_favorite()` 写，星标颜色在 `theme.favorite_color()` |
 | 自动抓取的间隔、范围与总结开关 | `data/config.toml` 的 `auto_poll_*` 五项，校验在 `config.py`；调度在 `app.ScheduleAutoPoll()` / `OnAutoPoll()` / `AutoPollTasks()`；「一觉醒来补上错过的这一拍」靠 `app.AutoPollDue()`（monotonic + 墙钟两个期限）与一次等待上限 `auto_poll_wake_seconds`（`app.AutoPollWakeMs()`） |
 | 企业微信推送的开关、地址、限流 | `data/config.toml` 的 `notify_*` 八项，校验在 `config.py`；正文在 `app.BuildNotifyMarkdown()`，发送在 `notifier.py` |

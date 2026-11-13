@@ -126,6 +126,35 @@ def seed_expected_prices():
     )
 
 
+def seed_categories():
+    """把沙盒清单切成几类，好看出表头行、空分类和分类按钮的样子。
+
+    只动 tmp/data 里的副本；真实清单一个字都不改。分类名故意一长一短，
+    顺带量一下按钮多的那一行会不会把窗口顶宽。
+    """
+    import links
+
+    path = links.default_watchlist_path()
+    entries = links.load_links(path)
+    if not entries:
+        return
+    sections = ["手办与模型", "谷子", "空分类看看", links.UNCLASSIFIED]
+    cut1 = max(1, len(entries) // 3)
+    cut2 = max(cut1, (len(entries) * 2) // 3)
+    items = []
+    for i, entry in enumerate(entries):
+        if i < cut1:
+            category = sections[0]
+        elif i < cut2:
+            category = sections[1]
+        else:
+            category = links.UNCLASSIFIED
+        items.append(
+            (entry.cluster_id, entry.name, entry.expected_price, entry.favorite, category)
+        )
+    links.save_watchlist(path, items, sections=sections)
+
+
 def seed_favorites(rows=(0, 2)):
     """给沙盒清单里几行打上收藏，好让表格场景里实心星和空心星并排出现。
 
@@ -545,6 +574,25 @@ def _main(dark):
     import links
 
     window = app.MainWindow()
+    window.ApplyTheme(dark)
+    window.resize(1280, 720)
+    path = links.default_watchlist_path()
+    if os.path.exists(path):
+        window.LoadWatchlist(path)
+    seed_sample_fetches(window)
+    window.ReportStartupNotes()
+    return window
+
+
+@scene("main-categories", settle=1.5)
+def _main_categories(dark):
+    """开了分类的真窗口：表头行、跳转按钮、空分类各是什么样。"""
+    import app
+    import links
+
+    seed_categories()
+    window = app.MainWindow()
+    window.config["categories_enabled"] = True
     window.ApplyTheme(dark)
     window.resize(1280, 720)
     path = links.default_watchlist_path()
