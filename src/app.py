@@ -51,11 +51,13 @@ from PyQt5.QtWidgets import (
     QApplication,
     QDialog,
     QDialogButtonBox,
+    QFrame,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -106,6 +108,8 @@ ZOOM_STEP = 1.25  # 滚轮每滚一格的放大倍数
 ZOOM_MAX = 4.0    # 最多放到铺满的 4 倍；720 的图再往上就是马赛克了
 
 ROW_NUMBER_PADDING = 16  # 序号槽左右留白，免得数字贴着分隔线
+SECTION_HEIGHT = 24  # 分类表头行的高度：比商品行矮，像一条分组带
+CATEGORY_BAR_HEIGHT = 34  # 分类跳转按钮那一行的高度（分类关闭时整行隐藏）
 
 # 拖拽排序时的自动滚动（见 ReorderableTable）：光标进到可视区上下这么宽的一条里就
 # 自己滚，越靠边滚得越快。Qt 自带的那套在自定义 QDrag 下不生效，只能自己接管。
@@ -2216,6 +2220,17 @@ class MainWindow(QMainWindow):
         self.watchlist_path = links.default_watchlist_path()
         self.watch_entries = []  # List[links.LinkEntry]，来自 watchlist.txt
         self.rows = []           # 表格行模型：见 MakeRow() 的字段说明
+        # 分类：self.categories 是顺序（「未归类」固定最后），entry.category 记归属。
+        # 表格行号 ≠ 商品下标：开了分类后每组前面多一行表头，下面三张表负责换算。
+        self.categories = [links.UNCLASSIFIED]
+        self.file_has_sections = False  # 清单文件里是否已有分类表头
+        self.table_items = []     # 表格行 -> 商品下标（表头行是 None）
+        self.item_rows = []       # 商品下标 -> 表格行
+        self.table_categories = []  # 表格行 -> 分类名（商品行和表头行都有）
+        self.section_rows = {}    # 分类名 -> 表头所在表格行
+        self.section_ranges = {}  # 分类名 -> (start_item, end_item)（end 不含）
+        self.category_buttons = []  # 分类跳转按钮，抓取中要禁用「＋ 分类」
+        self.btn_new_category = None
         self.row_urls = {}       # 行号 -> 详情页链接
         self.row_images = {}     # 行号 -> 缩略图原始地址（下载回来时用来认领）
         self.icons = {}          # 缩略图原始地址 -> QPixmap，重画表格时复用
@@ -2402,6 +2417,22 @@ class MainWindow(QMainWindow):
         btn_bar.addWidget(self.btn_settings)
         layout.addLayout(btn_bar)
 
+        # 分类跳转按钮：只在「开启分类」时显示。按钮多了会顶宽窗口，所以套一层
+        # 横向滚动区，整行高度固定；关闭分类时整行藏起来，老界面一点不变。
+        self.category_scroll = QScrollArea()
+        self.category_scroll.setWidgetResizable(False)
+        self.category_scroll.setFrameShape(QFrame.NoFrame)
+        self.category_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.category_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.category_scroll.setFixedHeight(CATEGORY_BAR_HEIGHT)
+        self.category_bar = QWidget()
+        self.category_layout = QHBoxLayout(self.category_bar)
+        self.category_layout.setContentsMargins(0, 0, 0, 0)
+        self.category_layout.setSpacing(6)
+        self.category_scroll.setWidget(self.category_bar)
+        self.category_scroll.setVisible(False)
+        layout.addWidget(self.category_scroll)
+
         # 表格
         self.table = ReorderableTable(0, len(HEADERS))
         self.table.setHorizontalHeaderLabels(HEADERS)
@@ -2454,6 +2485,9 @@ class MainWindow(QMainWindow):
         self.table.cellClicked.connect(self.OnCellClick)
         self.table.cellDoubleClicked.connect(self.OnCellDoubleClick)
         self.table.rows_dropped.connect(self.OnRowsDropped)
+        # 右键菜单：只对商品行有用，用来换分类。表头行不弹
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.OnTableContextMenu)
         layout.addWidget(self.table)
 
         self.setCentralWidget(central)
@@ -2472,6 +2506,24 @@ class MainWindow(QMainWindow):
             print(f"[降级] {message}")
         return ("；" + "；".join(messages)) if messages else ""
 
+    def _AddCategoryName(self, name):
+        """把分类名收进顺序表：去重、拒绝保留名，未归类固定挪到最后。"""
+        clean = links.parse_section(f"- {name}") if name is not None else ""
+        if not clean:
+            return
+        if clean == links.UNCLASSIFIED:
+            if links.UNCLASSIFIED in self.categories:
+                self.categories.remove(links.UNCLASSIFIED)
+            self.categories.append(links.UNCLASSIFIED)
+            return
+        if clean not in self.categories:
+            at = (
+                len(self.categories) - 1
+                if self.categories and self.categories[-1] == links.UNCLASSIFIED
+                else len(self.categories)
+            )
+            self.categories.insert(at, clean)
+
     def LoadWatchlist(self, path, show_errors=True):
         """读取清单 -> 同步缓存 -> 重建表格。"""
         notes = []
@@ -2484,6 +2536,15 @@ class MainWindow(QMainWindow):
             return False
         self.watchlist_path = path
         self.watch_entries = entries
+        self.file_has_sections = bool(stats.get("sections"))
+        # 分类顺序取文件里的表头顺序；商品里出现但表头没列到的（手工粘贴等）
+        # 补在「未归类」之前。未归类永远最后，哪怕是文件里写在中间的。
+        self.categories = []
+        for section in stats.get("sections", []):
+            self._AddCategoryName(section)
+        for entry in entries:
+            self._AddCategoryName(entry.category)
+        self._AddCategoryName(links.UNCLASSIFIED)
         # 记下认不出的行数：>0 时清单不能重写（重写是按解析结果重排的，
         # 那几行会被写没），见 OnRefreshList
         self.last_unparsed = stats.get("unparsed", 0)
@@ -2524,7 +2585,11 @@ class MainWindow(QMainWindow):
         }
 
     def RebuildRows(self, keep_values=True):
-        """按清单重建行模型；keep_values=False 时丢弃本次抓到的数据。"""
+        """按清单重建行模型；keep_values=False 时丢弃本次抓到的数据。
+
+        商品按 self.categories 的顺序分组，类内保持清单里的先后。分组只动行模型，
+        不碰文件：分类表头只在 RenderTable 里按开关决定画不画。
+        """
         old = {}
         if keep_values:
             old = {
@@ -2533,43 +2598,338 @@ class MainWindow(QMainWindow):
                 )
                 for item in self.rows
             }
-        rows = []
         for entry in self.watch_entries:
-            item = self.MakeRow(entry)
-            values, delta, cleared = old.get(entry.cluster_id, (None, None, False))
-            item["values"] = values
-            item["delta"] = delta
-            item["price_cleared"] = cleared
-            rows.append(item)
+            self._AddCategoryName(entry.category)
+            entry.category = (
+                links.parse_section(f"- {entry.category or links.UNCLASSIFIED}")
+                or links.UNCLASSIFIED
+            )
+        buckets = {category: [] for category in self.categories}
+        for entry in self.watch_entries:
+            if entry.category == links.ALL_CATEGORY:
+                entry.category = links.UNCLASSIFIED
+            buckets.setdefault(entry.category, []).append(entry)
+        rows = []
+        for category in self.categories:
+            for entry in buckets.get(category, []):
+                item = self.MakeRow(entry)
+                values, delta, cleared = old.get(entry.cluster_id, (None, None, False))
+                item["values"] = values
+                item["delta"] = delta
+                item["price_cleared"] = cleared
+                rows.append(item)
         self.rows = rows
+        self.watch_entries = [item["entry"] for item in rows]
         self.RenderTable()
 
     def NumberRows(self):
-        """重编序号。序号就是清单顺序，重排、增删、刷新后都得再编一遍。
+        """重编序号。序号是商品下标（1..N），不是表格行号。
 
-        setRowCount 会把序号清空，所以每次重画都得跟着走。
+        开了分类后每组前面多一行表头，表头行的序号留空；商品行仍按 1..N 编，
+        这样「第 N 件」不会因为加了几条分类表头就变。
         """
-        count = len(self.rows)
-        self.table.setVerticalHeaderLabels([str(i + 1) for i in range(count)])
+        labels = []
+        for item_index in self.table_items:
+            labels.append("" if item_index is None else str(item_index + 1))
+        self.table.setVerticalHeaderLabels(labels)
         # 按最大序号定宽，涨到两位数、三位数时它自己会变宽；位数没变就不动，
         # 免得每重画一次就抖一下
+        count = len(self.rows)
         header = self.table.verticalHeader()
         width = header.fontMetrics().horizontalAdvance(str(max(count, 1))) + ROW_NUMBER_PADDING
         if header.width() != width:
             header.setFixedWidth(width)
 
+    def ItemIndexAt(self, table_row):
+        """表格行号 -> 商品下标；表头行/越界返回 None。"""
+        if isinstance(table_row, int) and not isinstance(table_row, bool):
+            if 0 <= table_row < len(self.table_items):
+                return self.table_items[table_row]
+        return None
+
+    def TableRowOfItem(self, item_index):
+        """商品下标 -> 表格行号；越界返回 None。"""
+        if isinstance(item_index, int) and not isinstance(item_index, bool):
+            if 0 <= item_index < len(self.item_rows):
+                return self.item_rows[item_index]
+        return None
+
+    def FillHeaderRow(self, row, category):
+        """填一行横跨整个表格的分类表头。"""
+        count = sum(1 for item in self.rows if item["entry"].category == category)
+        cell = QTableWidgetItem(f"  {category}  ·  {count} 件")
+        cell.setFlags(Qt.ItemIsEnabled)
+        cell.setBackground(QBrush(theme.section_bg_color(self.dark)))
+        cell.setForeground(QBrush(theme.section_text_color(self.dark)))
+        font = cell.font()
+        font.setBold(True)
+        cell.setFont(font)
+        cell.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        cell.setToolTip(f"{category}：{count} 件商品；点上方分类按钮可跳转")
+        self.table.setItem(row, 0, cell)
+        self.table.setSpan(row, 0, 1, self.table.columnCount())
+        self.table.setRowHeight(row, SECTION_HEIGHT)
+
     def RenderTable(self):
-        """按行模型重画整张表（已抓到的数据通过 values 保留）。"""
-        self.table.setRowCount(len(self.rows))
-        self.NumberRows()
+        """按行模型重画整张表（已抓到的数据通过 values 保留）。
+
+        这里把「商品下标」和「表格行号」分开：关闭分类时两者相同；开启后每组
+        前面插一行表头，所有按行号读写表格的地方都得先经过 ItemIndexAt /
+        TableRowOfItem，不能再用 self.rows[row] 直接当商品取。
+        """
+        self.table.clearSpans()
+        self.table.setRowCount(0)
+        self.table_items = []
+        self.item_rows = [None] * len(self.rows)
+        self.table_categories = []
+        self.section_rows = {}
+        self.section_ranges = {}
+
+        # 防御性一行：行模型里如果冒出新分类（手工改过内存），先补进顺序表，
+        # 否则下面的分组会把它漏掉
+        for item in self.rows:
+            self._AddCategoryName(item["entry"].category)
+
+        buckets = {category: [] for category in self.categories}
+        for item_index, item in enumerate(self.rows):
+            buckets.setdefault(item["entry"].category, []).append(item_index)
+
+        plan = []
+        if self.config["categories_enabled"]:
+            for category in self.categories:
+                plan.append(("header", category))
+                for item_index in buckets.get(category, []):
+                    plan.append(("item", item_index))
+        else:
+            for item_index in range(len(self.rows)):
+                plan.append(("item", item_index))
+
+        self.table.setRowCount(len(plan))
+        self.table.clearContents()
         self.row_urls.clear()
         self.row_images.clear()  # 行号会整体挪位，缩略图的归属得跟着重算
-        for row, item in enumerate(self.rows):
-            self.FillRow(row, item)
+
+        positions = {category: [] for category in self.categories}
+        for row, (kind, value) in enumerate(plan):
+            if kind == "header":
+                category = value
+                self.table_items.append(None)
+                self.table_categories.append(category)
+                self.section_rows[category] = row
+                self.FillHeaderRow(row, category)
+                positions.setdefault(category, [])
+            else:
+                item_index = value
+                item = self.rows[item_index]
+                category = item["entry"].category
+                self.table_items.append(item_index)
+                self.item_rows[item_index] = row
+                self.table_categories.append(category)
+                positions.setdefault(category, []).append(item_index)
+                self.FillRow(row, item)
+        for category in self.categories:
+            items = positions.get(category, [])
+            start = items[0] if items else self._CategoryStart(category)
+            self.section_ranges[category] = (start, start + len(items))
+            if not self.config["categories_enabled"]:
+                self.section_rows[category] = items[0] if items else None
+
+        self.NumberRows()
+        self.UpdateCategoryBar()
         self.UpdateUpdatedLabel()
         # 顶部那句累积状态跟着重画一起刷新（增删、排序、刷新清单、确认之后都会走到
         # 这儿）：它数的是"清单里这些商品攒了多少变化"，商品没了就得跟着变
         self.UpdateAckLabel()
+
+    def _CategoryStart(self, category):
+        """空分类在行模型里的插入位置（它前面的分类件数之和）。"""
+        at = 0
+        for name in self.categories:
+            if name == category:
+                return at
+            at += sum(1 for item in self.rows if item["entry"].category == name)
+        return at
+
+    def _CategoryEndIndex(self, category, rows):
+        """在 rows 里，category 这一类的末尾下标（插到它后面用）。"""
+        at = 0
+        for name in self.categories:
+            count = sum(1 for item in rows if item["entry"].category == name)
+            if name == category:
+                return at + count
+            at += count
+        return len(rows)
+
+    def UpdateCategoryBar(self):
+        """重建分类跳转按钮：全部 / 各分类 / 未归类 / ＋ 分类。"""
+        while self.category_layout.count():
+            entry = self.category_layout.takeAt(0)
+            widget = entry.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.category_buttons = []
+        self.btn_new_category = None
+        if not self.config["categories_enabled"]:
+            self.category_scroll.setVisible(False)
+            return
+
+        counts = {category: 0 for category in self.categories}
+        for item in self.rows:
+            category = item["entry"].category
+            counts[category] = counts.get(category, 0) + 1
+
+        def add(label, slot, tip):
+            button = QPushButton(label)
+            button.setToolTip(tip)
+            button.clicked.connect(slot)
+            self.category_layout.addWidget(button)
+            self.category_buttons.append(button)
+            return button
+
+        add(
+            f"{links.ALL_CATEGORY} {len(self.rows)}",
+            self.ScrollToTop,
+            "回到表格最上面",
+        )
+        for category in self.categories:
+            add(
+                f"{category} {counts.get(category, 0)}",
+                lambda _checked=False, name=category: self.ScrollToCategory(name),
+                f"跳到「{category}」分类的表头",
+            )
+        self.btn_new_category = add(
+            "＋ 分类", self.OnNewCategory, "在「未归类」之前新建一个空分类"
+        )
+        self.category_bar.adjustSize()
+        self.category_scroll.setVisible(True)
+        if self.btn_new_category is not None:
+            self.btn_new_category.setEnabled(not self.IsPolling())
+
+    def ScrollToTop(self):
+        self.table.scrollToTop()
+
+    def ScrollToCategory(self, category):
+        """把某一类的表头滚到表格顶部；分类未开启时什么也不做。"""
+        if not self.config["categories_enabled"]:
+            return
+        row = self.section_rows.get(category)
+        if row is None:
+            return
+        cell = self.table.item(row, 0)
+        if cell is not None:
+            self.table.scrollToItem(cell, QAbstractItemView.PositionAtTop)
+
+    def OnNewCategory(self):
+        """新建一个空分类：插在「未归类」之前，并立即写回清单。"""
+        if self.IsPolling():
+            return
+        text, ok = QInputDialog.getText(
+            self, "新建分类", "分类名（会写成 watchlist 里的「- 分类名」）："
+        )
+        if not ok:
+            return
+        name = links.parse_section(f"- {text}")
+        if not name:
+            QMessageBox.warning(
+                self, "分类名不可用",
+                f"分类名不能为空，也不能用保留名「{links.ALL_CATEGORY}」。",
+            )
+            return
+        if name in self.categories:
+            self.ScrollToCategory(name)
+            self.progress_label.setText(f"分类「{name}」已经存在")
+            return
+        self._AddCategoryName(name)
+        self.RenderTable()
+        self.ScrollToCategory(name)
+        if self.SaveWatchlist():
+            self.progress_label.setText(
+                f"已新建分类「{name}」，可以把商品右键移进去" + self.last_note
+            )
+        else:
+            # 写文件失败就别留一个只在内存里的空分类，免得用户接着往里放商品，
+            # 下次刷新时这些归属全没了
+            self.categories.remove(name)
+            self.RenderTable()
+
+    def OnTableContextMenu(self, pos):
+        """右键商品行：移动到某个分类（追加到该类末尾）。"""
+        if self.IsPolling():
+            return
+        index = self.table.indexAt(pos)
+        if not index.isValid():
+            return
+        row = index.row()
+        item_index = self.ItemIndexAt(row)
+        if item_index is None:
+            return  # 表头行不弹菜单
+        if row not in {i.row() for i in self.table.selectedIndexes()}:
+            self.table.clearSelection()
+            self.table.selectRow(row)
+        menu = QMenu(self)
+        move_menu = menu.addMenu("移动到分类")
+        for category in self.categories:
+            action = move_menu.addAction(f"{category}（末尾）")
+            action.triggered.connect(
+                lambda _checked=False, name=category: self.MoveSelectedToCategory(name)
+            )
+        menu.addSeparator()
+        delete_action = menu.addAction("删除选中商品…")
+        delete_action.triggered.connect(self.OnDeleteSelected)
+        menu.exec_(self.table.viewport().mapToGlobal(pos))
+        menu.deleteLater()
+
+    def MoveSelectedToCategory(self, category):
+        """把选中的商品移到目标分类末尾，写回清单；失败则整批回滚。"""
+        if self.IsPolling():
+            return False
+        if category not in self.categories:
+            return False
+        picked = sorted({
+            item_index
+            for index in self.table.selectedIndexes()
+            if (item_index := self.ItemIndexAt(index.row())) is not None
+        })
+        if not picked:
+            return False
+
+        before = [(item, item["entry"].category) for item in self.rows]
+        moving = [self.rows[i] for i in picked]
+        moving_ids = {item["entry"].cluster_id for item in moving}
+        rest = [item for i, item in enumerate(self.rows) if i not in set(picked)]
+        for item in moving:
+            item["entry"].category = category
+        at = self._CategoryEndIndex(category, rest)
+        self.rows = rest[:at] + moving + rest[at:]
+        self.watch_entries = [item["entry"] for item in self.rows]
+        self.RenderTable()
+        self.SelectItems(moving_ids)
+        if not self.SaveWatchlist():
+            self.rows = [item for item, _category in before]
+            for item, old_category in before:
+                item["entry"].category = old_category
+            self.watch_entries = [item["entry"] for item in self.rows]
+            self.RenderTable()
+            self.SelectItems(moving_ids)
+            return False
+        self.progress_label.setText(
+            f"已把 {len(moving)} 件商品移到「{category}」末尾，已写回 watchlist.txt"
+            + self.last_note
+        )
+        # 目标分类可能在屏幕外：把第一件被移动的商品滚到视野里，省得用户以为没动
+        moved_rows = [
+            row
+            for item_index, item in enumerate(self.rows)
+            if item["entry"].cluster_id in moving_ids
+            for row in (self.TableRowOfItem(item_index),)
+            if row is not None
+        ]
+        if moved_rows:
+            self.table.scrollToItem(
+                self.table.item(min(moved_rows), 0),
+                QAbstractItemView.PositionAtCenter,
+            )
+        return True
 
     def UpdateUpdatedLabel(self):
         """刷新顶部那行「上次更新时间」。
@@ -2685,9 +3045,12 @@ class MainWindow(QMainWindow):
         """构造「设置预期价格」对话框（只造不弹）。
 
         跟 exec_ 拆开是为了让测试和截图工具能直接拿到它：模态弹窗得有人点，
-        而这两个地方都不该被卡住。
+        而这两个地方都不该被卡住。row 是表格行号，表头行返回 None。
         """
-        entry = self.rows[row]["entry"]
+        item_index = self.ItemIndexAt(row)
+        if item_index is None:
+            return None
+        entry = self.rows[item_index]["entry"]
         dialog = QInputDialog(self)
         dialog.setWindowTitle(EXPECTED_DIALOG_TITLE)
         dialog.setInputMode(QInputDialog.TextInput)
@@ -2701,10 +3064,10 @@ class MainWindow(QMainWindow):
 
     def EditExpectedPrice(self, row):
         """双击「预期价格」格：弹输入框改这一行的预期价，确定后立刻写回清单。"""
-        if not 0 <= row < len(self.rows):
+        if self.ItemIndexAt(row) is None:
             return
         dialog = self.ExpectedPriceDialog(row)
-        if dialog.exec_() != QDialog.Accepted:
+        if dialog is None or dialog.exec_() != QDialog.Accepted:
             return
 
         # 输入框里要的是数字，但手快连着符号一起粘进来也认（price_number 会脱掉它）
@@ -2721,16 +3084,19 @@ class MainWindow(QMainWindow):
         """把预期价写进行模型并落盘；写文件失败就回滚。
 
         不回滚的话会出现"表格里绿着、清单里其实没写"这种对不上的状态，
-        下次刷新清单一开，用户设的价就凭空没了。
+        下次刷新清单一开，用户设的价就凭空没了。row 是表格行号。
         """
-        entry = self.rows[row]["entry"]
+        item_index = self.ItemIndexAt(row)
+        if item_index is None:
+            return False
+        entry = self.rows[item_index]["entry"]
         before = entry.expected_price
         entry.expected_price = text
-        self.SetPriceCells(row, self.rows[row])  # 只这一行要重画
+        self.SetPriceCells(row, self.rows[item_index])  # 只这一行要重画
 
         if not self.SaveWatchlist():
             entry.expected_price = before
-            self.SetPriceCells(row, self.rows[row])
+            self.SetPriceCells(row, self.rows[item_index])
             return False
 
         what = f"预期价 {expected_display(text)}" if text else "预期价（已清除）"
@@ -2744,26 +3110,27 @@ class MainWindow(QMainWindow):
         """单击收藏格：切换这一行的收藏标记，写缓存、写清单；写文件失败就回滚。
 
         抓取中也允许点（SetBusy 不动）：收藏只是 entry 上的一个 bool，
-        PollerThread 手里的任务排的是"第几行抓哪件商品"，跟它没有关系；
+        PollerThread 手里的任务排的是"第几件商品"，跟它没有关系；
         写清单又是原子的（见 links.save_watchlist），不会写出一行半截的清单。
 
         回滚的路子跟 SetExpectedPrice 一样，两边都退回去：缓存先写了一笔，
         文件没写成的话也一并撤掉，免得留一份"缓存说收藏、清单说没有"的分叉
         ——清单才是收藏的家，下次 sync 本来也会把缓存掰回来，但那之前显示的是
-        哪一份就得靠人去猜了。
+        哪一份就得靠人去猜了。row 是表格行号。
         """
-        if not 0 <= row < len(self.rows):
+        item_index = self.ItemIndexAt(row)
+        if item_index is None:
             return False
-        entry = self.rows[row]["entry"]
+        entry = self.rows[item_index]["entry"]
         before = entry.favorite
         entry.favorite = not before
-        self.SetFavoriteCell(row, self.rows[row])
+        self.SetFavoriteCell(row, self.rows[item_index])
 
         self.store.set_favorite(entry.cluster_id, entry.favorite)
         if not self.SaveWatchlist():
             entry.favorite = before
             self.store.set_favorite(entry.cluster_id, before)
-            self.SetFavoriteCell(row, self.rows[row])
+            self.SetFavoriteCell(row, self.rows[item_index])
             return False
 
         what = "已加入收藏" if entry.favorite else "已取消收藏"
@@ -2775,12 +3142,15 @@ class MainWindow(QMainWindow):
 
     def PreviewRow(self, row):
         """打开某行的商品大图。这一行还没有缩略图时只在状态栏说一声。"""
+        item_index = self.ItemIndexAt(row)
+        if item_index is None:
+            return None
         url = self.row_images.get(row)
         if not url:
             self.progress_label.setText(NO_THUMBNAIL_TEXT + self.last_note)
             return None
-        name = self.rows[row]["entry"].name if row < len(self.rows) else ""
-        return self.OpenPreview(url, name or f"第 {row + 1} 行")
+        name = self.rows[item_index]["entry"].name
+        return self.OpenPreview(url, name or f"第 {item_index + 1} 件")
 
     def OpenPreview(self, image_url, title=""):
         """开一个预览窗口显示大图：看过的一张直接贴，没看过的后台去下。
@@ -3083,10 +3453,12 @@ class MainWindow(QMainWindow):
         rows 给一组行号时只清那几行（「仅抓取新添加商品」只抓其中一部分，
         其余行的价格不该跟着空一整轮），不传就是所有行都清一遍。
         """
-        for row in range(len(self.rows)) if rows is None else rows:
-            item = self.rows[row]
+        for item_index in range(len(self.rows)) if rows is None else rows:
+            item = self.rows[item_index]
             item["price_cleared"] = True
-            self.SetPriceCells(row, item)
+            row = self.TableRowOfItem(item_index)
+            if row is not None:
+                self.SetPriceCells(row, item)
 
     def RestorePendingPrices(self):
         """收尾：这一轮没轮到的行把价格还回来。
@@ -3094,10 +3466,12 @@ class MainWindow(QMainWindow):
         那些价格只是被"清空待抓"，数据还在缓存里（或者这次抓了个失败）；
         跑完还留着一片「--」，看起来就像价格被弄丢了。
         """
-        for row, item in enumerate(self.rows):
+        for item_index, item in enumerate(self.rows):
             if item.get("price_cleared"):
                 item["price_cleared"] = False
-                self.SetPriceCells(row, item)
+                row = self.TableRowOfItem(item_index)
+                if row is not None:
+                    self.SetPriceCells(row, item)
 
     def FillRow(self, row, item):
         """填充一行：优先显示本次抓到的值，其次缓存，最后留待抓取。"""
@@ -3262,11 +3636,19 @@ class MainWindow(QMainWindow):
         self.table.setDragDropMode(
             QAbstractItemView.NoDragDrop if busy else QAbstractItemView.InternalMove
         )
+        # 分类跳转按钮可以继续用（只是滚动），但抓取中不许新建分类
+        if self.btn_new_category is not None:
+            self.btn_new_category.setEnabled(not busy)
 
     # ---------------- 清单写入 ----------------
 
     def SaveWatchlist(self):
-        """按规范格式回写清单（名称取自抓取结果或缓存）。"""
+        """按规范格式回写清单（名称取自抓取结果或缓存）。
+
+        只有文件本来就有分类表头、或用户开了分类，才带分类写；老的无分类清单
+        在开关关闭时仍旧写成平铺格式，不会因为点一次收藏就多出一堆表头。
+        """
+        sectioned = self.file_has_sections or self.config["categories_enabled"]
         items = []
         for item in self.rows:
             values = item["values"] or {}
@@ -3274,20 +3656,28 @@ class MainWindow(QMainWindow):
             name = (values.get("name") or record.get("name") or item["entry"].name or "")
             # 预期价和收藏跟着行走：清单是它们的家（见 links 模块的说明），
             # 这两段都只在用户设过时才写出去（见 links.save_watchlist）
-            items.append(
-                (
-                    item["entry"].cluster_id,
-                    name,
-                    item["entry"].expected_price,
-                    item["entry"].favorite,
-                )
+            row = (
+                item["entry"].cluster_id,
+                name,
+                item["entry"].expected_price,
+                item["entry"].favorite,
             )
+            if sectioned:
+                row += (item["entry"].category,)
+            items.append(row)
         notes = []
         try:
-            links.save_watchlist(self.watchlist_path, items, notes)
+            links.save_watchlist(
+                self.watchlist_path,
+                items,
+                notes,
+                self.categories if sectioned else None,
+            )
         except OSError as err:
             QMessageBox.warning(self, "写入失败", f"写入 watchlist 出错：\n{err}")
             return False
+        if sectioned:
+            self.file_has_sections = True
         self.last_note = self.Note(notes)
         return True
 
@@ -3300,9 +3690,19 @@ class MainWindow(QMainWindow):
             return
 
         entries, seen, invalid = [], set(), 0
+        current = links.UNCLASSIFIED
+        pasted_sections = []
         for line in dialog.text().splitlines():
             if not line.strip() or line.strip().startswith("#"):
                 continue  # 空行 / 注释行
+            section = links.parse_section(line)
+            if section is not None:
+                if not section:
+                    invalid += 1
+                    continue
+                current = section
+                pasted_sections.append(section)
+                continue
             cluster_id, name, expected_price, favorite = links.parse_line(line)
             if cluster_id is None:
                 invalid += 1
@@ -3313,7 +3713,7 @@ class MainWindow(QMainWindow):
             # 粘进来的行里带了后两段（预期价、收藏）就一并收下，跟清单里是同一套格式
             entries.append(
                 links.LinkEntry(
-                    cluster_id, name, expected_price, line.strip(), favorite
+                    cluster_id, name, expected_price, line.strip(), favorite, current
                 )
             )
 
@@ -3334,12 +3734,14 @@ class MainWindow(QMainWindow):
             return
 
         self.watch_entries.extend(new_entries)
-        for entry in new_entries:
-            self.rows.append(self.MakeRow(entry))
+        for section in pasted_sections:
+            self._AddCategoryName(section)
         self.store.sync(
             [(e.cluster_id, e.name, e.favorite) for e in self.watch_entries]
         )
-        self.RenderTable()
+        # 走 RebuildRows 而不是直接 append：粘进来的分类可能是新的一类，
+        # 得按分类顺序重新分组，不能只接在表格末尾
+        self.RebuildRows()
         self.SaveWatchlist()
         self.progress_label.setText(
             f"已添加 {len(new_entries)} 件商品到 watchlist，待抓取价格"
@@ -3351,7 +3753,11 @@ class MainWindow(QMainWindow):
         """删除选中行：同时移出 watchlist.txt 和缓存（缓存以清单为准）。"""
         if self.IsPolling():
             return
-        rows = sorted({index.row() for index in self.table.selectedIndexes()})
+        rows = sorted({
+            item_index
+            for index in self.table.selectedIndexes()
+            if (item_index := self.ItemIndexAt(index.row())) is not None
+        })
         if not rows:
             QMessageBox.information(self, "提示", "请先在表格里选中要删除的商品。")
             return
@@ -3413,8 +3819,11 @@ class MainWindow(QMainWindow):
         if not cluster_ids:
             return
         last_col = self.table.columnCount() - 1
-        for row, item in enumerate(self.rows):
+        for item_index, item in enumerate(self.rows):
             if item["entry"].cluster_id in cluster_ids:
+                row = self.TableRowOfItem(item_index)
+                if row is None:
+                    continue
                 # 逐行 setRangeSelected：它不像 selectRow 那样顶掉上一次的选择
                 self.table.setRangeSelected(
                     QTableWidgetSelectionRange(row, 0, row, last_col), True
@@ -3422,25 +3831,78 @@ class MainWindow(QMainWindow):
 
     def SelectedClusterIds(self):
         """当前选中的商品（按 clusterId 记，重画表格后行号会变）。"""
-        return {
-            self.rows[index.row()]["entry"].cluster_id
-            for index in self.table.selectedIndexes()
-            if index.row() < len(self.rows)
-        }
+        ids = set()
+        for index in self.table.selectedIndexes():
+            item_index = self.ItemIndexAt(index.row())
+            if item_index is not None:
+                ids.add(self.rows[item_index]["entry"].cluster_id)
+        return ids
+
+    def _DropTargetItemIndex(self, target, category):
+        """把表格落点换成该分类内的商品插入下标；跨类/表头不合法时返回 None。"""
+        if not isinstance(target, int) or isinstance(target, bool) or target < 0:
+            return None
+        if category not in self.categories:
+            return None
+        start, end = self.section_ranges.get(category, (0, len(self.rows)))
+        if target >= len(self.table_items):
+            return end
+        item_index = self.table_items[target]
+        if item_index is None:
+            target_category = self.table_categories[target]
+            if target_category == category:
+                return start
+            at = self.categories.index(category)
+            if (
+                at + 1 < len(self.categories)
+                and target_category == self.categories[at + 1]
+            ):
+                return end
+            return None
+        target_category = self.table_categories[target]
+        if target_category == category:
+            return max(start, min(item_index, end))
+        # 落在下一类的第一件商品上，等价于落在上一类的末尾
+        at = self.categories.index(category)
+        if (
+            at + 1 < len(self.categories)
+            and target_category == self.categories[at + 1]
+            and item_index == end
+        ):
+            return end
+        return None
 
     def OnRowsDropped(self, rows, target):
-        """拖拽排序：按拖拽结果重排行模型，顺序即清单顺序，直接写回文件。
+        """拖拽排序：只在本分类内重排，顺序即清单顺序，直接写回文件。
 
-        清单本身就是顺序的载体（watchlist.txt 的行序 = 表格的行序），
-        所以这里同步重排两张表：行模型和清单条目。
+        换分类不走拖拽（表头/跨类落点容易误伤），统一用右键「移动到分类」。
+        关掉分类开关时清单里的分类边界仍然存在，所以也一样按类限制。
         """
         if self.IsPolling():
             return  # 抓取中不许重排，理由见 SetBusy
+        picked = sorted({
+            item_index
+            for row in rows
+            if (item_index := self.ItemIndexAt(row)) is not None
+        })
+        if not picked:
+            return
+        categories = {self.rows[i]["entry"].category for i in picked}
+        if len(categories) != 1:
+            self.progress_label.setText("一次只能在同一分类内调整顺序；换分类请右键移动")
+            return
+        category = categories.pop()
+        target_item = self._DropTargetItemIndex(target, category)
+        if target_item is None:
+            self.progress_label.setText(
+                "拖动只能在本分类内调整顺序；换分类请右键 →「移动到分类」"
+            )
+            return
+
         before = [item["entry"].cluster_id for item in self.rows]
         # 先记下被挪的是哪几件商品：重排后行号全变了，只有 clusterId 还认得出人
-        moved = {self.rows[i]["entry"].cluster_id for i in picked_rows(rows, len(self.rows))}
-
-        self.rows = move_rows(self.rows, rows, target)
+        moved = {self.rows[i]["entry"].cluster_id for i in picked}
+        self.rows = move_rows(self.rows, picked, target_item)
         if [item["entry"].cluster_id for item in self.rows] == before:
             return  # 原地放下（或又拖回了原位）：不重画也不写文件
 
@@ -3724,10 +4186,13 @@ class MainWindow(QMainWindow):
         elapsed = _elapsed_since(anchor)
         return 0.0 if elapsed is None else elapsed
 
-    def OnResultReady(self, row, result):
-        if row >= self.table.rowCount():
+    def OnResultReady(self, item_index, result):
+        if not 0 <= item_index < len(self.rows):
             return
-        item = self.rows[row]
+        item = self.rows[item_index]
+        table_row = self.TableRowOfItem(item_index)
+        if table_row is None:
+            return
         cluster_id = item["entry"].cluster_id
         item["price_cleared"] = False  # 这一条有结果了（成没成另说），不再算「待抓取」
 
@@ -3835,18 +4300,18 @@ class MainWindow(QMainWindow):
             if result["name"] and result["name"] != item["entry"].name:
                 self.names_learned = True
             # 补抓把这一件捞回来了：从失败名单里划掉，它也就不再算失败
-            self.run_failed_rows.discard(row)
+            self.run_failed_rows.discard(item_index)
         else:
             # 这次没抓到，还显示缓存里的价格，涨跌自然也就无从谈起；
             # 但得记一笔，总结里"没有变动"才不至于连失败一起含糊过去
             item["delta"] = None
             # 失败数不在这儿累加：收尾时要按这份名单现算（补抓捞回来的不算，
             # 见 StartRetryPass），中途加加减减容易和名单对不上
-            self.run_failed_rows.add(row)
+            self.run_failed_rows.add(item_index)
         item["values"] = result  # 失败的也记下来，重建表格时不会退回"待抓取"
 
-        self.SetPriceCells(row, item)
-        self.SetDealCells(row, item)
+        self.SetPriceCells(table_row, item)
+        self.SetDealCells(table_row, item)
         # 这一行的价格刚写进缓存，顶部那个时间得跟着往前走；累积那件也是同一回事
         # ——它比的就是"这行的现价相对确认那一刻"，每来一条结果它就该跟着变
         self.UpdateUpdatedLabel()
@@ -3854,14 +4319,14 @@ class MainWindow(QMainWindow):
 
         # 名称/自营徽标/店名/提示一起重画：抓取回填和首屏走同一段（见 ApplyNameCell），
         # 失败时如果原本没有名字，那里也会标出失败而不是留个"…"
-        self.ApplyNameCell(row, item)
+        self.ApplyNameCell(table_row, item)
         cluster_id = item["entry"].cluster_id
         if result["ok"] and result["name"]:
             item["entry"].name = result["name"]
         if result["ok"] and result["image_url"]:
-            img_item = self.table.item(row, COL_IMG)
+            img_item = self.table.item(table_row, COL_IMG)
             if img_item is not None and img_item.icon().isNull():
-                self.SetThumbnail(row, result["image_url"])
+                self.SetThumbnail(table_row, result["image_url"])
 
     def OnImageFetched(self, image_url, pixmap):
         """缩略图到手：key 是图片地址，等着它的行一起贴上。
@@ -4106,9 +4571,12 @@ class MainWindow(QMainWindow):
         只留一句状态栏提示，不猜也不乱跳。
         """
         cluster_id = str(cluster_id)
-        for row, item in enumerate(self.rows):
+        for item_index, item in enumerate(self.rows):
             if item["entry"].cluster_id != cluster_id:
                 continue
+            row = self.TableRowOfItem(item_index)
+            if row is None:
+                break
             self.RestoreMainWindow()
             # 整行选中，并把"当前格"落在商品名上（光标键、复制都从这儿起）
             self.SelectItems([cluster_id])
@@ -4120,7 +4588,7 @@ class MainWindow(QMainWindow):
             )
             self.table.setFocus()
             name = item["entry"].name or cluster_id
-            self.progress_label.setText(f"已定位到「{name}」（第 {row + 1} 行）")
+            self.progress_label.setText(f"已定位到「{name}」（第 {item_index + 1} 件）")
             return True
         self.progress_label.setText(SUMMARY_ITEM_MISSING_TEXT)
         return False
@@ -4208,6 +4676,8 @@ class MainWindow(QMainWindow):
 
     def OnCellClick(self, row, col):
         """单击：收藏格切换收藏，「链接」格开浏览器，其余格子（选中、拖拽）不理会。"""
+        if self.ItemIndexAt(row) is None:
+            return  # 分类表头行
         if col == COL_LINK:
             url = self.row_urls.get(row)
             if url:

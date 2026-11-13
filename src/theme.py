@@ -380,6 +380,16 @@ def muted_color(dark: bool) -> QColor:
     return QColor(MUTED_COLOR_DARK if dark else MUTED_COLOR_LIGHT)
 
 
+def section_bg_color(dark: bool) -> QColor:
+    """分类表头行的底色：比普通行略深/略浅一档，像一条分组带。"""
+    return QColor("#2f3136" if dark else "#eef1f5")
+
+
+def section_text_color(dark: bool) -> QColor:
+    """分类表头行的字色：正文色，不用弱化色，表头要能一眼扫到。"""
+    return QColor("#e3e3e3" if dark else "#30343b")
+
+
 def self_badge_color() -> QColor:
     """「自营」徽标的底色（不随主题变，见 SELF_BADGE_COLOR）。"""
     return QColor(SELF_BADGE_COLOR)

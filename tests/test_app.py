@@ -7319,3 +7319,208 @@ def test_updated_label_does_not_widen_the_window(window):
     w.LoadWatchlist(w.watchlist_path)
 
     assert w.minimumSizeHint().width() <= w.width()
+
+# ---------------- 分类 ----------------
+
+
+CATEGORY_CONFIG = "categories_enabled = true\n"
+
+CATEGORY_WATCHLIST = (
+    "- 明日方舟\n"
+    "10000000001 | 甲\n"
+    "10000000002 | 乙\n"
+    "- 初音未来\n"
+    "10000000003 | 丙\n"
+    "- 空分类\n"
+    "- 未归类\n"
+    "10000000004 | 丁\n"
+)
+
+
+def _category_window(window, config_toml=CATEGORY_CONFIG):
+    w = window(CATEGORY_WATCHLIST, config_toml)
+    assert w.LoadWatchlist(w.watchlist_path) is True
+    return w
+
+
+def test_categories_render_header_rows_and_mapping(window):
+    """开启分类：每组一行表头；表格行号与商品下标分开记。"""
+    w = _category_window(window)
+    assert w.categories == ["明日方舟", "初音未来", "空分类", "未归类"]
+    assert [item["entry"].cluster_id for item in w.rows] == [
+        "10000000001", "10000000002", "10000000003", "10000000004",
+    ]
+    # 表头 0 / 甲 1 / 乙 2 / 表头 3 / 丙 4 / 表头 5 / 表头 6 / 丁 7
+    assert w.table.rowCount() == 8
+    assert w.ItemIndexAt(0) is None
+    assert w.ItemIndexAt(1) == 0
+    assert w.ItemIndexAt(2) == 1
+    assert w.ItemIndexAt(3) is None
+    assert w.ItemIndexAt(4) == 2
+    assert w.TableRowOfItem(0) == 1
+    assert w.TableRowOfItem(2) == 4
+    assert "明日方舟" in w.table.item(0, 0).text()
+    assert "初音未来" in w.table.item(3, 0).text()
+    assert "空分类" in w.table.item(5, 0).text()
+    assert w.table.verticalHeaderItem(0).text() == ""
+    assert w.table.verticalHeaderItem(1).text() == "1"
+    assert w.table.verticalHeaderItem(4).text() == "3"
+    assert w.section_rows["初音未来"] == 3
+    labels = [button.text() for button in w.category_buttons]
+    assert labels[0] == "全部 4"
+    assert "初音未来 1" in labels
+    assert any(label.startswith("＋") for label in labels)
+
+
+def test_categories_save_preserves_headers_and_empty_section(window, data_files):
+    """收藏一下也会带着分类写回，空分类不能丢。"""
+    w = _category_window(window)
+    assert w.ToggleFavorite(1) is True  # 表格行 1 = 甲
+    entries = links.load_links(str(data_files / "watchlist.txt"))
+    assert [(e.cluster_id, e.category, e.favorite) for e in entries] == [
+        ("10000000001", "明日方舟", True),
+        ("10000000002", "明日方舟", False),
+        ("10000000003", "初音未来", False),
+        ("10000000004", "未归类", False),
+    ]
+    text = (data_files / "watchlist.txt").read_text(encoding="utf-8")
+    assert "- 空分类" in text
+
+
+def test_categories_move_selected_to_end(window, data_files):
+    """右键移动：选中的商品追加到目标分类末尾，并写回文件。"""
+    w = _category_window(window)
+    w.table.selectRow(1)  # 甲
+    assert w.MoveSelectedToCategory("初音未来") is True
+    assert [item["entry"].cluster_id for item in w.rows] == [
+        "10000000002", "10000000003", "10000000001", "10000000004",
+    ]
+    assert [item["entry"].category for item in w.rows] == [
+        "明日方舟", "初音未来", "初音未来", "未归类",
+    ]
+    entries = links.load_links(str(data_files / "watchlist.txt"))
+    assert [(e.cluster_id, e.category) for e in entries] == [
+        ("10000000002", "明日方舟"),
+        ("10000000003", "初音未来"),
+        ("10000000001", "初音未来"),
+        ("10000000004", "未归类"),
+    ]
+    assert w.SelectedClusterIds() == {"10000000001"}
+
+
+def test_categories_drag_only_within_category(window):
+    """类内拖拽可以，跨类拖拽拒绝并提示。"""
+    w = _category_window(window)
+    w.OnRowsDropped([1], 3)  # 把甲拖到明日方舟末尾（下一类表头前）
+    assert [item["entry"].cluster_id for item in w.rows[:2]] == [
+        "10000000002", "10000000001",
+    ]
+    before = [item["entry"].cluster_id for item in w.rows]
+    w.OnRowsDropped([2], 5)  # 把甲拖到初音未来的表头上
+    assert [item["entry"].cluster_id for item in w.rows] == before
+    assert "只能在本分类内" in w.progress_label.text()
+
+
+def test_categories_switch_off_keeps_file_headers(window, data_files):
+    """关掉分类只影响界面，写回时仍保留文件里的分类表头。"""
+    w = _category_window(window, "")  # 默认关闭
+    assert w.table.rowCount() == 4
+    assert w.ItemIndexAt(0) == 0
+    assert w.config["categories_enabled"] is False
+    assert w.ToggleFavorite(0) is True
+    entries = links.load_links(str(data_files / "watchlist.txt"))
+    assert [(e.cluster_id, e.category) for e in entries] == [
+        ("10000000001", "明日方舟"),
+        ("10000000002", "明日方舟"),
+        ("10000000003", "初音未来"),
+        ("10000000004", "未归类"),
+    ]
+
+
+def test_categories_result_ready_targets_item_row_not_header(window):
+    """抓取回填按商品下标找表格行，不能把结果写到表头上。"""
+    w = _category_window(window)
+    w.OnResultReady(1, result_ok(name="乙的新名", price="¥10"))
+    assert w.table.item(2, app_module.COL_NAME).text() == "乙的新名"
+    assert w.table.item(2, app_module.COL_PRICE).text() == "¥10"
+    assert "甲" in w.table.item(1, app_module.COL_NAME).text()
+    assert w.rows[1]["entry"].name == "乙的新名"
+
+
+def test_categories_clear_prices_and_summary_jump(window):
+    """清价与总结跳转都要先换算行号。"""
+    w = _category_window(window)
+    w.ClearPrices([1])
+    assert w.table.item(2, app_module.COL_PRICE).text() == app_module.CLEARED_TEXT
+    assert w.rows[1]["price_cleared"] is True
+    assert w.OnSummaryItemClicked("10000000003") is True
+    row = w.TableRowOfItem(2)
+    assert w.table.currentRow() == row
+    assert "第 3 件" in w.progress_label.text()
+
+
+def test_categories_add_item_goes_to_unclassified(window, data_files, monkeypatch):
+    """新添加的商品归入未归类，而不是掉进文件最后一个分类。"""
+    class FakeDialog:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def exec_(self):
+            return QDialog.Accepted
+
+        def text(self):
+            return "10000000009 | 新商品"
+
+    monkeypatch.setattr(app_module, "AddDialog", FakeDialog)
+    w = _category_window(window)
+    w.OnAdd()
+    assert w.rows[-1]["entry"].cluster_id == "10000000009"
+    assert w.rows[-1]["entry"].category == "未归类"
+    entries = links.load_links(str(data_files / "watchlist.txt"))
+    assert entries[-1].cluster_id == "10000000009"
+    assert entries[-1].category == "未归类"
+
+
+
+def test_categories_new_category_button_adds_empty_section(window, data_files, monkeypatch):
+    """「＋ 分类」建的是空分类，插在未归类之前并立刻落盘。"""
+    monkeypatch.setattr(
+        app_module.QInputDialog, "getText", lambda *args, **kwargs: ("新分类", True)
+    )
+    w = _category_window(window)
+    assert w.OnNewCategory() is None  # 槽函数按 Qt 习惯返回 None
+    assert w.categories == ["明日方舟", "初音未来", "空分类", "新分类", "未归类"]
+    assert w.section_rows["新分类"] == w.table.rowCount() - 3
+    entries = links.load_links(str(data_files / "watchlist.txt"))
+    assert [e.category for e in entries] == [
+        "明日方舟", "明日方舟", "初音未来", "未归类",
+    ]
+    text = (data_files / "watchlist.txt").read_text(encoding="utf-8")
+    assert "- 新分类" in text
+    assert text.index("- 新分类") < text.index("- 未归类")
+
+
+def test_categories_add_pasted_sections(window, data_files, monkeypatch):
+    """粘贴内容里的分类表头也认，新商品按表头归类，空分类一起保留。"""
+    class FakeDialog:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def exec_(self):
+            return QDialog.Accepted
+
+        def text(self):
+            return "- 新分类\n10000000009 | 新商品\n- 空的新分类"
+
+    monkeypatch.setattr(app_module, "AddDialog", FakeDialog)
+    w = _category_window(window)
+    w.OnAdd()
+    added = next(item for item in w.rows if item["entry"].cluster_id == "10000000009")
+    assert added["entry"].category == "新分类"
+    assert w.rows[-1]["entry"].cluster_id == "10000000004"  # 未归类仍在最后
+    assert w.categories == [
+        "明日方舟", "初音未来", "空分类", "新分类", "空的新分类", "未归类",
+    ]
+    text = (data_files / "watchlist.txt").read_text(encoding="utf-8")
+    assert "- 新分类" in text
+    assert "- 空的新分类" in text
